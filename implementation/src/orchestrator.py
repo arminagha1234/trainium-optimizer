@@ -150,9 +150,22 @@ class Orchestrator:
         beam = proposer.select(scored_seed) if scored_seed else [self.incumbent]
 
         state = StoppingState(guards=self.guards)
+        # Don't let the SOFT stopping criteria (no-improvement / marginal) end
+        # the search before every config axis has been tried at least once.
+        # The overnight run halted before ever reaching compile_mode — the
+        # single biggest lever (~3-6x) — because tp/dtype came first and
+        # plateaued the streak. max_iterations stays a hard backstop regardless.
+        all_axes = set(proposer.axes)
+        explored: set[str] = set()
+
+        def _stop_now(reason: str) -> bool:
+            if reason == "max_iterations":
+                return True                        # hard backstop always wins
+            return explored.issuperset(all_axes)   # soft stops wait for coverage
+
         while True:
-            stop, _reason = state.should_stop()
-            if stop:
+            stop, reason = state.should_stop()
+            if stop and _stop_now(reason):
                 break
             candidates = proposer.expand(beam)
             if not candidates:
@@ -163,25 +176,31 @@ class Orchestrator:
             configs = [c.config for c in candidates]
             _survivors, pruned = self.bank.prune(configs, family_dir, self.sdk_version)
             pruned_keys = {tuple(sorted(cfg.items())) for cfg, _ in pruned}
-            for cfg, reason in pruned:
-                self._record_pruned(cfg, reason)
+            for cfg, prune_reason in pruned:
+                self._record_pruned(cfg, prune_reason)
             candidates = [c for c in candidates if c.key() not in pruned_keys]
 
+            # Evaluate the WHOLE round before deciding to stop, so a round that
+            # contains the decisive candidate (compile_mode, or tp=8) always
+            # tries it. Stopping is a round-level decision, not per-candidate —
+            # that per-candidate check is what let the streak fire mid-round,
+            # before the big lever, in the overnight run.
             scored = []
-            improved_any = False
+            round_improved = False
+            round_best_gain = 0.0
             for cand in candidates:
+                if "=" in cand.provenance:          # "axis=value" -> axis seen
+                    explored.add(cand.provenance.split("=", 1)[0])
                 evaluated = self._evaluate(cand, spec, Stage.CONFIG)
                 if evaluated is None:
                     continue
                 scored.append(evaluated)
+                gain = self._gain_pct(evaluated)    # vs the incumbent so far
                 if self._update_incumbent(evaluated):
-                    improved_any = True
-                gain = self._gain_pct(evaluated)
-                state.record(improved=self._beats_incumbent(evaluated), gain_pct=gain)
-                stop, _ = state.should_stop()
-                if stop:
-                    break
+                    round_improved = True
+                    round_best_gain = max(round_best_gain, gain)
 
+            state.record(improved=round_improved, gain_pct=round_best_gain)
             beam = proposer.select(beam + scored)
 
         assert self.incumbent is not None

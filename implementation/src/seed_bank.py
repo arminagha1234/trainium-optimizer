@@ -157,6 +157,34 @@ def seed_lessons() -> list[Lesson]:
             last_reverified_sdk="2.28.0",
         ),
 
+        Lesson(
+            lesson_id="latency-track-fill-tp-cp-not-dp",
+            type=LessonType.CONFIG_PRIOR,
+            applicability=Applicability(dense, (1e9, 300e9), neuron_sdk_versions=sdk),
+            layer=Layer.COLLECTIVE, migration_risk="low-medium",
+            intervention={"spec": {"track": "latency", "dp_degree": 1,
+                                   "cp_degree": 2, "batching": "static"}},
+            reason=(
+                "For the 'fastest possible' (lowest per-request latency) track, "
+                "fill the instance with tensor/context parallelism, NOT "
+                "data-parallel replicas: DP raises aggregate tok/s but does "
+                "nothing for a single request's latency. So set dp=1 and put "
+                "more cores on the one request — raise tp (up to the KV-head "
+                "cap, or beyond via KV replication) and cp_degree (splits the "
+                "sequence, wins most at long context). Prefer smaller batch. "
+                "This is the mirror image of the throughput prior, which fills "
+                "with DP replicas instead."
+            ),
+            symptoms_addressed=[Symptom(
+                bottleneck="latency_bound",
+                signature="single-request TTFT/'/token latency is the objective",
+                observed_via="customer SLA on p50/p99 latency, batch small",
+            )],
+            confidence=Confidence(n_models_validated=2, architecture_diversity=1,
+                                  human_verified=True),
+            last_reverified_sdk="2.28.0",
+        ),
+
         # --- anti-patterns (prune before compile) ---------------------------
         Lesson(
             lesson_id="tp16-spill-under-30b",

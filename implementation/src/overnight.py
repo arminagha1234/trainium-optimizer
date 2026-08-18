@@ -27,7 +27,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
-from bank import KnowledgeBank
+from bank import AutoPromotionPolicy, KnowledgeBank
 from guardrails import Guardrails
 from ledger import Ledger, Origin
 from orchestrator import ModelSpec, Orchestrator
@@ -38,17 +38,31 @@ from trajectory_chart import build_chart
 # The three seed models, in escalation order (see CLAUDE.md). `family` drives
 # which adapter and tolerances apply; `param_count` sizes the instance.
 SEED_MODELS: dict[str, ModelSpec] = {
+    # Fast validation model (dense, tiny) — proves the whole loop on real HW.
+    "qwen3-0-6b": ModelSpec(
+        model_id="Qwen/Qwen3-0.6B", family="dense_causal_lm",
+        param_count=0.6e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1,
+    ),
+    # The three real seeds (escalation order). IDs verified present on HF Hub.
     "gemma-4-31b": ModelSpec(
         model_id="google/gemma-4-31B", family="dense_causal_lm",
-        param_count=31e9, parent="gemma", probe_shape="chat 1k/512", probe_batch=1,
+        param_count=31e9, parent="gemma", probe_shape="chat 512/256", probe_batch=1,
     ),
-    "muse-glimmer-30b": ModelSpec(
-        model_id="meta-models/Muse-Glimmer-30B", family="dense_causal_lm",
-        param_count=30e9, parent="muse", probe_shape="chat 1k/512", probe_batch=1,
+    "qwen3-1-7b": ModelSpec(
+        model_id="Qwen/Qwen3-1.7B", family="dense_causal_lm",
+        param_count=1.7e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1,
+    ),
+    "qwen3-4b": ModelSpec(
+        model_id="Qwen/Qwen3-4B", family="dense_causal_lm",
+        param_count=4e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1,
+    ),
+    "qwen3-8b": ModelSpec(
+        model_id="Qwen/Qwen3-8B", family="dense_causal_lm",
+        param_count=8e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1,
     ),
     "qwen3-8-27b": ModelSpec(
         model_id="Qwen/Qwen3.8-27B", family="hybrid_attention_causal_lm",
-        param_count=27e9, parent="qwen", probe_shape="chat 1k/512", probe_batch=1,
+        param_count=27e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1,
     ),
 }
 
@@ -96,17 +110,25 @@ def run_one(
     bank: KnowledgeBank,
     sdk_version: str,
     log,
+    instance_type: str | None = "trn2.48xlarge",
+    cycle: int = 1,
 ) -> ModelResult:
     """Optimize a single model. Crashes are caught and returned, never raised,
     so one bad model does not end the night."""
-    run_dir = out_root / "optimization_runs" / slug
+    # Fresh run dir per cycle so re-optimization never mixes with a prior pass
+    # (Ledger.init is no-clobber, so appending to a stale file would interleave
+    # runs — the bug the first overnight run hit).
+    run_dir = out_root / "optimization_runs" / (slug if cycle <= 1 else f"{slug}/cycle{cycle}")
     try:
         backend = _make_backend(backend_name)
         ledger = Ledger(run_dir)
+        if ledger.path.exists():
+            ledger.path.unlink()      # guarantee a clean ledger for this run
         ledger.init()
         orch = Orchestrator(
             backend=backend, bank=bank, guards=Guardrails(), ledger=ledger,
             equivalence=_equivalence_for(backend_name), sdk_version=sdk_version,
+            instance_type=instance_type,   # fills the whole box (DP/CP), not just the TP group
         )
 
         log(f"[{slug}] establishing baseline on {backend_name}")
@@ -179,12 +201,16 @@ def _emit_lesson(bank, slug, spec, best, sdk_version, log) -> None:
         log(f"[{slug}] lesson emit failed (non-fatal): {e}")
 
 
-def write_leaderboard(results: list[ModelResult], out_root: Path, backend: str) -> Path:
-    """Cross-model summary — the morning artifact."""
+def write_leaderboard(results: list[ModelResult], out_root: Path, backend: str,
+                      cycle: int | None = None) -> Path:
+    """Cross-model summary — the morning artifact. Rewritten each cycle so the
+    file is always the latest snapshot of a continuous run."""
+    cyc = f"  |  Cycle: {cycle}" if cycle else ""
     lines = [
         "# Overnight Run — Leaderboard",
         "",
-        f"Backend: `{backend}`  |  Generated: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}",
+        f"Backend: `{backend}`  |  Generated: "
+        f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}{cyc}",
         "",
     ]
     if backend == "mock":
@@ -221,11 +247,26 @@ def main() -> None:
     ap.add_argument("--out-root", type=Path, default=Path("../artifacts"))
     ap.add_argument("--bank-root", type=Path, default=Path("../../knowledge-bank"))
     ap.add_argument("--sdk", default="2.28.0")
+    ap.add_argument("--instance-type", default="trn2.48xlarge",
+                    help="fills the whole instance (DP/CP); '' to disable")
+    # --- continuous operation: "keep working and working" ---
+    ap.add_argument("--cycles", type=int, default=1,
+                    help="passes over the model set; 0 = run until stopped")
+    ap.add_argument("--forever", action="store_true", help="alias for --cycles 0")
+    ap.add_argument("--auto-promote", action="store_true",
+                    help="promote provisional->verified between cycles so "
+                         "later models/cycles compound (uses the overnight policy)")
+    ap.add_argument("--cycle-pause", type=float, default=0.0,
+                    help="seconds to sleep between cycles")
     a = ap.parse_args()
 
     out_root = a.out_root.resolve()
     out_root.mkdir(parents=True, exist_ok=True)
     bank = KnowledgeBank(a.bank_root.resolve())
+    instance_type = a.instance_type or None
+    cycles = 0 if a.forever else a.cycles          # 0 == run until stopped
+    policy = AutoPromotionPolicy.overnight() if a.auto_promote else AutoPromotionPolicy()
+    stop_file = out_root / "STOP"                  # `touch artifacts/STOP` to end cleanly
 
     log_path = out_root / "OVERNIGHT_LOG.md"
     log_fh = log_path.open("a")
@@ -237,20 +278,58 @@ def main() -> None:
         log_fh.write(line + "\n")
         log_fh.flush()
 
-    log(f"=== overnight run start: backend={a.backend} models={a.models} ===")
-    results = []
-    for slug in a.models:
-        if slug not in SEED_MODELS:
-            log(f"skip unknown model {slug!r}")
-            continue
-        results.append(run_one(
-            slug, SEED_MODELS[slug], a.backend, out_root, bank, a.sdk, log,
-        ))
+    models = [s for s in a.models if s in SEED_MODELS]
+    for bad in (s for s in a.models if s not in SEED_MODELS):
+        log(f"skip unknown model {bad!r}")
 
-    board = write_leaderboard(results, out_root, a.backend)
-    ok = sum(1 for r in results if r.ok)
-    log(f"=== overnight run complete: {ok}/{len(results)} models ok ===")
-    log(f"leaderboard -> {board}")
+    log(f"=== overnight START: backend={a.backend} instance={instance_type} "
+        f"cycles={'forever' if cycles == 0 else cycles} auto_promote={a.auto_promote} "
+        f"models={models} ===")
+    log(f"    (touch {stop_file} to stop cleanly after the current model)")
+
+    cycle = 0
+    try:
+        while True:
+            if stop_file.exists():
+                log(f"STOP file seen — halting before cycle {cycle + 1}")
+                break
+            cycle += 1
+            log(f"=== cycle {cycle} start ===")
+            results: list[ModelResult] = []
+            for slug in models:
+                if stop_file.exists():
+                    log("STOP file seen mid-cycle — finishing up")
+                    break
+                results.append(run_one(
+                    slug, SEED_MODELS[slug], a.backend, out_root, bank, a.sdk, log,
+                    instance_type=instance_type, cycle=cycle,
+                ))
+
+            # Compound learning: promote qualifying provisional lessons so the
+            # NEXT model / cycle starts from what this one proved. This is what
+            # turns a re-run into improvement rather than repetition.
+            if a.auto_promote:
+                promoted = bank.auto_promote(policy, current_sdk=a.sdk)
+                n = sum(1 for _, ok, _ in promoted if ok)
+                if n:
+                    log(f"auto-promoted {n} provisional lesson(s) -> verified")
+
+            board = write_leaderboard(results, out_root, a.backend, cycle)
+            ok = sum(1 for r in results if r.ok)
+            stats = bank.stats(current_sdk=a.sdk)
+            log(f"=== cycle {cycle} done: {ok}/{len(results)} ok | "
+                f"bank: {stats['verified']} verified "
+                f"({stats.get('auto_promoted', 0)} auto), "
+                f"{stats['provisional']} provisional | board -> {board} ===")
+
+            if cycles and cycle >= cycles:
+                break
+            if a.cycle_pause:
+                time.sleep(a.cycle_pause)
+    except KeyboardInterrupt:
+        log("interrupted — exiting cleanly")
+
+    log(f"=== overnight STOPPED after {cycle} cycle(s) ===")
     log_fh.close()
 
 

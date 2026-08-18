@@ -77,7 +77,24 @@ class BeamProposer:
         if (budget is not None and (long_context or track == "latency")
                 and "cp_degree" not in self.axes):
             self.axes["cp_degree"] = [c for c in (1, 2, 4, 8) if c <= budget.num_cores]
+        # Try high-impact axes FIRST. The overnight run showed the greedy stop
+        # firing before it ever reached compile_mode — the single biggest lever
+        # (torch.compile was ~3-6x while tp/dtype were single-digit %). Ordering
+        # by expected impact means the win is found in round 1, not missed.
+        self.axes = dict(sorted(self.axes.items(),
+                                key=lambda kv: self._AXIS_PRIORITY.get(kv[0], 50)))
         self._seen: set[tuple] = set()
+
+    # Lower = tried earlier. Compile mode dominates; sharding/precision are
+    # cheap tie-breakers that interact, so they come after the big lever.
+    _AXIS_PRIORITY = {
+        "compile_mode": 0,
+        "attn_implementation": 1, "attention_kernel": 1,
+        "batching": 2,
+        "weights_dtype": 3, "activations_dtype": 3, "kv_cache_dtype": 4,
+        "sequence_layout": 5,
+        "tp_degree": 6, "cp_degree": 7,
+    }
 
     def _fill(self, config: dict[str, Any]) -> dict[str, Any]:
         """Attach the parallelism fill-plan (dp/cp/util + kv_replication) so a
@@ -141,11 +158,17 @@ class BeamProposer:
         """
         out: list[Candidate] = []
         for parent in beam:
-            generated = 0
-            for axis, values in self.axes.items():
+            # Generate EVERY unseen single-axis neighbour, in priority order.
+            # Generating all of them (rather than a capped subset) is what
+            # guarantees the decisive axis — compile_mode, or tp — is always
+            # tried in the round, instead of being starved by a high-fan-out
+            # axis. The overnight run halted before torch.compile precisely
+            # because the capped expansion never emitted a compile_mode
+            # candidate. The beam still keeps only top-k, so fan-out is bounded
+            # downstream, and the round-level stop check evaluates the whole
+            # round before deciding to stop.
+            for axis, values in self.axes.items():       # dict is priority-sorted
                 for v in values:
-                    if generated >= self.plans_per_parent:
-                        break
                     if parent.config.get(axis) == v:
                         continue
                     # Re-fill after the perturbation: changing tp (or cp)
@@ -160,7 +183,6 @@ class BeamProposer:
                         continue
                     self._seen.add(cand.key())
                     out.append(cand)
-                    generated += 1
         return out
 
     # -- selection -----------------------------------------------------------
