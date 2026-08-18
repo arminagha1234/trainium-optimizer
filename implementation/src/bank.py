@@ -168,6 +168,14 @@ class Lesson:
     last_reverified_sdk: str = ""
     evidence: list[dict[str, Any]] = field(default_factory=list)
 
+    # Promotion audit trail. auto_promoted is deliberately distinct from
+    # confidence.human_verified: an auto-promoted lesson is trusted by the
+    # proposer (it lives in verified/) but was NOT signed off by a human, and
+    # human_verified_ratio must keep reflecting that.
+    auto_promoted: bool = False
+    promoted_at: str = ""
+    beat_borrowed_by: float | None = None   # fraction; required for origin=invented
+
     # ---- serialization -----------------------------------------------------
 
     @classmethod
@@ -198,6 +206,9 @@ class Lesson:
             source=d.get("source", ""),
             last_reverified_sdk=d.get("last_reverified_sdk", ""),
             evidence=d.get("evidence", []),
+            auto_promoted=d.get("auto_promoted", False),
+            promoted_at=d.get("promoted_at", ""),
+            beat_borrowed_by=d.get("beat_borrowed_by", None),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -240,6 +251,12 @@ class Lesson:
             out["last_reverified_sdk"] = self.last_reverified_sdk
         if self.evidence:
             out["evidence"] = self.evidence
+        if self.auto_promoted:
+            out["auto_promoted"] = self.auto_promoted
+        if self.promoted_at:
+            out["promoted_at"] = self.promoted_at
+        if self.beat_borrowed_by is not None:
+            out["beat_borrowed_by"] = self.beat_borrowed_by
         return out
 
     # ---- anti-pattern matching --------------------------------------------
@@ -268,6 +285,45 @@ class Lesson:
                 if val != pred:
                     return False
         return True
+
+
+@dataclass(frozen=True)
+class AutoPromotionPolicy:
+    """When may a provisional lesson become verified WITHOUT a human?
+
+    This is the switch that turns the bank from "self-logging" into
+    "self-learning": with it on, a lesson proven during an overnight run is
+    trusted by later models in the *same* run, so the 3 seeds compound instead
+    of each re-deriving the same wins.
+
+    Deliberately conservative — a bad auto-promotion pollutes every future
+    model's search, so the bar is real. It is expressed as explicit,
+    interpretable criteria rather than the opaque 0-0.8 `Confidence.score()`
+    (which is calibrated for *ranking* verified lessons, not as a promotion
+    gate — it returns 0.2 for a solid 2-model lesson, which would fight
+    min_models here):
+      - validated on >= min_models distinct models,
+      - across >= min_families architecture families,
+      - every recorded measurement cleared min_correctness,
+      - invented kernels additionally beat their borrowed alternative by
+        >= invented_min_margin percent (no "invented" freebies).
+
+    Off by default (humans-only). `overnight()` is the preset for the
+    autonomous run: it allows single-family compounding (min_families=1) so a
+    lesson learned on seed 1 can help seed 2 of the same family.
+    """
+
+    enabled: bool = False
+    min_models: int = 2
+    min_families: int = 2
+    min_correctness: float = 99.0
+    invented_min_margin: float = 5.0     # percent; mirrors Guardrails.invention_margin_pct
+
+    @classmethod
+    def overnight(cls) -> AutoPromotionPolicy:
+        """Preset for a no-human-in-the-loop run across the seed set."""
+        return cls(enabled=True, min_models=2, min_families=1,
+                   min_correctness=99.0, invented_min_margin=5.0)
 
 
 class KnowledgeBank:
@@ -424,9 +480,60 @@ class KnowledgeBank:
                 l.tier = Tier.VERIFIED
                 l.confidence.human_verified = True
                 new = self.save(l)
-                old.unlink(missing_ok=True)
+                if old != new:
+                    old.unlink(missing_ok=True)
                 return new
         raise KeyError(f"no provisional lesson {lesson_id!r}")
+
+    def _auto_promotion_reason(
+        self, l: Lesson, policy: AutoPromotionPolicy, current_sdk: str,
+    ) -> tuple[bool, str]:
+        """Evaluate one provisional lesson against the policy. Returns
+        (qualifies, human-readable reason) — the reason is logged either way so
+        the morning audit shows why each lesson did or didn't cross."""
+        c = l.confidence
+        if c.n_models_validated < policy.min_models:
+            return False, f"only {c.n_models_validated} model(s) < {policy.min_models}"
+        if c.architecture_diversity < policy.min_families:
+            return False, f"only {c.architecture_diversity} family/ies < {policy.min_families}"
+        for e in l.evidence:
+            corr = e.get("correctness", e.get("correctness_pct"))
+            if corr is not None and corr < policy.min_correctness:
+                return False, f"a measurement's correctness {corr} < {policy.min_correctness}"
+        if l.origin is Origin.INVENTED:
+            if l.beat_borrowed_by is None:
+                return False, "invented but no beat_borrowed_by recorded"
+            if l.beat_borrowed_by * 100.0 < policy.invented_min_margin:
+                return False, (f"invented beat borrowed by only "
+                               f"{l.beat_borrowed_by*100:.1f}% < {policy.invented_min_margin}%")
+        return True, (f"n_models={c.n_models_validated}, "
+                      f"families={c.architecture_diversity}, "
+                      f"correctness gate + invented margin cleared")
+
+    def auto_promote(
+        self, policy: AutoPromotionPolicy, current_sdk: str = "",
+    ) -> list[tuple[str, bool, str]]:
+        """Promote every qualifying provisional lesson to verified, no human.
+
+        Returns [(lesson_id, promoted, reason), ...] for the whole provisional
+        set — promoted and skipped alike — so the run log is auditable. A no-op
+        (returns []) when the policy is disabled.
+        """
+        if not policy.enabled:
+            return []
+        results: list[tuple[str, bool, str]] = []
+        for l in self.load_all(Tier.PROVISIONAL):
+            ok, reason = self._auto_promotion_reason(l, policy, current_sdk)
+            if ok:
+                old = self._lesson_path(l)
+                l.tier = Tier.VERIFIED
+                l.auto_promoted = True          # trusted, but NOT human_verified
+                l.promoted_at = _utcnow()
+                new = self.save(l)
+                if old != new:
+                    old.unlink(missing_ok=True)
+            results.append((l.lesson_id, ok, reason))
+        return results
 
     # ---- metrics -----------------------------------------------------------
 
@@ -445,10 +552,19 @@ class KnowledgeBank:
                 sum(1 for l in verified if l.confidence.human_verified) / len(verified)
                 if verified else 0.0
             ),
+            # verified lessons that got there by auto-promotion, not a human.
+            # Watch this against human_verified_ratio to see how much of the
+            # bank the autonomous loop is now responsible for.
+            "auto_promoted": sum(1 for l in verified if l.auto_promoted),
         }
 
 
 # -- helpers -----------------------------------------------------------------
+
+def _utcnow() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
 
 def _norm_family(name: str) -> str:
     """Canonicalize a family name. The lesson schema uses underscores

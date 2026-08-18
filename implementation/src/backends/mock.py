@@ -77,8 +77,11 @@ class MockBackend:
                     compile_seconds=max(60.0, base + jitter))
 
     def measure(self, neff: Neff, shape: str, batch: int) -> Measurements:
-        tps = self._throughput(neff.artifact.config, shape, batch)
-        hbm = self._hbm(neff.artifact.config, shape, batch)
+        cfg = neff.artifact.config
+        tps = self._throughput(cfg, shape, batch)
+        hbm = self._hbm(cfg, shape, batch)
+        cores_used = int(cfg.get("cores_used", 0) or 0)
+        cores_avail = int(cfg.get("cores_available", 0) or 0)
         return Measurements(
             metric=tps,
             metric_p50=tps,
@@ -86,11 +89,13 @@ class MockBackend:
             ttft_ms_p50=1000.0 / max(tps, 1) * batch,
             hbm_peak_gb=hbm,
             hbm_available_gb=self._hbm_gb,
-            mfu_percent=self._mfu(neff.artifact.config, tps),
+            mfu_percent=self._mfu(cfg, tps),
             shape=shape,
             batch=batch,
             warmup_iters=3,
             measured_iters=10,
+            cores_used=cores_used,
+            cores_available=cores_avail,
         )
 
     def profile(self, neff: Neff, shape: str) -> Profile:
@@ -143,6 +148,13 @@ class MockBackend:
         base *= {"default": 1.0, "paged": 1.3, "flash": 2.6, "kv_parallel": 2.9}.get(
             cfg.get("attention_kernel"), 1.0)
         base *= 1.0 + 0.02 * batch
+        # Data-parallel replicas fill the rest of the instance. Aggregate
+        # throughput scales ~linearly with a small coordination overhead — this
+        # is what makes "TP=4 x DP=16" beat "TP=4 x DP=1" and stops the search
+        # from leaving 60 of 64 cores idle. dp defaults to 1 when no hardware
+        # budget was wired in, so the budget-less path is unchanged.
+        dp = int(cfg.get("dp_degree", 1) or 1)
+        base *= dp * (0.99 ** (dp - 1))
         return round(base * self._rng.uniform(0.98, 1.02), 1)
 
     def _hbm(self, cfg: dict[str, Any], shape: str, batch: int) -> float:

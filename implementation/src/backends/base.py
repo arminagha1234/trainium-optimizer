@@ -55,12 +55,26 @@ class Measurements:
     batch: int = 1
     warmup_iters: int = 0
     measured_iters: int = 0
+    # Instance occupancy. cores_used = tp*cp*dp for this deployment;
+    # cores_available = the whole instance. A model pinned to its TP group on a
+    # bigger box reports low device_utilization here — the signal that made
+    # "27B at TP=4 on a 64-core trn2.48xlarge" visible. mfu_percent should be
+    # reported against the FULL instance so idle cores drag it down.
+    cores_used: int = 0
+    cores_available: int = 0
 
     @property
     def hbm_utilization(self) -> float:
         if self.hbm_available_gb <= 0:
             return 0.0
         return self.hbm_peak_gb / self.hbm_available_gb
+
+    @property
+    def device_utilization(self) -> float:
+        """Fraction of the instance's cores this deployment actually uses."""
+        if self.cores_available <= 0:
+            return 0.0
+        return self.cores_used / self.cores_available
 
 
 @dataclass

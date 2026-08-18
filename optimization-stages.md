@@ -67,6 +67,17 @@ correctly.
 Record: baseline measurements on the search-time probe shape, full toolchain
 stamp, HBM peak.
 
+**Detect the instance first — the compute budget the search must fill.** Step
+zero of every run is to read the hardware: instance type → cores, HBM/core,
+total HBM (`hardware.budget_for(instance_type)`, with the runtime
+`NEURON_RT_NUM_CORES` / `world_size` as the authoritative override). This is
+recorded alongside HBM peak and is not optional — it is the denominator for the
+utilization guardrail and the input to the Stage-1 fill plan. Concretely: a
+trn2.48xlarge is **64 logical NeuronCores** at the default LNC=2 (16 chips × 8
+physical, combined 2:1), so "use the whole instance" means filling 64 cores,
+not the 4-16 a single TP group touches. Getting this number wrong (e.g.
+assuming 16) silently caps every model at a fraction of the box.
+
 ## Stage 1 — Config search (no new code)
 
 **What changes**: only configuration. No source is written or modified.
@@ -89,6 +100,34 @@ Axes:
 This is where bank `config_prior` lessons do the most work — a good prior can
 land within a few percent of the Stage-1 optimum on the first candidate.
 Anti-patterns prune here too, before any compile happens.
+
+**Fill the instance — `tp_degree` is not the whole story.** `tp_degree` is
+bounded by the model: GQA requires `num_kv_heads % tp == 0`, so a 27B model
+with 4 KV heads is capped at TP=4. On a trn2.48xlarge that is *4 of 64 logical
+cores* (LNC=2) — the search must not stop there and leave ~94% of a paid
+instance idle. `dp_degree` is therefore **derived, not searched**: for the
+throughput track the fill planner sets `dp = cores // (tp*cp)` so every
+candidate uses the whole box (TP=4 → DP=16 → ~16× throughput). `cp_degree`
+fills the box for the long-context / latency track instead. Going *past* the
+KV-head cap
+(`tp > num_kv_heads`) is possible by replicating KV heads across ranks — it is
+a **testable** candidate the search may try, not a hard ceiling and not an
+assumption. See `hardware.py` (`fill_plan`) and the utilization guardrail.
+
+**Throughput vs latency fill are different.** How you spend the 64 cores
+depends on what the customer wants:
+
+- **Max throughput** (aggregate tok/s): fill with **data-parallel replicas**.
+  Each replica is an independent model on its own cores, so aggregate tok/s
+  scales ~linearly and per-core HBM is unchanged. `dp = cores // (tp*cp)`.
+- **Fastest possible** (lowest per-request latency): DP replicas do **nothing**
+  for a single request. Fill instead with **more cores on the one request** —
+  raise `tp` (up to the KV-head cap, or beyond via KV replication) and
+  `cp_degree` (splits the sequence). `dp` stays 1. This is the
+  `track="latency"` path, which is why it opens the `cp_degree` search axis.
+
+Both fill the box; they just fill it with different parallelism. The search
+runs the track that matches the customer objective rather than assuming one.
 
 **Exit when**: no-improvement streak on config axes, or all single-axis moves
 tried.

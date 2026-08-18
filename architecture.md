@@ -61,8 +61,11 @@ equivalence, NKI agents) or downstream artifacts (leaderboard).
 
 ### Config space (indicative, expands per architecture family)
 
-- **Sharding**: `tp_degree ∈ {1, 2, 4, 8, 16, 32}`, `cp_degree ∈ {1, 2, 4}`,
-  `dp_degree` (batch splitting)
+- **Sharding**: `tp_degree ∈ {1, 2, 4, 8, 16, 32}` (bounded by `num_kv_heads`
+  for GQA), `cp_degree ∈ {1, 2, 4}`, and `dp_degree` — **derived, not searched**:
+  the fill planner (`hardware.py`) sets `dp = cores // (tp*cp)` so the whole
+  instance is used rather than just the TP group. See
+  `optimization-stages.md` (Stage 1, "Fill the instance").
 - **Precision**: `weights ∈ {fp32, bf16, fp8, int8-w8a8}`,
   `activations ∈ {bf16, fp8}`, KV cache dtype
 - **Attention**: dense / paged / flash / GQA-optimized / MoE-aware
@@ -292,6 +295,46 @@ Deliberately kept backend-agnostic, because these are the bulk of the value:
    costs or buys, measured."
 4. Flip the leaderboard's primary backend only when native PyTorch matches or
    beats XLA on the seed set *and* TP works at the degrees our models need.
+
+## Backend hooks for hardware-aware fill (handoff to the backend owner)
+
+The core is now hardware-aware: the proposer attaches a fill plan to **every**
+candidate config, so alongside `tp_degree` each config carries `cp_degree`,
+`dp_degree`, `kv_replication`, `cores_used`, and `cores_available` (computed by
+`hardware.fill_plan`). This is backend-independent and already exercised by the
+mock. To make it real on device, the native-PyTorch backend
+(`backends/native_pytorch.py` + `neuron_worker.py`) needs three changes — all
+additive, and until they land the extra keys ride along in the config
+harmlessly (the box just isn't filled yet, so nothing breaks):
+
+1. **Launch `dp_degree` replicas.** `apply_config`/the worker should read
+   `dp_degree` and start that many independent model replicas (each a full
+   `tp × cp` group on its own cores), fan the request stream across them, and
+   **sum** throughput. `dp` does not change per-core HBM — it uses *other*
+   cores — so it is the cheap way to fill the box for the throughput track.
+   Set `NEURON_RT_NUM_CORES` / `torchrun --nproc_per_node` to `tp*cp*dp`.
+2. **Honor `cp_degree` and `kv_replication`.** `cp_degree > 1` enables context
+   parallelism (the long-context/latency lever). `kv_replication > 1` means the
+   search chose `tp > num_kv_heads`; the worker's `num_kv_heads % tp == 0`
+   assertion (`neuron_worker.py:64`) should become "either divides, or
+   replicate KV heads `kv_replication`×" — a **testable** path, gated by
+   measurement, not a hard reject.
+3. **Report occupancy.** `measure()` should set `Measurements.cores_used`
+   (`tp*cp*dp`) and `cores_available` (the instance's cores, from
+   `hardware.budget_for(instance_type)` or the runtime count), and compute
+   `mfu_percent` against the **full** instance. That is what makes the
+   utilization guardrail and the ledger's `[under-util: …]` flag work on real
+   hardware exactly as they do against the mock.
+
+`config_axes()` needs two changes: add `cp_degree` (for the long-context /
+latency track), and **extend `tp_degree` up to the instance core count** rather
+than stopping at 8. Today it returns `[1, 2, 4, 8]`; on a 64-core
+trn2.48xlarge the legal TP values run to 64 (still bounded by `num_kv_heads`
+for clean sharding, and by the TP≥16-spill anti-pattern for small models, so
+the search will rarely pick the high end — but it should be *allowed* to try,
+and generate the value from the detected core count, not a hardcoded list).
+`dp_degree` is *derived* by the planner, so the backend reads it from the
+handed config rather than enumerating it.
 
 ## Blocking unknown, restated
 

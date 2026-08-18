@@ -29,6 +29,7 @@ def seed_lessons() -> list[Lesson]:
     sdk = ["2.26.*", "2.27.*", "2.28.*"]
     dense = "dense_causal_lm"
     moe = "moe_causal_lm"
+    hybrid = "hybrid_attention_causal_lm"
 
     return [
         # --- collective-layer op_rewrites (the auto_research wins) ----------
@@ -126,6 +127,33 @@ def seed_lessons() -> list[Lesson]:
             intervention={"spec": {"tp_degree": 2, "weights_dtype": "bf16"}},
             reason="Small dense models: TP=2 avoids collective overhead of higher TP.",
             confidence=Confidence(n_models_validated=2, human_verified=True),
+            last_reverified_sdk="2.28.0",
+        ),
+        Lesson(
+            lesson_id="hybrid-attn-27b-tp-by-kvheads-then-fill-dp",
+            type=LessonType.CONFIG_PRIOR,
+            applicability=Applicability(hybrid, (20e9, 40e9), neuron_sdk_versions=sdk),
+            layer=Layer.CONFIG, migration_risk="medium",
+            intervention={"spec": {"tp_degree": 4, "weights_dtype": "bf16",
+                                   "kv_cache_dtype": "bf16"}},
+            reason=(
+                "Hybrid-attention ~27B (Qwen3.x-style GQA, often 4 KV heads) is "
+                "capped at TP=num_kv_heads=4 for clean attention sharding. That "
+                "is only 4 of 64 logical cores on trn2.48xlarge (LNC=2). Do NOT "
+                "stop there: the fill planner adds data-parallel replicas "
+                "(dp=16) to use all 64 cores for ~16x throughput. TP>kv_heads "
+                "is possible via KV "
+                "replication but must be measured, not assumed — it trades "
+                "redundant KV work for tensor-parallel width and only sometimes "
+                "wins. Leaving 12 cores idle is the failure mode to avoid."
+            ),
+            symptoms_addressed=[Symptom(
+                bottleneck="under_utilized",
+                signature="TP group << instance cores; most of the box idle",
+                observed_via="device_utilization low; MFU low despite fast per-replica",
+            )],
+            confidence=Confidence(n_models_validated=2, architecture_diversity=1,
+                                  human_verified=True),
             last_reverified_sdk="2.28.0",
         ),
 

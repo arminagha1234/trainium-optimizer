@@ -105,6 +105,26 @@ Each measurement must run enough tokens to be trustworthy:
 - Report p50 and p99, not just mean — p99 is what a user actually feels
 - Reject a measurement whose p99/p50 ratio exceeds 3.0 (too noisy, rerun)
 
+### Instance utilization floor: 85% of cores
+
+You paid for the whole box; use it. A deployment that pins the model to its TP
+group and leaves the rest of the instance idle is failing a resource gate, not
+just missing an optimization — TP=4 on a 64-core trn2.48xlarge (LNC=2) is ~6%
+utilization and ~$20/hr of idle silicon.
+
+- Utilization is `cores_used / cores_available` where
+  `cores_used = tp × cp × dp` and `cores_available` is the whole instance
+  (64 on trn2.48xlarge at LNC=2). MFU is reported against the **full**
+  instance, so idle cores drag it down and become visible.
+- This is a **soft** flag, not a hard discard: a model that genuinely cannot
+  fill the box (too large to replicate, or a latency run where DP=1 is
+  correct) is not wrong. It is annotated in the ledger (`[under-util: X% of N
+  cores]`) so the operator sees it, and the fill planner (`hardware.py`) is
+  expected to have already raised `dp`/`cp` to clear it.
+- **Fill the instance before adding instances.** The horizontal lever below
+  (N models across N boxes) is orthogonal: first fill one box for one model
+  (intra-instance DP/CP), *then* scale across boxes for the leaderboard.
+
 ## Stopping criteria
 
 Compute budget is **not** a constraint here — we have the capacity. But the
@@ -183,6 +203,7 @@ first, then performance is considered.
 | Batch sweep | 1-32 powers of 2 (1-4 for `stress`) |
 | Search-time probe | `chat` @ batch 1 and 32 only |
 | HBM ceiling | 85% at peak (full KV occupancy) |
+| Instance utilization floor | 85% of cores (soft flag; fill via DP/CP) |
 | Compile timeout | 30 min per candidate (family-overridable) |
 | Warmup / measured | 3 / 10 iterations minimum |
 | No-improvement stop | 5 rounds |
