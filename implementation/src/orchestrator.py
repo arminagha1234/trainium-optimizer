@@ -51,6 +51,13 @@ class ModelSpec:
     probe_shape: str = "chat 1k/512"
     probe_batch: int = 1
     seq_len: int = 1024
+    # Hardware-fit inputs. num_kv_heads bounds the clean TP degree (GQA rule);
+    # the fill plan uses it to decide when DP replicas (throughput) or KV
+    # replication (a testable option) are needed. track picks throughput vs
+    # latency fill behavior.
+    num_kv_heads: int | None = None
+    track: str = "throughput"   # "throughput" | "latency"
+    long_context: bool = False  # enables the context-parallel search axis
 
 
 @dataclass
@@ -77,6 +84,11 @@ class Orchestrator:
     ledger: Ledger
     equivalence: EquivalenceFn = always_equivalent
     sdk_version: str = "2.28.0"
+    # When set, the proposer fills the whole instance (DP replicas / CP) rather
+    # than leaving cores idle beyond the TP group. Left None it's a no-op, so
+    # existing budget-less callers and tests are unchanged. Real runs set it
+    # (e.g. "trn2.48xlarge") — see overnight.py.
+    instance_type: str | None = None
 
     # populated during a run
     incumbent: Candidate | None = None
@@ -107,7 +119,15 @@ class Orchestrator:
             self.establish_baseline(spec)
 
         axes = self.backend.config_axes()
-        proposer = BeamProposer(axes=axes, bank=self.bank)
+        budget = None
+        if self.instance_type:
+            from hardware import budget_for
+            budget = budget_for(self.instance_type)
+        proposer = BeamProposer(
+            axes=axes, bank=self.bank, budget=budget,
+            num_kv_heads=spec.num_kv_heads, track=spec.track,
+            long_context=spec.long_context,
+        )
 
         beam = proposer.seed(
             baseline=self.incumbent.config,
@@ -225,12 +245,19 @@ class Orchestrator:
         # _update_incumbent via a follow-up row only when it becomes incumbent.
         is_invention = stage is Stage.INVENT
         beats = self._beats_incumbent(cand, is_invention)
+        # Under-utilization is a soft flag, not a gate: record it in the
+        # description so "left the box idle" is visible in the ledger and chart,
+        # but never discard a correct, faster candidate for it.
+        desc = cand.provenance
+        if not self.guards.utilization_ok(m):
+            desc = (f"{desc} [under-util: {m.device_utilization:.0%} of "
+                    f"{m.cores_available} cores]")
         self._record(
             cand, stage, origin, layer, source, metric=m.metric,
             correctness=eq.correctness_pct, compile_s=neff.compile_seconds,
             mfu=m.mfu_percent,
             status=Status.KEEP if beats else Status.DISCARD,
-            desc=cand.provenance,
+            desc=desc,
         )
         return cand
 

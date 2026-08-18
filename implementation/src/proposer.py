@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from bank import KnowledgeBank, Lesson, LessonType, Tier
+from hardware import ComputeBudget, fill_plan
 from ledger import Layer, LAYER_DURABILITY
 
 
@@ -50,12 +51,47 @@ class BeamProposer:
         bank: KnowledgeBank | None = None,
         beam_size: int = 4,
         plans_per_parent: int = 8,
+        budget: ComputeBudget | None = None,
+        num_kv_heads: int | None = None,
+        track: str = "throughput",
+        long_context: bool = False,
     ) -> None:
-        self.axes = axes
+        self.axes = dict(axes)
         self.bank = bank
         self.beam_size = beam_size
         self.plans_per_parent = plans_per_parent
+        # Hardware awareness: when a budget is given, every candidate is filled
+        # to use the whole instance (see _fill). Without it, behavior is
+        # unchanged — this keeps the mock/unit path and any budget-less caller
+        # working exactly as before.
+        self.budget = budget
+        self.num_kv_heads = num_kv_heads
+        self.track = track
+        # Context parallelism becomes a search axis for the long-context track
+        # AND the latency track. Rationale: DP replicas raise *aggregate*
+        # throughput but do nothing for a single request's latency, so the
+        # "fastest possible" (latency) track fills the box with tp/cp — more
+        # cores working on one request — instead. For a plain short-shape
+        # throughput run, cp just burns search budget since DP fill already
+        # uses every core.
+        if (budget is not None and (long_context or track == "latency")
+                and "cp_degree" not in self.axes):
+            self.axes["cp_degree"] = [c for c in (1, 2, 4, 8) if c <= budget.num_cores]
         self._seen: set[tuple] = set()
+
+    def _fill(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Attach the parallelism fill-plan (dp/cp/util + kv_replication) so a
+        candidate uses the whole instance, not just its TP group. No-op when no
+        budget was supplied."""
+        if self.budget is None:
+            return config
+        tp = int(config.get("tp_degree", 1) or 1)
+        cp = int(config.get("cp_degree", 1) or 1)
+        plan = fill_plan(self.budget, tp=tp, cp=cp,
+                         num_kv_heads=self.num_kv_heads, track=self.track)
+        cfg = dict(config)
+        cfg.update(plan.as_config())
+        return cfg
 
     # -- seeding -------------------------------------------------------------
 
@@ -73,7 +109,7 @@ class BeamProposer:
         A good prior can land within a few percent of the Stage-1 optimum on
         the first candidate, which is the whole point of the knowledge bank.
         """
-        beam = [Candidate(config=dict(baseline), provenance="baseline")]
+        beam = [Candidate(config=self._fill(dict(baseline)), provenance="baseline")]
         self._seen.add(beam[0].key())
 
         if self.bank is not None:
@@ -83,7 +119,7 @@ class BeamProposer:
                 types=(LessonType.CONFIG_PRIOR,),
             )
             for lesson in priors[: self.beam_size]:
-                cfg = {**baseline, **lesson.intervention.get("spec", {})}
+                cfg = self._fill({**baseline, **lesson.intervention.get("spec", {})})
                 cand = Candidate(
                     config=cfg, parent=baseline,
                     provenance=f"prior:{lesson.lesson_id}",
@@ -112,7 +148,10 @@ class BeamProposer:
                         break
                     if parent.config.get(axis) == v:
                         continue
-                    cfg = {**parent.config, axis: v}
+                    # Re-fill after the perturbation: changing tp (or cp)
+                    # changes how many DP replicas fit, so dp/util are
+                    # recomputed rather than inherited from the parent.
+                    cfg = self._fill({**parent.config, axis: v})
                     cand = Candidate(
                         config=cfg, parent=parent.config,
                         provenance=f"{axis}={v}",
@@ -145,7 +184,7 @@ class BeamProposer:
                 for v in values:
                     if parent.config.get(axis) == v:
                         continue
-                    if ({**parent.config, axis: v}.items().__iter__() and
-                            tuple(sorted({**parent.config, axis: v}.items())) not in self._seen):
+                    cfg = self._fill({**parent.config, axis: v})
+                    if tuple(sorted(cfg.items())) not in self._seen:
                         return False
         return True

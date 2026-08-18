@@ -38,6 +38,9 @@ class Guardrails:
     marginal_improvement_pct: float = 2.0   # below this counts as noise
     max_iterations: int = 100
     invention_margin_pct: float = 5.0   # Stage-4 promotion bar over borrowed
+    min_utilization: float = 0.85       # of the instance's cores; below is a
+                                        # "you paid for a box and left it idle"
+                                        # flag, not a correctness failure
 
     def hbm_ok(self, m: Measurements) -> bool:
         # Peak HBM must be measured at full KV occupancy, not step 0 — a config
@@ -48,6 +51,16 @@ class Guardrails:
 
     def compile_ok(self, compile_seconds: float) -> bool:
         return compile_seconds <= self.compile_timeout_s
+
+    def utilization_ok(self, m: Measurements) -> bool:
+        """Is the deployment using enough of the instance? This is a soft gate
+        by design — a model that genuinely cannot fill the box (too large to
+        replicate, or a latency run where DP=1 is correct) is not *wrong*. The
+        orchestrator uses this to flag under-utilization in the ledger, not to
+        discard the candidate. Unknown occupancy (cores_available=0) passes."""
+        if m.cores_available <= 0:
+            return True
+        return m.device_utilization >= self.min_utilization
 
     def measurement_trustworthy(self, m: Measurements) -> bool:
         if m.warmup_iters < self.min_warmup_iters:
