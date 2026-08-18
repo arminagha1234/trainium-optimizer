@@ -140,8 +140,10 @@ def seed_lessons() -> list[Lesson]:
                 "Hybrid-attention ~27B (Qwen3.x-style GQA, often 4 KV heads) is "
                 "capped at TP=num_kv_heads=4 for clean attention sharding. That "
                 "is only 4 of 64 logical cores on trn2.48xlarge (LNC=2). Do NOT "
-                "stop there: the fill planner adds data-parallel replicas "
-                "(dp=16) to use all 64 cores for ~16x throughput. TP>kv_heads "
+                "stop there: the search sweeps the whole TPxDP grid (TP=4xDP=16, "
+                "TP=8xDP=8, ... TP=64xDP=1 — every box-filling partition) and "
+                "MEASURES each; a good default is low-TP x many-DP for "
+                "throughput, but the winner is decided by measurement. TP>kv_heads "
                 "is possible via KV "
                 "replication but must be measured, not assumed — it trades "
                 "redundant KV work for tensor-parallel width and only sometimes "
@@ -194,9 +196,15 @@ def seed_lessons() -> list[Lesson]:
             matcher={"tp_degree": {"gte": 16}},
             reason=("At TP>=16 with under 30B params, per-core weight shards get "
                     "small enough that collective overhead dominates and the "
-                    "compiler spills. ~3x slower than TP=8."),
+                    "compiler spills. ~3x slower than TP=8. NOTE: verified on "
+                    "XLA only — on other backends this is measured, not "
+                    "assumed, so the TPxDP sweep can confirm it on native."),
             confidence=Confidence(n_models_validated=3, human_verified=True),
             last_reverified_sdk="2.28.0",
+            # Verified on vLLM-Neuron/XLA. On native PyTorch it does NOT
+            # pre-prune — the TPxDP sweep measures TP>=16 to verify the prior
+            # on the new backend before trusting it.
+            backend_validated=["vllm-neuron-xla"],
         ),
         Lesson(
             lesson_id="fp8-activations-rmsnorm-heavy",

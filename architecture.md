@@ -326,15 +326,17 @@ harmlessly (the box just isn't filled yet, so nothing breaks):
    utilization guardrail and the ledger's `[under-util: …]` flag work on real
    hardware exactly as they do against the mock.
 
-`config_axes()` needs two changes: add `cp_degree` (for the long-context /
-latency track), and **extend `tp_degree` up to the instance core count** rather
-than stopping at 8. Today it returns `[1, 2, 4, 8]`; on a 64-core
-trn2.48xlarge the legal TP values run to 64 (still bounded by `num_kv_heads`
-for clean sharding, and by the TP≥16-spill anti-pattern for small models, so
-the search will rarely pick the high end — but it should be *allowed* to try,
-and generate the value from the detected core count, not a hardcoded list).
-`dp_degree` is *derived* by the planner, so the backend reads it from the
-handed config rather than enumerating it.
+**Heads-up: the proposer now sweeps `tp_degree` to the core count itself**
+(1, 2, 4, …, 64 on trn2.48xlarge), deriving `dp_degree` per TP to sweep the
+full TP×DP grid. So the worker *will* be handed high TP values — including
+`tp > num_kv_heads` with `kv_replication > 1`. It must either run them (replicate
+KV heads) or reject cleanly with `invalid_tp` (which is recorded as a failed
+data point). Today it hard-fails the divisibility assertion; honoring
+`kv_replication` is what lets the sweep actually measure the high-TP end. The
+"TP≥16 spills" anti-pattern is verify-first (validated on XLA only), so it will
+NOT pre-prune those points on native — they're meant to be measured here.
+`config_axes()` still only needs to add `cp_degree` (for the latency /
+long-context track); `tp_degree` and `dp_degree` are handled by the planner.
 
 ## Blocking unknown, restated
 

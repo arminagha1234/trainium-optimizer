@@ -103,16 +103,31 @@ Anti-patterns prune here too, before any compile happens.
 
 **Fill the instance — `tp_degree` is not the whole story.** `tp_degree` is
 bounded by the model: GQA requires `num_kv_heads % tp == 0`, so a 27B model
-with 4 KV heads is capped at TP=4. On a trn2.48xlarge that is *4 of 64 logical
-cores* (LNC=2) — the search must not stop there and leave ~94% of a paid
-instance idle. `dp_degree` is therefore **derived, not searched**: for the
-throughput track the fill planner sets `dp = cores // (tp*cp)` so every
-candidate uses the whole box (TP=4 → DP=16 → ~16× throughput). `cp_degree`
-fills the box for the long-context / latency track instead. Going *past* the
-KV-head cap
-(`tp > num_kv_heads`) is possible by replicating KV heads across ranks — it is
-a **testable** candidate the search may try, not a hard ceiling and not an
-assumption. See `hardware.py` (`fill_plan`) and the utilization guardrail.
+with 4 KV heads is capped at TP=4 *for clean sharding*. On a trn2.48xlarge that
+is *4 of 64 logical cores* (LNC=2) — the search must not stop there and leave
+~94% of a paid instance idle.
+
+**The search sweeps the whole TP×DP grid.** `tp_degree` is swept to the core
+count (1, 2, 4, …, 64) and `dp_degree` is **derived** (`dp = cores // (tp*cp)`),
+so every candidate is a box-filling partition and the search measures the
+entire grid:
+
+```
+TP=64×DP=1   TP=32×DP=2   TP=16×DP=4   TP=8×DP=8   TP=4×DP=16   TP=2×DP=32   TP=1×DP=64
+```
+
+max-TP/one-replica … one-TP/many-replicas — the complete mix. The winner is
+decided by **measurement**, not by assuming a moderate TP. Two consequences:
+
+- Going *past* the KV-head cap (`tp > num_kv_heads`) needs KV heads replicated
+  across ranks (`kv_replication`) — a **testable** candidate the sweep tries,
+  not a hard ceiling. The worker must honor it, else those points error
+  `invalid_tp` and are recorded as failures (still useful data).
+- The "TP≥16 spills" prior is **verify-first**: it prunes only on backends it's
+  been validated on (XLA), so on native PyTorch the high-TP points are
+  *measured* to confirm the prior before it's trusted. `cp_degree` fills the
+  box for the long-context / latency track instead of DP. See `hardware.py`
+  (`fill_plan`) and the utilization guardrail.
 
 **Throughput vs latency fill are different.** How you spend the 64 cores
 depends on what the customer wants:

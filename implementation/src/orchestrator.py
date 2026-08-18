@@ -174,7 +174,8 @@ class Orchestrator:
             # Anti-pattern pruning — zero cost, before any compile.
             family_dir = spec.family.replace("_", "-")
             configs = [c.config for c in candidates]
-            _survivors, pruned = self.bank.prune(configs, family_dir, self.sdk_version)
+            _survivors, pruned = self.bank.prune(
+                configs, family_dir, self.sdk_version, backend=self.backend.name)
             pruned_keys = {tuple(sorted(cfg.items())) for cfg, _ in pruned}
             for cfg, prune_reason in pruned:
                 self._record_pruned(cfg, prune_reason)
