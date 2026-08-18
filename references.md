@@ -13,7 +13,7 @@ techniques, and prior art. Extends the original `websites_check` note.
 
 ### Existing internal tooling (already in this workspace)
 - `neuron/neuron-agentic-development-merged/` — autoport + NKI writer/debugger/optimizer agents
-- `neuron/private-vllm-neuron/` — vLLM-Neuron backend, kernel adapters
+- `neuron/vllm-neuron/` — vLLM-Neuron backend, kernel adapters
 - `neuron/examples/` — reference implementations we can pattern-match against
 
 ### Existing skills (in `.kiro/skills/`, if applicable)

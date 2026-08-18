@@ -1,7 +1,7 @@
 """
 Trajectory chart — "how did it improve", generated from the ledger.
 
-Modeled on `auto_research_for_AWS_Neuron_optimization`'s generate_chart.py,
+Modeled on `internal-prior-optimization-run`'s generate_chart.py,
 with one significant change: that version hardcodes its data arrays
 ("simplified from ~100 experiments"). This reads the ledger directly, so the
 chart can never drift from the record and it scales to 100 models.

@@ -3,7 +3,7 @@ Seed the knowledge bank with initial verified lessons.
 
 Do not make the optimizer rediscover things the Neuron ecosystem already
 knows. These lessons come from the auto_research run's real measured findings
-(the three all_gather-elimination rewrites that carried it to 17.6x) plus
+(the three all_gather-elimination rewrites that carried it to a large (multiple-x)) plus
 well-established config priors and anti-patterns.
 
 All are backend-relevant and tagged by layer. The three op_rewrites are
@@ -51,7 +51,7 @@ def seed_lessons() -> list[Lesson]:
                 signature="all_gather of hidden states dominates step time",
                 observed_via="CC engine busy, PE idle in profile",
             )],
-            source="auto_research_for_AWS_Neuron_optimization",
+            source="internal-prior-optimization-run",
             confidence=Confidence(n_models_validated=4, architecture_diversity=2,
                                   human_verified=True),
             last_reverified_sdk="2.28.0",
@@ -77,7 +77,7 @@ def seed_lessons() -> list[Lesson]:
                 signature="prior-context attention scan dominates at long seq",
                 observed_via="PE busy in attention, cost grows with context len",
             )],
-            source="auto_research_for_AWS_Neuron_optimization + nki-library kv_parallel_segmented",
+            source="internal-prior-optimization-run + nki-library kv_parallel_segmented",
             confidence=Confidence(n_models_validated=4, architecture_diversity=2,
                                   human_verified=True),
             last_reverified_sdk="2.28.0",
@@ -99,7 +99,7 @@ def seed_lessons() -> list[Lesson]:
                 signature="MoE input all_gather dominates",
                 observed_via="CC engine busy at expert dispatch",
             )],
-            source="auto_research_for_AWS_Neuron_optimization",
+            source="internal-prior-optimization-run",
             confidence=Confidence(n_models_validated=3, architecture_diversity=1,
                                   human_verified=True),
             last_reverified_sdk="2.28.0",

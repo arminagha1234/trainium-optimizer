@@ -112,7 +112,7 @@ encode internal Neuron knowledge, keep ours and take Autocomp's *search
 architecture* rather than its code. Either way, take the beam search and the
 plan/implement split. Added as Q13.
 
-## 2. `auto_research_for_AWS_Neuron_optimization` (private, cloned + read)
+## 2. `internal-prior-optimization-run` (private, cloned + read)
 
 **This is the most directly useful reference of the set.** A working 12-hour
 autonomous optimization loop for LLM prefill throughput on Trn2, built on
@@ -123,9 +123,9 @@ and it has real measured results.
 
 | Model | Type | Official config | 128K context | MFU (base→opt) | Correctness |
 |-------|------|----------------|--------------|----------------|-------------|
-| Tongyi-30B-A3B | MoE | **17.6x** | **24.0x** | 0.28% → 4.93% | 100% |
-| GPT-OSS-20B | MoE | **16.3x** | **66.7x** | 0.36% → 5.89% | 100% |
-| GPT-OSS-120B | MoE | **11.4x** | ~9.2x | 0.60% → 6.88% | 100% |
+| Tongyi-30B-A3B | MoE | **a large (multiple-x)** | **a large** | 0.28% → 4.93% | 100% |
+| GPT-OSS-20B | MoE | **a large** | **a large** | 0.36% → 5.89% | 100% |
+| GPT-OSS-120B | MoE | **a large** | ~9.2x | 0.60% → 6.88% | 100% |
 | Qwen3-VL-32B | Dense | **2.8x** | 2.4x | 10.36% → 28.87% | 100% |
 
 Two conclusions we should internalize:
@@ -133,7 +133,7 @@ Two conclusions we should internalize:
 1. **MoE gains dwarf dense gains** (11-17x vs 2.8x). The MoE wins came from
    eliminating `all_gather` of activations. Our seed set is currently three
    dense-ish models — we may be picking the *hardest* case to show value on.
-2. **Even after 17.6x, MFU is ~5%.** The headroom remaining is enormous.
+2. **Even after a large (multiple-x), MFU is ~5%.** The headroom remaining is enormous.
    That reframes what "optimized" means and argues strongly for tracking
    roofline attainment rather than just speedup multiples.
 

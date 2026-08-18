@@ -36,7 +36,7 @@ human in the loop.
 > 5. **Implement `implementation/src/backends/native_pytorch.py`**: fill in the
 >    stubbed methods in the documented order (build_baseline + compile +
 >    measure first, then profile, then kernel_swap_points). The Beta 3 patterns
->    are in each docstring and in `.kiro/steering/beta3-only.md`. Wire the real
+>    are in each docstring and in `internal Neuron Beta 3 setup docs`. Wire the real
 >    equivalence checker into `overnight.py`'s `_equivalence_for`.
 >
 > 6. **Run for real**:

@@ -10,7 +10,7 @@ Everything a real backend must satisfy is in ../base.py (the Backend Protocol).
 This file documents HOW each method maps onto the Beta 3 native-PyTorch stack,
 so whoever finishes it (Claude Code, on-device) has the exact patterns.
 
-CRITICAL — Beta 3 patterns (from .kiro/steering/beta3-only.md, a hard rule):
+CRITICAL — Beta 3 patterns (from internal Neuron Beta 3 setup docs, a hard rule):
   - device string is torch.device("neuron")   NOT "privateuseone:N"  (Beta 2)
   - torch.compile(model, backend="neuron", dynamic=False)  — dynamic unsupported
   - distributed rendezvous: torchrun --rdzv_backend c10d
@@ -176,5 +176,5 @@ class NativePyTorchBackend:
             "device_string": "neuron",
             "instance_type": self.instance_type,
             "_note": "read real versions with pip show on-device; these are "
-                     "the Beta 3 expected values from .kiro/steering/beta3-only.md",
+                     "the Beta 3 expected values from internal Neuron Beta 3 setup docs",
         }

@@ -7,7 +7,7 @@ Everything above this line in the stack (bank, search loop, guardrails,
 ledger, reporting, and the NKI kernels themselves) is backend-independent.
 
 Concrete backends:
-  vllm_neuron_xla.py   — V1 primary. Production-representative, proven at 17.6x.
+  vllm_neuron_xla.py   — V1 primary. Production-representative, proven at a large (multiple-x).
   nxdi_xla.py          — Stage 0 baseline producer (what autoport targets).
   native_pytorch.py    — added when the beta is viable and TP=8 works on Trn2.
 

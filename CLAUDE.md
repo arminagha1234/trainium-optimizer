@@ -43,7 +43,7 @@ If those pass, the core logic is intact and the problem is purely the backend.
 ### Task 1 — set up the Beta 3 environment
 Follow `implementation/ENVIRONMENT.md`. It pulls the Beta 3 DLC, installs the
 driver, and verifies the device. **Beta 3 only — never Beta 2** (hard rule,
-see `.kiro/steering/beta3-only.md`).
+see `internal Neuron Beta 3 setup docs`).
 
 ### Task 2 — the TP=8 gate (do this BEFORE finishing the backend)
 There is one unknown that decides everything: **does cross-chip tensor
@@ -90,7 +90,7 @@ All fit a trn2.3xlarge in bf16. Do NOT start on a 70B+ or MoE flagship.
 ## Rules of the game (non-negotiable)
 
 These come from `optimization-stages.md` and the reference implementation that
-hit 17.6x. Each prevents an observed failure.
+hit a large (multiple-x). Each prevents an observed failure.
 
 1. **Equivalence is a hard gate.** A faster config that fails equivalence is a
    bug, not a win. Never keep it. The baseline defines correctness; everything

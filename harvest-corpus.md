@@ -5,7 +5,7 @@ Harvest** that mines working code before any optimization is attempted.
 
 ## Why this stage exists — a concrete case
 
-The `auto_research_for_AWS_Neuron_optimization` run spent Round 3 hand-building
+The `internal-prior-optimization-run` run spent Round 3 hand-building
 **Context Parallel**: splitting prior KV cache across ranks and merging with an
 online softmax reduction.
 
@@ -48,7 +48,7 @@ assumption.** Your instinct here is right.
 | Repo | Stars | Notes |
 |------|-------|-------|
 | [`upstreaming-to-vllm`](https://github.com/aws-neuron/upstreaming-to-vllm) | 25 | Public vLLM-Neuron |
-| `private-vllm-neuron` | 22 | Private dev repo, updated 2026-08-15 — very active |
+| `vllm-neuron` | 22 | Private dev repo, updated 2026-08-15 — very active |
 | [`neuronx-distributed-inference`](https://github.com/aws-neuron/neuronx-distributed-inference) | 40 | NxDI — the autoport target |
 | [`torch-neuronx`](https://github.com/aws-neuron/torch-neuronx) | 29 | The native-PyTorch path |
 | [`neuronx-distributed`](https://github.com/aws-neuron/neuronx-distributed) | 68 | Distributed primitives |

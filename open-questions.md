@@ -393,7 +393,7 @@ undermine the leaderboard's credibility.
   batching, paged attention, prefix caching, and a scheduler — all of which
   are things to *tune*. Native PyTorch has none of that; we would be building
   serving infrastructure rather than optimizing it.
-- **The one proven result used vLLM-Neuron.** `auto_research` hit 17.6x on it.
+- **The one proven result used vLLM-Neuron.** `auto_research` hit a large (multiple-x) on it.
   That is the only end-to-end evidence we have that this whole approach works
   on Trainium.
 - **Known TP limitations.** Per this workspace's own beta notes, verified on
@@ -408,7 +408,7 @@ undermine the leaderboard's credibility.
 
 | Backend | Role | Why |
 |---------|------|-----|
-| **vLLM-Neuron** | **Primary — the leaderboard backend** | Production-representative, proven at 17.6x, rich tunable surface, TP works |
+| **vLLM-Neuron** | **Primary — the leaderboard backend** | Production-representative, proven at a large (multiple-x), rich tunable surface, TP works |
 | **Native PyTorch** | Fast-iteration research track + Stage 4 kernel dev environment | Eager mode removes the compile wait for correctness work; better debugging; also the right home for architectures vLLM does not support |
 | NxDI | Autoport baseline producer (Stage 0) | Already what `neuron-framework-autoport` targets |
 
