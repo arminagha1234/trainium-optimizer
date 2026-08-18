@@ -135,3 +135,53 @@ def test_orchestrator_fills_the_instance():
         # baseline in the mock is ~600 tok/s single-replica; filling the box
         # must beat that comfortably.
         assert best.metric > 600
+
+
+# -- TP x DP sweep (measure every box-filling partition) ---------------------
+
+def test_tp_axis_sweeps_to_core_count():
+    """With a budget, the TP axis must reach the instance core count so the
+    full TP x DP grid is searched, not the hardcoded [1,2,4,8]."""
+    b = budget_for("trn2.48xlarge")            # 64 cores
+    p = BeamProposer(axes={"tp_degree": [1, 2, 4, 8], "weights_dtype": ["bf16"]},
+                     budget=b)
+    assert set(p.axes["tp_degree"]) >= {1, 2, 4, 8, 16, 32, 64}
+
+
+def test_tp_dp_grid_every_partition_fills_the_box():
+    """Each TP in the sweep pairs with the DP that fills the 64-core box:
+    TP=64/DP=1 ... TP=1/DP=64 — the 'complete mix' to compare."""
+    b = budget_for("trn2.48xlarge")
+    for tp, exp_dp in [(64, 1), (32, 2), (16, 4), (8, 8), (4, 16), (2, 32), (1, 64)]:
+        plan = fill_plan(b, tp=tp)
+        assert plan.dp == exp_dp, f"tp={tp} -> dp should be {exp_dp}, got {plan.dp}"
+        assert plan.cores_used == 64
+
+
+def test_antipattern_is_verify_first_by_backend(tmp_path):
+    """An anti-pattern validated only on XLA must NOT pre-prune high TP on the
+    native backend — those get measured so the prior is verified there first."""
+    from bank import (Applicability, Confidence, KnowledgeBank, Lesson,
+                      LessonType, Tier)
+    from ledger import Layer
+
+    bank = KnowledgeBank(tmp_path)
+    bank.save(Lesson(
+        lesson_id="tp16-xla-only", type=LessonType.ANTI_PATTERN,
+        applicability=Applicability("dense_causal_lm", (0, 30e9),
+                                    neuron_sdk_versions=["2.28.*"]),
+        layer=Layer.CONFIG, migration_risk="medium", tier=Tier.VERIFIED,
+        matcher={"tp_degree": {"gte": 16}}, reason="spills on XLA",
+        confidence=Confidence(n_models_validated=3, human_verified=True),
+        last_reverified_sdk="2.28.0", backend_validated=["vllm-neuron-xla"],
+    ))
+    cfgs = [{"tp_degree": 32}]
+    # validated backend -> pruned
+    surv, pruned = bank.prune(cfgs, "dense-causal-lm", "2.28.0", backend="vllm-neuron-xla")
+    assert pruned and not surv
+    # a different backend -> measured, not pruned
+    surv, pruned = bank.prune(cfgs, "dense-causal-lm", "2.28.0", backend="native-pytorch-beta3")
+    assert surv and not pruned
+    # backend unspecified -> backward-compatible always-prune
+    surv, pruned = bank.prune(cfgs, "dense-causal-lm", "2.28.0")
+    assert pruned and not surv

@@ -167,6 +167,13 @@ class Lesson:
     source: str = ""            # repo@commit for harvested/borrowed
     last_reverified_sdk: str = ""
     evidence: list[dict[str, Any]] = field(default_factory=list)
+    # Backends this lesson has actually been validated on. EMPTY = applies
+    # everywhere (backward-compatible default). A NON-empty list means an
+    # anti-pattern only prunes on those backends — on any other backend the
+    # candidate is measured instead, so an unverified prior (e.g. "TP>=16
+    # spills", proven on XLA) does not silently block exploration on a new
+    # backend like native PyTorch.
+    backend_validated: list[str] = field(default_factory=list)
 
     # Promotion audit trail. auto_promoted is deliberately distinct from
     # confidence.human_verified: an auto-promoted lesson is trusted by the
@@ -206,6 +213,7 @@ class Lesson:
             source=d.get("source", ""),
             last_reverified_sdk=d.get("last_reverified_sdk", ""),
             evidence=d.get("evidence", []),
+            backend_validated=d.get("backend_validated", []),
             auto_promoted=d.get("auto_promoted", False),
             promoted_at=d.get("promoted_at", ""),
             beat_borrowed_by=d.get("beat_borrowed_by", None),
@@ -251,6 +259,8 @@ class Lesson:
             out["last_reverified_sdk"] = self.last_reverified_sdk
         if self.evidence:
             out["evidence"] = self.evidence
+        if self.backend_validated:
+            out["backend_validated"] = self.backend_validated
         if self.auto_promoted:
             out["auto_promoted"] = self.auto_promoted
         if self.promoted_at:
@@ -433,16 +443,30 @@ class KnowledgeBank:
 
     def prune(
         self, candidates: list[dict[str, Any]], family: str, sdk_version: str,
+        backend: str | None = None,
     ) -> tuple[list[dict[str, Any]], list[tuple[dict, str]]]:
         """Drop candidates matching a known anti-pattern, before any compile.
 
         Returns (survivors, [(pruned_config, reason), ...]). The pruned list
         feeds the ledger as zero-cost negative results.
+
+        Verify-first: an anti-pattern only prunes when it is *active* on the
+        current backend. An anti-pattern with a non-empty `backend_validated`
+        that does not include `backend` is NOT applied — its candidates are
+        measured instead, so an unverified prior can't silently block
+        exploration on a new backend. Empty `backend_validated`, or backend
+        left None, keeps the old always-prune behavior.
         """
         aps = self.antipatterns(family, sdk_version)
+
+        def active(ap: Lesson) -> bool:
+            if not ap.backend_validated or backend is None:
+                return True
+            return backend in ap.backend_validated
+
         survivors, pruned = [], []
         for cfg in candidates:
-            hit = next((ap for ap in aps if ap.prunes(cfg)), None)
+            hit = next((ap for ap in aps if active(ap) and ap.prunes(cfg)), None)
             if hit is None:
                 survivors.append(cfg)
             else:

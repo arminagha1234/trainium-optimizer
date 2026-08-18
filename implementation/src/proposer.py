@@ -67,6 +67,17 @@ class BeamProposer:
         self.budget = budget
         self.num_kv_heads = num_kv_heads
         self.track = track
+        # Sweep TP across the whole instance: powers of 2 up to the core count.
+        # Combined with the DP fill (dp = cores // (tp*cp)), this yields the
+        # entire TP x DP grid — max-TP/1-replica ... 1-TP/max-replicas — so the
+        # search MEASURES every box-filling partition instead of assuming one.
+        # The winner is decided by measurement, not a hardcoded [1,2,4,8] list.
+        if budget is not None and "tp_degree" in self.axes:
+            powers, p = [], 1
+            while p <= budget.num_cores:
+                powers.append(p)
+                p *= 2
+            self.axes["tp_degree"] = sorted(set(self.axes["tp_degree"]).union(powers))
         # Context parallelism becomes a search axis for the long-context track
         # AND the latency track. Rationale: DP replicas raise *aggregate*
         # throughput but do nothing for a single request's latency, so the
