@@ -32,7 +32,8 @@ from guardrails import Guardrails
 from ledger import Ledger, Origin
 from orchestrator import ModelSpec, Orchestrator
 from publish import publish
-from trajectory_chart import build_chart
+from leaderboard_chart import build_leaderboard_chart
+from trajectory_chart import build_chart, build_highlights_chart
 
 
 # The three seed models, in escalation order (see CLAUDE.md). `family` drives
@@ -42,11 +43,6 @@ SEED_MODELS: dict[str, ModelSpec] = {
     "qwen3-0-6b": ModelSpec(
         model_id="Qwen/Qwen3-0.6B", family="dense_causal_lm",
         param_count=0.6e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1,
-    ),
-    # The three real seeds (escalation order). IDs verified present on HF Hub.
-    "gemma-4-31b": ModelSpec(
-        model_id="google/gemma-4-31B", family="dense_causal_lm",
-        param_count=31e9, parent="gemma", probe_shape="chat 512/256", probe_batch=1,
     ),
     "qwen3-1-7b": ModelSpec(
         model_id="Qwen/Qwen3-1.7B", family="dense_causal_lm",
@@ -60,9 +56,24 @@ SEED_MODELS: dict[str, ModelSpec] = {
         model_id="Qwen/Qwen3-8B", family="dense_causal_lm",
         param_count=8e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1,
     ),
+    # Large dense text seed — replaces the non-open muse-glimmer-30b. Verified
+    # working at tp8 (8.4GB/rank) on real HW, 2026-08-18.
+    "qwen3-32b": ModelSpec(
+        model_id="Qwen/Qwen3-32B", family="dense_causal_lm",
+        param_count=32e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1,
+        num_kv_heads=8,
+    ),
+    # The two hard seeds — attempted every cycle, currently need dedicated
+    # adapters (gemma4 head-layout; qwen3.8 GQA-4 / vocab-parallel to reach tp8).
+    "gemma-4-31b": ModelSpec(
+        model_id="google/gemma-4-31B", family="dense_causal_lm",
+        param_count=31e9, parent="gemma", probe_shape="chat 512/256", probe_batch=1,
+        num_kv_heads=16,
+    ),
     "qwen3-8-27b": ModelSpec(
         model_id="Qwen/Qwen3.8-27B", family="hybrid_attention_causal_lm",
         param_count=27e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1,
+        num_kv_heads=4,
     ),
 }
 
@@ -149,13 +160,27 @@ def run_one(
         )
         log(f"[{slug}] published recipe -> {dest}")
 
-        # Chart the trajectory.
+        # Chart the trajectory — the detailed engineer view (every attempt).
         chart = build_chart(
             run_dir=run_dir, out_path=run_dir / "optimization_timeline.png",
             model=spec.model_id, hardware=backend_name, shape=spec.probe_shape,
             sdk=sdk_version,
         )
         log(f"[{slug}] chart -> {chart}")
+
+        # And the highlights view — kept-only staircase with stage dividers
+        # and a big final Nx callout (Wutong style). Failure to render this
+        # never blocks the run: it's a presentation artifact, not a gate.
+        try:
+            hi = build_highlights_chart(
+                run_dir=run_dir,
+                out_path=run_dir / "optimization_highlights.png",
+                model=spec.model_id, hardware=backend_name,
+                shape=spec.probe_shape, sdk=sdk_version,
+            )
+            log(f"[{slug}] highlights -> {hi}")
+        except Exception as e:  # noqa: BLE001
+            log(f"[{slug}] highlights chart failed (non-fatal): {e}")
 
         # Emit a provisional lesson from the winning config, for the bank.
         _emit_lesson(bank, slug, spec, best, sdk_version, log)
@@ -315,6 +340,16 @@ def main() -> None:
                     log(f"auto-promoted {n} provisional lesson(s) -> verified")
 
             board = write_leaderboard(results, out_root, a.backend, cycle)
+            # And the picture next to the table — the cross-model bar chart.
+            # Failure to render is non-fatal so it never breaks the run loop.
+            try:
+                board_img = build_leaderboard_chart(
+                    results, out_root / "leaderboard.png",
+                    backend=a.backend, sdk=a.sdk, cycle=cycle,
+                )
+                log(f"leaderboard chart -> {board_img}")
+            except Exception as e:  # noqa: BLE001
+                log(f"leaderboard chart failed (non-fatal): {e}")
             ok = sum(1 for r in results if r.ok)
             stats = bank.stats(current_sdk=a.sdk)
             log(f"=== cycle {cycle} done: {ok}/{len(results)} ok | "

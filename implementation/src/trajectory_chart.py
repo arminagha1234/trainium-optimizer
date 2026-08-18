@@ -419,6 +419,237 @@ def _short_label(desc: str, width: int = 22) -> str:
     return "\n".join(lines)
 
 
+# -- highlights chart (kept-only staircase, the "presentation" view) --------
+
+# Stage labels for the top-of-plot annotations, styled after wutong's
+# "Round 1 (Params)". Renamed to our stage vocabulary so the two vocabularies
+# don't drift.
+_STAGE_LABEL: dict[Stage, str] = {
+    Stage.BASELINE: "Baseline",
+    Stage.HARVEST: "Stage 0.5\n(Harvest)",
+    Stage.CONFIG: "Stage 1\n(Config)",
+    Stage.KNOWN_KERNEL: "Stage 2\n(Known Kernels)",
+    Stage.BORROW: "Stage 3\n(Borrow)",
+    Stage.INVENT: "Stage 4\n(Invent)",
+    Stage.GRAPH_REWRITE: "Stage 5\n(Graph Rewrite)",
+}
+
+
+def _stage_label(stage: Stage) -> str:
+    return _STAGE_LABEL.get(stage, stage.value)
+
+
+# Row.description -> prose idea. Explicit map for the common axis=value combos
+# so the staircase reads as ideas ("torch.compile", "NKI flash-attention"), not
+# parameter names ("compile_mode=compile-default"). Falls back to a light
+# pretty-print for anything unmapped so new axes never crash the chart.
+_IDEA_MAP: dict[str, str] = {
+    "compile_mode=compile-default": "torch.compile",
+    "compile_mode=compile-max": "torch.compile\n(max-autotune)",
+    "compile_mode=compile-reduce-overhead": "torch.compile\n(reduce-overhead)",
+    "compile_mode=eager": "Eager mode",
+    "attn_implementation=sdpa": "SDPA attention",
+    "attn_implementation=flash": "Flash attention",
+    "attn_implementation=eager_math": "Math attention",
+    "attention_kernel=nki_flash": "NKI\nflash-attention",
+    "attention_kernel=paged": "Paged attention",
+    "attention_kernel=kv_parallel": "KV-parallel\nattention",
+    "weights_dtype=bf16": "BF16 weights",
+    "weights_dtype=fp8": "FP8 weights",
+    "weights_dtype=int8": "INT8 weights",
+    "kv_cache_dtype=bf16": "BF16 KV cache",
+    "kv_cache_dtype=fp8": "FP8 KV cache",
+    "batching=paged": "Paged batching",
+    "batching=continuous": "Continuous batching",
+    "batching=static": "Static batching",
+    "sequence_layout=bshd": "BSHD layout",
+    "sequence_layout=sbhd": "SBHD layout",
+    "track=latency": "Latency track\n(dp=1)",
+    "track=throughput": "Throughput track",
+}
+
+_PRETTY_AXIS: dict[str, str] = {
+    "tp_degree": "TP",
+    "cp_degree": "CP",
+    "dp_degree": "DP",
+    "kv_replication": "KV-rep",
+}
+
+
+def _ideafy(row: Row) -> str:
+    """A row's provenance rendered as a short prose idea for the x-axis of the
+    highlights chart. Explicit map first, then light pretty-print, then a
+    stage/origin fallback for the kernel stages."""
+    # Drop the under-utilization annotation the orchestrator may have appended;
+    # it belongs on the busy chart, not the presentation one.
+    desc = row.description.split("[under-util:")[0].strip()
+    if not desc or desc.lower() == "baseline":
+        return "Baseline"
+    if desc in _IDEA_MAP:
+        return _IDEA_MAP[desc]
+    # bank prior:lesson-id — show the lesson id, truncated
+    if desc.startswith("prior:"):
+        lid = desc.split(":", 1)[1]
+        return f"Bank prior:\n{lid[:22]}"
+    # single axis=value not in the map: pretty-print the axis
+    if "=" in desc:
+        axis, value = desc.split("=", 1)
+        return f"{_PRETTY_AXIS.get(axis, axis.replace('_', ' '))}={value}"
+    # stage/origin fallback for the kernel stages
+    if row.stage is Stage.BORROW and row.source:
+        return f"Borrowed:\n{row.source.split('@')[0][:20]}"
+    if row.stage is Stage.INVENT:
+        return "Invented\nkernel"
+    if row.stage is Stage.KNOWN_KERNEL and row.origin is Origin.HARVESTED:
+        return "nkilib kernel"
+    if row.stage is Stage.HARVEST:
+        return "Harvested\nfrom corpus"
+    return desc[:22]
+
+
+def build_highlights_chart(
+    run_dir: Path,
+    out_path: Path,
+    model: str,
+    hardware: str = "",
+    tp: int | None = None,
+    shape: str = "",
+    sdk: str = "",
+    metric_label: str = "tok/s",
+) -> Path:
+    """Wutong-style kept-path staircase — the "presentation" chart.
+
+    Complementary to build_chart: that one shows every attempt with stage
+    colors, provenance markers, MFU, and discards — the engineer view. This
+    one shows only the *story*: the winning path stepped up, labelled with
+    the idea (not the axis value), stage sections divided by dashed lines
+    with big prose labels on top, and a giant final Nx callout in red.
+
+    Modeled on wutongabc/auto_research_for_AWS_Neuron_optimization's
+    "Every Optimization Step" chart. The 5-6× compile-mode cliff on Qwen3-8B
+    is exactly the kind of jump this view was designed to sell.
+    """
+    led = Ledger(run_dir)
+    rows = led.read()
+    if not rows:
+        raise SystemExit(f"ledger is empty: {led.path}")
+    kept = [r for r in rows if r.kept]
+    if not kept:
+        raise SystemExit("no kept rows — nothing to plot")
+
+    plt.rcParams.update(THEME)
+    fig, ax = plt.subplots(figsize=(14, 6.5))
+    # top pad leaves room for the stage-name row; bottom pad for prose labels.
+    fig.subplots_adjust(top=0.80, bottom=0.24, left=0.08, right=0.94)
+
+    fig.suptitle(
+        f"{model}: Every Optimization Step",
+        fontsize=17, fontweight="bold", color="#f0f6fc", y=0.965,
+    )
+    cond = " │ ".join(
+        p for p in (
+            hardware,
+            f"TP={tp}" if tp else "",
+            shape,
+            f"SDK {sdk}" if sdk else "",
+        ) if p
+    )
+    if cond:
+        fig.text(0.5, 0.895, cond, ha="center", fontsize=10, color="#8b949e")
+
+    xs = list(range(len(kept)))
+    ys = [r.metric for r in kept]
+
+    # -- the staircase itself ------------------------------------------------
+    # steps-post = horizontal-then-vertical: each improvement "holds" until
+    # the next win. This is the visual signature of Wutong's chart.
+    ax.plot(xs, ys, drawstyle="steps-post", color="#58a6ff",
+            linewidth=2.5, alpha=0.95, zorder=2)
+    ax.scatter(xs, ys, s=80, color="#58a6ff",
+               edgecolors="#0d1117", linewidths=1.2, zorder=3)
+
+    # -- per-point tok/s values (blue text, always above the dot) -----------
+    # Alternating above/below sounds nice but breaks the moment two adjacent
+    # points are close in y (the classic small-config-win-then-another-small
+    # -config-win pattern) — an above label of point i then collides with the
+    # below label of point i+1. Consistent "above" keeps every label at the
+    # same offset relative to its dot, so labels never invade each other's
+    # airspace. The ylim below gives them room.
+    ymax = max(ys)
+    for i, r in enumerate(kept):
+        ax.annotate(
+            f"{r.metric:,.0f}",
+            xy=(i, r.metric),
+            xytext=(0, 14), textcoords="offset points",
+            ha="center", fontsize=8.5, fontweight="bold", color="#79c0ff",
+        )
+
+    # -- stage dividers + labels at the top (wutong's "Round 1 (Params)") ---
+    # The plot has three horizontal bands stacked above the data:
+    #   data (staircase, incl. above-dot value labels)  ->  ends near ymax*1.02
+    #   speedup callout band                            ->  around ymax*1.20
+    #   stage-name row                                  ->  around ymax*1.45 (top_y)
+    #   headroom (ylim caps at ymax * 1.60)
+    # Any two of these overlap the moment top_y is squeezed. Keep them separate.
+    bands = _stage_bands(kept)
+    top_y = ymax * 1.45
+    for i, (xpos, stage) in enumerate(bands):
+        # Vertical dashed line between stages — never at the plot's left edge.
+        if i > 0:
+            ax.axvline(xpos, color="#30363d", linestyle="--",
+                       linewidth=1.2, alpha=0.75)
+        # Centered stage label above the band it names.
+        next_xpos = bands[i + 1][0] if i + 1 < len(bands) else len(kept) - 0.5
+        ax.text(
+            (xpos + next_xpos) / 2, top_y,
+            _stage_label(stage),
+            fontsize=10.5, color="#8b949e", ha="center", va="top",
+            style="italic",
+        )
+
+    # -- giant final Nx callout ---------------------------------------------
+    # Anchored to the top-right axes corner so it never collides with the
+    # last data point's tok/s label (they used to fight for the same pixels).
+    # A drawn arrow points from the callout down to the last data point.
+    speedup = led.speedup() or (ys[-1] / ys[0] if ys[0] > 0 else 0.0)
+    if speedup and speedup > 1.05:
+        # Callout in its own middle band — clear of the last data point (at
+        # axes-frac ~0.63 with ylim=ymax*1.60) AND the stage-name row (top_y at
+        # axes-frac ~0.91). shrinkB stops the arrow short of the last point so
+        # it doesn't spear the "N,NNN" value label above it.
+        ax.annotate(
+            f"{speedup:.1f}×",
+            xy=(len(kept) - 1, ys[-1]),
+            xytext=(0.985, 0.78),
+            xycoords="data", textcoords="axes fraction",
+            fontsize=26, fontweight="bold", color="#f85149",
+            ha="right", va="center",
+            arrowprops=dict(arrowstyle="->", color="#f85149", lw=2.0,
+                            connectionstyle="arc3,rad=0", shrinkB=18),
+        )
+
+    ax.set_xticks(xs)
+    ax.set_xticklabels(
+        [_ideafy(r) for r in kept],
+        fontsize=9, rotation=38, ha="right",
+    )
+    ax.set_ylabel(
+        f"{metric_label}" + (f"  ({shape})" if shape else ""),
+        fontsize=11,
+    )
+    # ylim upper is generous on purpose: it creates the three-band vertical
+    # layout (data / callout / stage names) that keeps them from fighting.
+    ax.set_ylim(0, ymax * 1.60)
+    ax.set_xlim(-0.6, len(kept) - 0.4)
+    ax.yaxis.set_major_formatter(FuncFormatter(_fmt_thousands))
+    ax.grid(True, axis="y", alpha=0.35)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run-dir", required=True, type=Path)
@@ -430,14 +661,24 @@ def main() -> None:
     ap.add_argument("--sdk", default="")
     ap.add_argument("--roofline", type=float, default=None)
     ap.add_argument("--metric-label", default="tok/s")
+    ap.add_argument("--style", choices=("detailed", "highlights"), default="detailed",
+                    help="detailed = every attempt (engineer view); "
+                         "highlights = kept-only staircase (presentation view)")
     a = ap.parse_args()
 
-    out = a.out or (a.run_dir / "optimization_timeline.png")
-    p = build_chart(
-        run_dir=a.run_dir, out_path=out, model=a.model, hardware=a.hardware,
-        tp=a.tp, shape=a.shape, sdk=a.sdk, roofline=a.roofline,
-        metric_label=a.metric_label,
-    )
+    if a.style == "highlights":
+        out = a.out or (a.run_dir / "optimization_highlights.png")
+        p = build_highlights_chart(
+            run_dir=a.run_dir, out_path=out, model=a.model, hardware=a.hardware,
+            tp=a.tp, shape=a.shape, sdk=a.sdk, metric_label=a.metric_label,
+        )
+    else:
+        out = a.out or (a.run_dir / "optimization_timeline.png")
+        p = build_chart(
+            run_dir=a.run_dir, out_path=out, model=a.model, hardware=a.hardware,
+            tp=a.tp, shape=a.shape, sdk=a.sdk, roofline=a.roofline,
+            metric_label=a.metric_label,
+        )
     print(f"wrote {p}")
 
 
