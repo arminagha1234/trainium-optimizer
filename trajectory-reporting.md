@@ -5,7 +5,7 @@ leaderboard entry saying "4,269 tok/s" is worth far less than one saying
 "4,269 tok/s, and here is the 23-step path from 845, including the ~40
 experiments that failed."
 
-Modeled directly on `auto_research_for_AWS_Neuron_optimization`'s
+Modeled directly on `internal-prior-optimization-run`'s
 `generate_chart.py` + `results.tsv` + `optimization_report_en.md` trio, with
 the manual step automated away.
 
@@ -183,7 +183,7 @@ Two reasons to adopt it:
 1. **It normalizes across models.** 4,269 tok/s on a 3B-active MoE and 4,269
    tok/s on a 31B dense model are wildly different achievements. MFU says so.
 2. **It shows absolute headroom.** The reference took Tongyi-30B from 0.28%
-   to 4.93% MFU — a 17.6x speedup that still leaves ~95% of the hardware on
+   to 4.93% MFU — a a large (multiple-x) speedup that still leaves ~95% of the hardware on
    the table. Publishing that honestly is more useful than a bare multiplier,
    and it sets expectations for how much further Stage 4 could go.
 

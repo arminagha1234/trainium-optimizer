@@ -95,7 +95,7 @@ tried.
 
 **Calibration, corrected against real data.** An earlier version of this doc
 claimed most of the total speedup lands here. The
-`auto_research_for_AWS_Neuron_optimization` results contradict that: param
+`internal-prior-optimization-run` results contradict that: param
 tuning gave **+19%**, model-code changes gave **+405%**, and structural TP
 changes (Local-Q, Context Parallel) gave **+193%** on the same model. Config
 is the cheapest stage and worth doing first, but on an unoptimized baseline it
@@ -353,8 +353,8 @@ self-congratulatory.
 
 # Execution discipline
 
-Adopted from `auto_research_for_AWS_Neuron_optimization`, which ran this loop
-autonomously for 12 hours and produced 17.6x. These are not stylistic
+Adopted from `internal-prior-optimization-run`, which ran this loop
+autonomously for 12 hours and produced a large (multiple-x). These are not stylistic
 preferences; each one prevents an observed failure mode.
 
 ## Phase budgets with scoped write permissions

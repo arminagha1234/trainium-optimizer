@@ -2,7 +2,7 @@
 Tests for the ledger and the trajectory chart.
 
 The synthetic trajectory mirrors the real numbers from
-`auto_research_for_AWS_Neuron_optimization`'s Round 2 (845 -> 4,269 tok/s),
+`internal-prior-optimization-run`'s Round 2 (845 -> 4,269 tok/s),
 including its failure pattern, so the chart is exercised against a shape we
 know occurs in practice rather than a tidy monotonic curve.
 

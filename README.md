@@ -33,7 +33,7 @@ one paragraph:
 | [`guardrails.md`](./guardrails.md) | Benchmark shapes per track, batch sweeps, HBM/compile limits, stopping criteria, SDK stamping |
 | [`model-landscape.md`](./model-landscape.md) | Researched top open models per modality (Aug 2026 snapshot) |
 | [`optimization-stages.md`](./optimization-stages.md) | The 6-stage pipeline: config → known kernels → **borrow** → **invent** → graph rewrites, plus execution discipline |
-| [`references-analysis.md`](./references-analysis.md) | What we took from Autocomp, auto_research (17.6x on Trn2), AFlow, AgentArch, ADIAS |
+| [`references-analysis.md`](./references-analysis.md) | What we took from Autocomp, auto_research (a large (multiple-x) on Trn2), AFlow, AgentArch, ADIAS |
 | [`harvest-corpus.md`](./harvest-corpus.md) | The aws-neuron org survey + **Stage 0.5: Harvest** — mine working kernels before optimizing |
 | [`agent-topology.md`](./agent-topology.md) | Multi-agent design (worker vs. watcher agents) and what host this runs on |
 | [`trajectory-reporting.md`](./trajectory-reporting.md) | The ledger + chart + report showing **how** it improved, not just the final number |
@@ -113,7 +113,7 @@ Five systems studied in detail; full analysis in
 | System | What we took |
 |--------|-------------|
 | [**Autocomp**](https://github.com/ucb-bar/autocomp) (UC Berkeley, NeurIPS 2025) | Beam search over LLM-generated plans; plan-then-implement two-phase prompt; optimization menu with dropout; hardware-in-the-loop every iteration. Already supports Trainium NKI. Their paper also measured **24% improvement from reusing optimization schedules across similar ops** — direct empirical support for the knowledge bank. |
-| **auto_research_for_AWS_Neuron_optimization** (private) | The closest existing system — a 12-hour autonomous loop hitting **17.6x on Tongyi-30B-A3B**. Took: phase budgets with scoped write permissions, read-only grader, git-as-state-machine, three measurement tiers, MFU normalization, the trajectory chart format, and its prompt rules. |
+| **internal-prior-optimization-run** (private) | The closest existing system — a 12-hour autonomous loop hitting **a large (multiple-x) on Tongyi-30B-A3B**. Took: phase budgets with scoped write permissions, read-only grader, git-as-state-machine, three measurement tiers, MFU normalization, the trajectory chart format, and its prompt rules. |
 | [**AFlow**](https://arxiv.org/abs/2410.10762) (ICLR 2025 Oral) | MCTS over code-represented workflow space; **tree-structured experience** rather than a flat lesson store. |
 | [**AgentArch**](https://arxiv.org/abs/2509.10769) (ServiceNow) | Design dimensions interact in ways component-level study misses → run an **ablation** on the first 3-5 models, not just end-to-end speedup. |
 | [**ADIAS**](https://arxiv.org/html/2608.06410v1) | Candidate-centric experience stores leave repair progress implicit → index the bank **by symptom**, not only by intervention. |

@@ -5,7 +5,7 @@ Every candidate the optimizer tries gets a row, kept or discarded. This is the
 source of truth that the trajectory chart and the report are generated from,
 and the substrate for the borrow-vs-invent metrics.
 
-Schema follows `auto_research_for_AWS_Neuron_optimization`'s results.tsv, with
+Schema follows `internal-prior-optimization-run`'s results.tsv, with
 four additions: `stage`, `origin`, `layer`, and `source` — which are what make
 the provenance and migration-risk queries possible.
 

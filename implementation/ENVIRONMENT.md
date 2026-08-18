@@ -17,18 +17,18 @@ That is enough to run the mock demos and develop backend-independent logic.
 ## 2. Backend — Beta 3 native PyTorch on Trainium
 
 **Hard rule: Beta 3, never Beta 2.** Full detail in
-`.kiro/steering/beta3-only.md`. This is the authoritative source; the summary
+`internal Neuron Beta 3 setup docs`. This is the authoritative source; the summary
 below is for convenience.
 
 ### 2a. Pull the Beta 3 DLC
 
 ```bash
-# ECR login (cross-account). Works with an EC2 Neuron instance role or Isengard creds.
+# ECR login (cross-account). Works with an EC2 Neuron instance role or AWS creds.
 aws ecr get-login-password --region us-east-1 | sudo docker login \
     --username AWS --password-stdin \
-    421672808698.dkr.ecr.us-east-1.amazonaws.com
+    <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com
 
-sudo docker pull 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+sudo docker pull <BETA3_NEURON_DLC_IMAGE>
 ```
 
 ### 2b. Extract artifacts + install the Beta 3 driver
@@ -38,7 +38,7 @@ one shipped in the image.
 
 ```bash
 imageID=$(sudo docker images -q --filter \
-    reference=421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest)
+    reference=<BETA3_NEURON_DLC_IMAGE>)
 cd $HOME
 sudo docker create --name tmp $imageID && sudo docker cp tmp:/workspace . && sudo docker rm tmp
 
@@ -117,16 +117,16 @@ The user's `~/Downloads` has related material. Note for whoever runs this:
 - `torch_neuronx-2.11.3.0.19138+...whl` — a native PyTorch wheel (a build newer
   than the steering's `.1254`; prefer the DLC's bundled version unless you have
   a reason to override).
-- `auto_research_for_AWS_Neuron_optimization-master.zip` — the reference
-  implementation that hit 17.6x. Worth extracting for its `program.md` and
+- `internal-prior-optimization-run.zip` — the reference
+  implementation that hit a large (multiple-x). Worth extracting for its `program.md` and
   kernel patterns.
 
 **NOTE:** the user referenced a Downloads folder "neuron beta" for DLC
 instructions. No folder by that exact name was found — the authoritative
-instructions used here are from `.kiro/steering/beta3-only.md`. If the user has
+instructions used here are from `internal Neuron Beta 3 setup docs`. If the user has
 a different/newer beta image in mind, confirm the ECR URI before pulling.
 
-## Gotchas (from beta3-only.md)
+## Gotchas (from internal Beta 3 setup docs)
 
 - `dynamic=True` in `torch.compile` raises → use static shapes / bucketing.
 - float64 → silently fp32; int64 → silently int32. Cast explicitly.

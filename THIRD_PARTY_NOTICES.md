@@ -20,7 +20,7 @@ header in its source file and a `reference_translation` (or `nki_kernel` with
 | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) | Apache-2.0 (+ NVIDIA terms) | Fused-kernel patterns — **compliance review required before code borrow** |
 | [AWS Neuron nki-library](https://github.com/aws-neuron/nki-library) | see repo | Harvested production NKI kernels (Stage 0.5) |
 | [Autocomp](https://github.com/ucb-bar/autocomp) | see repo | Search architecture (beam + plan/implement); no code copied |
-| auto_research_for_AWS_Neuron_optimization | private | Optimization techniques (Local-Q, Context Parallel, Local-MoE); trajectory-report format |
+| internal-prior-optimization-run | private | Optimization techniques (Local-Q, Context Parallel, Local-MoE); trajectory-report format |
 
 ## Per-borrow log
 

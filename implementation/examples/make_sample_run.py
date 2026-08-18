@@ -1,7 +1,7 @@
 """
 Generate a sample run + trajectory chart for documentation purposes.
 
-Numbers mirror `auto_research_for_AWS_Neuron_optimization`'s Round 2
+Numbers mirror `internal-prior-optimization-run`'s Round 2
 (845 -> 4,269 tok/s on Tongyi-30B-A3B) including its failure pattern, so the
 chart demonstrates a realistic shape rather than a tidy monotonic curve.
 
