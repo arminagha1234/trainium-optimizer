@@ -13,11 +13,11 @@ credentials
 implementation/artifacts/
 artifacts/
 optimization_runs/
-optimized_models/
+# optimized_models/ is now CANONICAL (per-model deliverable recipes) — tracked.
 *.neff
 *.ntff
 OVERNIGHT_LOG.md
-LEADERBOARD.md
+# LEADERBOARD.md is now CANONICAL (current standings, regenerated from HISTORY.tsv) — tracked.
 
 # Keep the committed demo under implementation/examples/ (small, illustrative)
 !implementation/examples/**
