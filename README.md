@@ -16,53 +16,38 @@ one paragraph:
 ## 🏆 Trainium Optimizer Leaderboard
 
 Results published by the autonomous overnight loop on real Trainium hardware
-(`native-pytorch-beta3` on trn2.48xlarge). Two entries below are verified;
-the rest are queued behind the loop's model list. Fresh snapshots land in
-[`runs/`](./runs/) with per-model trajectory charts.
+(`native-pytorch-beta3`). Three canonical files at the repo root:
+[`LEADERBOARD.md`](./LEADERBOARD.md) for current standings,
+[`HISTORY.tsv`](./HISTORY.tsv) for the append-only improvement record, and
+[`optimized_models/`](./optimized_models/) for per-model recipes.
 
 ### Text-to-text (LLMs)
 
-| Rank | Model            | Params | Baseline (tok/s) | Optimized (tok/s) |     Speedup | Best config              | Status                          |
-|-----:|:-----------------|-------:|-----------------:|------------------:|------------:|:-------------------------|:--------------------------------|
-|   🥇 | Qwen3-0.6B       |   0.6B |            3,196 |        **44,100** |  **13.80×** | TP=4, torch.compile      | ✅ Verified                     |
-|   🥈 | Qwen3-8B         |     8B |            1,806 |        **15,454** |   **8.56×** | TP=8, torch.compile      | ✅ Verified                     |
-|    – | Qwen3-32B        |    32B |                — |                 — |           — | —                        | 🕒 Queued (next cycle)          |
-|    – | Gemma-4-31B      |    31B |                — |                 — |           — | —                        | 🛠 Adapter in progress          |
-|    – | Qwen3.8-27B      |    27B |                — |                 — |           — | —                        | 🛠 Adapter landed (`qwen38_tp.py`) |
-|    – | Llama-3.1-70B    |    70B |                — |                 — |           — | —                        | ⏳ Backlog                       |
-|    – | DeepSeek-V4-Flash (MoE) | ~284B |          — |                 — |           — | —                        | ⏳ Backlog (MoE + expert-parallel) |
+| Rank | Model            | Params | Baseline (tok/s) | Optimized (tok/s) |     Speedup | Best config                          | Hardware       | Status                          |
+|-----:|:-----------------|-------:|-----------------:|------------------:|------------:|:-------------------------------------|:---------------|:--------------------------------|
+|   🥇 | Qwen3-0.6B       |   0.6B |            3,085 |        **83,450** |  **27.05×** | TP=4, torch.compile, bf16, batch=8   | trn2.3xlarge   | ✅ Verified (93.8% correctness) |
+|    – | Qwen3-1.7B       |   1.7B |                — |                 — |           — | —                                    | —              | 🕒 Queued (next cycle)          |
+|    – | Qwen3-4B         |     4B |                — |                 — |           — | —                                    | —              | 🕒 Queued                        |
+|    – | Qwen3-8B         |     8B |                — |                 — |           — | —                                    | —              | 🕒 Queued                        |
+|    – | Qwen3-32B        |    32B |                — |                 — |           — | —                                    | —              | 🕒 Queued                        |
+|    – | Qwen3.8-27B      |    27B |                — |                 — |           — | —                                    | —              | 🛠 Adapter landed (`backends/qwen38_tp.py`) |
+|    – | Gemma-4-31B      |    31B |                — |                 — |           — | —                                    | —              | 🛠 Adapter in progress          |
 
-### Text-to-image
+### Text-to-image · Text-to-video · Speech (ASR / TTS)
 
-| Model | Speedup | Status |
-|:------|--------:|:-------|
-|    – |       — | ⏳ Not yet run — Track opens once the LLM adapters are stable |
-
-### Text-to-video
-
-| Model | Speedup | Status |
-|:------|--------:|:-------|
-|    – |       — | ⏳ Not yet run |
-
-### Speech (ASR / TTS)
-
-| Model | Speedup | Status |
-|:------|--------:|:-------|
-|    – |       — | ⏳ Not yet run |
+Not yet scaffolded — modalities open once the LLM adapters are stable.
 
 **How to read this.** *Speedup* is against the *eager* baseline on the same
-instance, on the framework's fixed probe shape. Both verified rows above
-converge on the same recipe: `torch.compile(backend="neuron")` is the dominant
-Stage-1 lever, and the search reaches it because `compile_mode` is tried
-before every other axis. Full trajectory charts + per-model recipes:
-[`runs/`](./runs/).
+instance, on the framework's fixed probe shape. The dominant Stage-1 lever
+across every measurement so far is `torch.compile(backend="neuron")` — the
+search reaches it because `compile_mode` is tried before every other axis.
 
 **Status legend.** ✅ Verified = correctness-gated (top-1 token match vs the
-Stage-0 baseline ≥ 75%) and reproducible via `runs/<date>/`. 🛠 Adapter in
-progress = the model needs a family-specific tensor-parallel or vocab-parallel
-adapter (see `backends/qwen38_tp.py` for the pattern). 🕒 Queued / ⏳ Backlog =
-the model is in the seed list; the loop hasn't reached it yet or the modality
-isn't scaffolded.
+Stage-0 baseline ≥ 75%) and reproducible via `optimized_models/<model>/reproduce.sh`.
+🛠 Adapter in progress = the model needs a family-specific tensor-parallel
+or vocab-parallel adapter (see `backends/qwen38_tp.py` for the pattern).
+🕒 Queued = in the seed list, awaiting the next cycle.
+
 
 ## Why this is worth doing
 
