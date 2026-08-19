@@ -62,6 +62,10 @@ class Measurements:
     # reported against the FULL instance so idle cores drag it down.
     cores_used: int = 0
     cores_available: int = 0
+    # Equivalence signature: top-1 predicted token id at the last K positions on
+    # a fixed deterministic prompt. The orchestrator compares a candidate's
+    # signature against the Stage-0 baseline's to gate correctness for real.
+    top1_tokens: list = field(default_factory=list)
 
     @property
     def hbm_utilization(self) -> float:

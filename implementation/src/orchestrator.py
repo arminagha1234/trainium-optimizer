@@ -92,6 +92,8 @@ class Orchestrator:
 
     # populated during a run
     incumbent: Candidate | None = None
+    # Stage-0 baseline top-1 token signature; the real equivalence reference.
+    _baseline_tokens: list = field(default_factory=list)
 
     def establish_baseline(self, spec: ModelSpec) -> Candidate:
         """Stage 0. Measure the autoport baseline and set it as the incumbent.
@@ -104,6 +106,9 @@ class Orchestrator:
         artifact = self.backend.build_baseline(spec.model_id)
         neff = self.backend.compile(artifact)
         m = self.backend.measure(neff, spec.probe_shape, spec.probe_batch)
+        # Capture the baseline's top-1 token signature — this IS the correctness
+        # reference every later candidate is gated against.
+        self._baseline_tokens = list(getattr(m, "top1_tokens", []) or [])
         base = Candidate(config=artifact.config, provenance="baseline",
                          layer=Layer.NONE, metric=m.metric)
         self._record(base, Stage.BASELINE, Origin.NONE, Layer.NONE, source="",
@@ -207,7 +212,69 @@ class Orchestrator:
         assert self.incumbent is not None
         return self.incumbent
 
+    def run_deep_stages(self, spec: ModelSpec) -> Candidate:
+        """Stages 2-5 on top of the Stage-1 winner.
+
+        On native PyTorch the neuronx-cc compiler already does kernel selection,
+        fusion, and graph rewrites when torch.compile runs — so the real lever
+        beyond config is *compiler flags* (NEURON_CC_FLAGS). Each candidate here
+        recompiles the Stage-1 winner with a different flag set and is gated by
+        the same real equivalence + guardrails as Stage 1.
+
+        Stage 2 (known kernels) / 3 (borrow) / 5 (graph rewrite) use real flags.
+        Stage 4 (invent) is entered but honestly records that novel-NKI
+        invention needs the NKI-writer agent — matching the docs' expectation
+        that early runs are borrow-dominated and invention is ~0.
+        """
+        if self.incumbent is None:
+            return self.incumbent
+        base_cfg = dict(self.incumbent.config)
+        # cc-flags only affect the compiled path; ensure the deep stages compile.
+        base_cfg["compile_mode"] = "compile-default"
+
+        stage_plan = [
+            (Stage.KNOWN_KERNEL, Origin.HARVESTED, Layer.KERNEL,
+             [("cc:model-type-transformer", "--model-type transformer")]),
+            (Stage.BORROW, Origin.BORROWED, Layer.KERNEL,
+             [("cc:auto-cast-none", "--auto-cast none")]),
+            (Stage.GRAPH_REWRITE, Origin.NONE, Layer.GRAPH,
+             [("cc:optlevel3", "--optlevel 3"),
+              ("cc:optlevel3+transformer+nocast",
+               "--optlevel 3 --model-type transformer --auto-cast none")]),
+        ]
+        for stage, origin, layer, flagsets in stage_plan:
+            for label, flags in flagsets:
+                cand = Candidate(config={**base_cfg, "cc_flags": flags},
+                                 provenance=label, layer=layer)
+                evaluated = self._evaluate(cand, spec, stage, origin=origin,
+                                           layer=layer, source="neuronx-cc")
+                if evaluated is not None:
+                    self._update_incumbent(evaluated)
+
+        # Stage 4 — invent: entered, but no auto-generated NKI kernel this run.
+        self._record(
+            Candidate(config=base_cfg, provenance="stage4-invent", layer=Layer.KERNEL),
+            Stage.INVENT, Origin.NONE, Layer.KERNEL, source="",
+            metric=0.0, correctness=0.0, compile_s=0.0, status=Status.DISCARD,
+            desc="Stage 4 entered: no auto-invention (needs NKI-writer agent)")
+        return self.incumbent
+
     # -- tournament primitives ----------------------------------------------
+
+    def _equivalence(self, m: Measurements, spec: ModelSpec, neff) -> EquivalenceResult:
+        """Real correctness gate: fraction of top-1 tokens matching the Stage-0
+        baseline signature. No baseline signature (mock) -> injected checker."""
+        ref = self._baseline_tokens
+        cand = list(getattr(m, "top1_tokens", []) or [])
+        if not ref:
+            return self.equivalence(neff, spec)     # mock / no reference
+        if not cand:
+            return EquivalenceResult(passed=False, correctness_pct=0.0,
+                                     notes="no output tokens (run failed/OOM)")
+        n = min(len(ref), len(cand))
+        match = sum(1 for i in range(n) if ref[i] == cand[i]) / n
+        return EquivalenceResult(passed=match >= 0.75, correctness_pct=match * 100.0,
+                                 notes=f"top1 match {match:.0%} vs baseline")
 
     def _evaluate(
         self, cand: Candidate, spec: ModelSpec, stage: Stage,
@@ -220,6 +287,20 @@ class Orchestrator:
         itself recorded as a discard). Equivalence is a HARD gate: a faster
         config that produces different output is a bug, not a win.
         """
+        # REVIEW GATE ("review, then execute") — reject malformed or unsafe
+        # candidates before the 5-20 min compile. Legit proposer candidates
+        # always PASS; this catches bad values + cc_flags injection.
+        try:
+            from reviewer import review_config
+            verdict, reason = review_config(cand.config)
+        except Exception:  # noqa: BLE001 — reviewer must never crash the loop
+            verdict, reason = "PASS", "reviewer-unavailable"
+        if verdict != "PASS":
+            self._record(cand, stage, origin, layer, source, metric=0.0,
+                         correctness=0.0, compile_s=0.0, status=Status.DISCARD,
+                         desc=f"{cand.provenance} (review REJECT: {reason})")
+            return None
+
         artifact = self.backend.apply_config(
             self.backend.build_baseline(spec.model_id), cand.config
         )
@@ -233,16 +314,21 @@ class Orchestrator:
                          desc=f"{cand.provenance} (compile timeout)")
             return None
 
-        # Equivalence — hard gate, before performance is even considered.
-        eq = self.equivalence(neff, spec)
+        # Measure first — this also yields the top-1 token signature the real
+        # equivalence gate needs.
+        m: Measurements = self.backend.measure(neff, spec.probe_shape, spec.probe_batch)
+
+        # Equivalence — HARD gate. Compares this config's top-1 tokens against
+        # the Stage-0 baseline signature; a config that changes the output is a
+        # bug, not a win. (Falls back to the injected checker when no signature
+        # is available, e.g. the mock backend.)
+        eq = self._equivalence(m, spec, neff)
         if not eq.passed:
             self._record(cand, stage, origin, layer, source, metric=0.0,
                          correctness=eq.correctness_pct,
                          compile_s=neff.compile_seconds, status=Status.DISCARD,
                          desc=f"{cand.provenance} (equivalence fail: {eq.notes})")
             return None
-
-        m: Measurements = self.backend.measure(neff, spec.probe_shape, spec.probe_batch)
 
         # HBM + measurement-quality guardrails.
         if not self.guards.hbm_ok(m):

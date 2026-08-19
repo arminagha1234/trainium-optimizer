@@ -57,10 +57,8 @@ rsync -a \
   --exclude '*.pyc' \
   --exclude '.venv/' --exclude 'venv/' \
   --exclude '.pytest_cache/' \
-  --exclude 'implementation/artifacts/' \
-  --exclude 'artifacts/' \
-  --exclude 'optimization_runs/' \
-  --exclude 'optimized_models/' \
+  --exclude 'implementation/artifacts/optimization_runs/' \
+  --exclude 'artifacts/optimization_runs/' \
   --exclude '*.neff' --exclude '*.ntff' \
   --exclude '*.safetensors' --exclude '*.bin' --exclude '*.pt' --exclude '*.pth' \
   "$SRC_ROOT/" "$STAGING/"
