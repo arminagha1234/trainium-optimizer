@@ -13,6 +13,57 @@ one paragraph:
 > models and publish a **Neuron-optimized leaderboard** that refreshes on
 > every SDK release.
 
+## 🏆 Trainium Optimizer Leaderboard
+
+Results published by the autonomous overnight loop on real Trainium hardware
+(`native-pytorch-beta3` on trn2.48xlarge). Two entries below are verified;
+the rest are queued behind the loop's model list. Fresh snapshots land in
+[`runs/`](./runs/) with per-model trajectory charts.
+
+### Text-to-text (LLMs)
+
+| Rank | Model            | Params | Baseline (tok/s) | Optimized (tok/s) |     Speedup | Best config              | Status                          |
+|-----:|:-----------------|-------:|-----------------:|------------------:|------------:|:-------------------------|:--------------------------------|
+|   🥇 | Qwen3-0.6B       |   0.6B |            3,196 |        **44,100** |  **13.80×** | TP=4, torch.compile      | ✅ Verified                     |
+|   🥈 | Qwen3-8B         |     8B |            1,806 |        **15,454** |   **8.56×** | TP=8, torch.compile      | ✅ Verified                     |
+|    – | Qwen3-32B        |    32B |                — |                 — |           — | —                        | 🕒 Queued (next cycle)          |
+|    – | Gemma-4-31B      |    31B |                — |                 — |           — | —                        | 🛠 Adapter in progress          |
+|    – | Qwen3.8-27B      |    27B |                — |                 — |           — | —                        | 🛠 Adapter landed (`qwen38_tp.py`) |
+|    – | Llama-3.1-70B    |    70B |                — |                 — |           — | —                        | ⏳ Backlog                       |
+|    – | DeepSeek-V4-Flash (MoE) | ~284B |          — |                 — |           — | —                        | ⏳ Backlog (MoE + expert-parallel) |
+
+### Text-to-image
+
+| Model | Speedup | Status |
+|:------|--------:|:-------|
+|    – |       — | ⏳ Not yet run — Track opens once the LLM adapters are stable |
+
+### Text-to-video
+
+| Model | Speedup | Status |
+|:------|--------:|:-------|
+|    – |       — | ⏳ Not yet run |
+
+### Speech (ASR / TTS)
+
+| Model | Speedup | Status |
+|:------|--------:|:-------|
+|    – |       — | ⏳ Not yet run |
+
+**How to read this.** *Speedup* is against the *eager* baseline on the same
+instance, on the framework's fixed probe shape. Both verified rows above
+converge on the same recipe: `torch.compile(backend="neuron")` is the dominant
+Stage-1 lever, and the search reaches it because `compile_mode` is tried
+before every other axis. Full trajectory charts + per-model recipes:
+[`runs/`](./runs/).
+
+**Status legend.** ✅ Verified = correctness-gated (top-1 token match vs the
+Stage-0 baseline ≥ 75%) and reproducible via `runs/<date>/`. 🛠 Adapter in
+progress = the model needs a family-specific tensor-parallel or vocab-parallel
+adapter (see `backends/qwen38_tp.py` for the pattern). 🕒 Queued / ⏳ Backlog =
+the model is in the seed list; the loop hasn't reached it yet or the modality
+isn't scaffolded.
+
 ## Why this is worth doing
 
 - Nobody owns "best perf-per-dollar on Trainium for open models" as a
