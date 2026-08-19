@@ -1,0 +1,34 @@
+{
+  "model_id": "Qwen/Qwen3-0.6B",
+  "backend": "native-pytorch-beta3",
+  "baseline_metric": 3085.05056863769,
+  "best_metric": 83450.28857601539,
+  "speedup": 27.05,
+  "metric_label": "tok/s",
+  "config": {
+    "tp_degree": 4,
+    "weights_dtype": "bf16",
+    "attn_implementation": "sdpa",
+    "compile_mode": "compile-default",
+    "batch": 8,
+    "cp_degree": 1,
+    "dp_degree": 1,
+    "kv_replication": 1,
+    "cores_used": 4,
+    "cores_available": 4
+  },
+  "toolchain": {
+    "backend": "native-pytorch-beta3",
+    "stack": "native-pytorch-beta3",
+    "device_string": "neuron",
+    "instance_type": "trn2.3xlarge",
+    "torch": "2.12.1+cpu",
+    "torch_neuronx": "2.12.3.0.0+unknown.dev",
+    "neuronx_cc": "2.27.2878.0+8220f7ac",
+    "nki": "0.6.0+30289107548.gd2d9cc57"
+  },
+  "kernels": [],
+  "measurements": {},
+  "verified": "verified",
+  "generated_at": "2026-08-19T00:50:26Z"
+}
