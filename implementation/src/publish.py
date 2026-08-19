@@ -42,6 +42,7 @@ class Recipe:
     toolchain: dict[str, str]           # full SDK/compiler stamp — reproducibility
     kernels: list[dict[str, Any]] = field(default_factory=list)  # provenance per kernel
     measurements: dict[str, Any] = field(default_factory=dict)   # per-shape, per-batch
+    verified: str = "ungraded"          # trusted-grader verdict for this recipe
     generated_at: str = ""
 
 
@@ -55,11 +56,16 @@ def publish(
     full_measurements: dict[str, Any] | None = None,
     kernel_provenance: list[dict[str, Any]] | None = None,
     fork_diff_path: Path | str | None = None,
-) -> Path:
-    """Write optimized_models/<slug>/ from a completed run.
+    config: dict[str, Any] | None = None,
+    verified: str = "ungraded",
+) -> Path | None:
+    """Update the CANONICAL best recipe at optimized_models/<slug>/.
 
-    The slug is derived from the model id ("google/gemma-4-31B" -> "gemma-4-31b")
-    so the folder name is filesystem-safe and stable.
+    Canonical, not per-run: the folder holds the single current-best recipe for
+    a model. We overwrite it ONLY when this run BEATS the recipe already there
+    (so a worse/noisy re-run can't clobber a good recipe). The append-only
+    HISTORY.tsv is the run-by-run record; this folder is the product. Returns
+    the dest path if updated, or None if the existing recipe was kept.
     """
     import time
 
@@ -71,6 +77,18 @@ def publish(
 
     slug = _slug(model_id)
     dest = Path(out_root) / slug
+
+    # Beat-gate: keep the better recipe. Only replace if this run is faster than
+    # the one already published (canonical current-best).
+    existing = dest / "recipe.json"
+    if existing.exists():
+        try:
+            prev = json.loads(existing.read_text())
+            if float(prev.get("best_metric", 0.0)) >= float(best.metric):
+                return None  # existing recipe is as good or better — keep it
+        except Exception:  # noqa: BLE001 — corrupt existing recipe: overwrite it
+            pass
+
     dest.mkdir(parents=True, exist_ok=True)
 
     recipe = Recipe(
@@ -80,10 +98,11 @@ def publish(
         best_metric=best.metric,
         speedup=round(best.metric / base.metric, 3) if base.metric else 0.0,
         metric_label=metric_label,
-        config=_config_from_ledger(led),
+        config=config if config is not None else _config_from_ledger(led),
         toolchain=toolchain,
         kernels=kernel_provenance or [],
         measurements=full_measurements or {},
+        verified=verified,
         generated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     )
 
@@ -152,7 +171,7 @@ def _recipe_markdown(r: Recipe) -> str:
 **{r.best_metric:,.0f} {r.metric_label}** — {r.speedup}x over baseline
 ({r.baseline_metric:,.0f} {r.metric_label}).
 
-Backend: `{r.backend}`
+Backend: `{r.backend}`  ·  Correctness: **{r.verified}** (trusted-grader re-measure)
 Generated: {r.generated_at}
 
 ## Winning config
