@@ -19,19 +19,21 @@ Results published by the autonomous overnight loop on real Trainium hardware
 (`native-pytorch-beta3`). Three canonical files at the repo root:
 [`LEADERBOARD.md`](./LEADERBOARD.md) for current standings,
 [`HISTORY.tsv`](./HISTORY.tsv) for the append-only improvement record, and
-[`optimized_models/`](./optimized_models/) for per-model recipes.
+[`optimized_models/<family>/<model>/`](./optimized_models/) for per-model
+recipes and trajectory charts (`optimization_timeline.png` +
+`optimization_highlights.png`).
 
 ### Text-to-text (LLMs)
 
-| Rank | Model            | Params | Baseline (tok/s) | Optimized (tok/s) |     Speedup | Best config                          | Hardware       | Status                          |
-|-----:|:-----------------|-------:|-----------------:|------------------:|------------:|:-------------------------------------|:---------------|:--------------------------------|
-|   🥇 | Qwen3-0.6B       |   0.6B |            3,085 |        **83,450** |  **27.05×** | TP=4, torch.compile, bf16, batch=8   | trn2.3xlarge   | ✅ Verified (93.8% correctness) |
-|    – | Qwen3-1.7B       |   1.7B |                — |                 — |           — | —                                    | —              | 🕒 Queued (next cycle)          |
-|    – | Qwen3-4B         |     4B |                — |                 — |           — | —                                    | —              | 🕒 Queued                        |
-|    – | Qwen3-8B         |     8B |                — |                 — |           — | —                                    | —              | 🕒 Queued                        |
-|    – | Qwen3-32B        |    32B |                — |                 — |           — | —                                    | —              | 🕒 Queued                        |
-|    – | Qwen3.8-27B      |    27B |                — |                 — |           — | —                                    | —              | 🛠 Adapter landed (`backends/qwen38_tp.py`) |
-|    – | Gemma-4-31B      |    31B |                — |                 — |           — | —                                    | —              | 🛠 Adapter in progress          |
+| Rank | Model            | Family  | Params | Baseline (tok/s) | Optimized (tok/s) |     Speedup | Best config                          | Hardware       | Status                          |
+|-----:|:-----------------|:--------|-------:|-----------------:|------------------:|------------:|:-------------------------------------|:---------------|:--------------------------------|
+|   🥇 | Qwen3-0.6B       | qwen3   |   0.6B |            3,085 |        **83,450** |  **27.05×** | TP=4, torch.compile, bf16, batch=8   | trn2.3xlarge   | ✅ Verified (93.8% correctness) |
+|    – | Qwen3-1.7B       | qwen3   |   1.7B |                — |                 — |           — | —                                    | —              | 🕒 Queued (next cycle)          |
+|    – | Qwen3-4B         | qwen3   |     4B |                — |                 — |           — | —                                    | —              | 🕒 Queued                        |
+|    – | Qwen3-8B         | qwen3   |     8B |                — |                 — |           — | —                                    | —              | 🕒 Queued                        |
+|    – | Qwen3-32B        | qwen3   |    32B |                — |                 — |           — | —                                    | —              | 🕒 Queued                        |
+|    – | Qwen3.8-27B      | qwen3.8 |    27B |                — |                 — |           — | —                                    | —              | 🛠 Adapter landed (`backends/qwen38_tp.py`) |
+|    – | Gemma-4-31B      | gemma4  |    31B |                — |                 — |           — | —                                    | —              | 🛠 Adapter in progress          |
 
 ### Text-to-image · Text-to-video · Speech (ASR / TTS)
 
@@ -43,7 +45,8 @@ across every measurement so far is `torch.compile(backend="neuron")` — the
 search reaches it because `compile_mode` is tried before every other axis.
 
 **Status legend.** ✅ Verified = correctness-gated (top-1 token match vs the
-Stage-0 baseline ≥ 75%) and reproducible via `optimized_models/<model>/reproduce.sh`.
+Stage-0 baseline ≥ 75%) and reproducible via
+`optimized_models/<family>/<model>/reproduce.sh`.
 🛠 Adapter in progress = the model needs a family-specific tensor-parallel
 or vocab-parallel adapter (see `backends/qwen38_tp.py` for the pattern).
 🕒 Queued = in the seed list, awaiting the next cycle.
