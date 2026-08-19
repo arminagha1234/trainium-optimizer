@@ -4,7 +4,7 @@
 (3,085 tok/s).
 
 Backend: `native-pytorch-beta3`  ·  Correctness: **verified** (trusted-grader re-measure)
-Generated: 2026-08-19T00:50:26Z
+Generated: 2026-08-19T02:22:48Z
 
 ## Winning config
 
@@ -48,5 +48,10 @@ Generated: 2026-08-19T00:50:26Z
 ./reproduce.sh
 ```
 
-See `results.tsv` for the full search trace and the trajectory chart for how
-this recipe was reached.
+## Optimization timeline
+
+![optimization timeline](optimization_timeline.png)
+
+![highlights](optimization_highlights.png)
+
+See `results.tsv` for the full search trace behind these charts.
