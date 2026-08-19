@@ -1,0 +1,2 @@
+timestamp	cycle	model	model_id	baseline	best	speedup	box_tok_s	verified	win_stage	correctness	stages_run	sdk
+2026-08-19T00:50:27Z	1	qwen3-0-6b	Qwen/Qwen3-0.6B	3085.1	83450.3	27.050	0	verified	config	93.8	baseline+borrow+config+graph_rewrite+invent+known_kernel	2.28.0
