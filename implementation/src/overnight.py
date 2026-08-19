@@ -89,7 +89,42 @@ class ModelResult:
     error: str = ""
 
 
-def _make_backend(name: str):
+def detect_cores() -> int:
+    """AUTO-DETECT physical NeuronCores by parsing `neuron-ls` (sum the CORES
+    column across all devices). Robust to any instance size (trn2.3xlarge=4,
+    trn2.48xlarge=64, partial allocations, future sizes) — no hardcoding.
+    Returns 0 if detection fails, so the caller falls back to the heuristic."""
+    import re
+    import subprocess
+    try:
+        out = subprocess.run(["neuron-ls"], capture_output=True, text=True,
+                             timeout=30).stdout
+        total = 0
+        for line in out.splitlines():
+            # device rows look like: | 0 | 4 | 0-3 | 96 GB | ...
+            m = re.match(r"^\|\s*\d+\s*\|\s*(\d+)\s*\|", line)
+            if m:
+                total += int(m.group(1))
+        return total
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _cores_for(instance_type: str | None) -> int:
+    """Physical NeuronCores: auto-detect via neuron-ls first, then fall back to
+    an instance-size heuristic (trn2.48xlarge=64, 3xlarge=4)."""
+    detected = detect_cores()
+    if detected > 0:
+        return detected
+    it = instance_type or ""
+    if it.endswith("48xlarge"):
+        return 64
+    if "3xlarge" in it:
+        return 4
+    return 8
+
+
+def _make_backend(name: str, instance_type: str | None = None):
     """Import the requested backend lazily, so a laptop run (mock) never
     needs the on-device deps, and a missing native backend fails cleanly."""
     if name == "mock":
@@ -97,7 +132,10 @@ def _make_backend(name: str):
         return MockBackend(seed=7)
     if name in ("native-pytorch-beta3", "native"):
         from backends.native_pytorch import NativePyTorchBackend
-        return NativePyTorchBackend()
+        # Tell the backend the real core count so it never proposes tp > cores.
+        return NativePyTorchBackend(
+            instance_type=instance_type or "trn2.48xlarge",
+            core_count=_cores_for(instance_type))
     raise SystemExit(f"unknown backend {name!r} (use: mock | native-pytorch-beta3)")
 
 
@@ -126,15 +164,16 @@ def run_one(
 ) -> ModelResult:
     """Optimize a single model. Crashes are caught and returned, never raised,
     so one bad model does not end the night."""
-    # Fresh run dir per cycle so re-optimization never mixes with a prior pass
-    # (Ledger.init is no-clobber, so appending to a stale file would interleave
-    # runs — the bug the first overnight run hit).
-    run_dir = out_root / "optimization_runs" / (slug if cycle <= 1 else f"{slug}/cycle{cycle}")
+    # WIP trace: one dir per model, OVERWRITTEN each cycle (no dated/per-cycle
+    # copies — that bloat is what we cut). The durable run-by-run record is the
+    # append-only HISTORY.tsv; the winning run's trace is frozen into
+    # optimized_models/<slug>/ by publish(). So this is just the live scratch.
+    run_dir = out_root / "optimization_runs" / slug
     try:
-        backend = _make_backend(backend_name)
+        backend = _make_backend(backend_name, instance_type)
         ledger = Ledger(run_dir)
         if ledger.path.exists():
-            ledger.path.unlink()      # guarantee a clean ledger for this run
+            ledger.path.unlink()      # fresh WIP ledger; HISTORY.tsv is the record
         ledger.init()
         orch = Orchestrator(
             backend=backend, bank=bank, guards=Guardrails(), ledger=ledger,
@@ -148,17 +187,34 @@ def run_one(
         log(f"[{slug}] Stage 1: config search")
         best = orch.run_stage1_config(spec)
 
-        # Stages 2-5 (kernel work) run here once the backend implements
-        # profile() + kernel_swap_points(). On mock/stub they are skipped.
-        # orch.run_stage2_known_kernels(spec) ... etc.
+        # Stages 2-5: compiler-driven kernel selection + graph rewrites
+        # (NEURON_CC_FLAGS) on top of the Stage-1 winner, equivalence-gated.
+        log(f"[{slug}] Stages 2-5: compiler/kernel rewrites")
+        best = orch.run_deep_stages(spec)
 
-        # Publish the deliverable.
+        # TRUSTED GRADER (before publish) — never trust the search's self-
+        # reported winner. Re-run it independently; it must REPRODUCE its metric
+        # (within tolerance) and re-pass equivalence to be marked `verified`.
+        try:
+            from trusted_grader import verify_winner
+            grade = verify_winner(backend, spec, best,
+                                  getattr(orch, "_baseline_tokens", []), log)
+            verdict = grade.get("verdict", "ungraded")
+        except Exception as e:  # noqa: BLE001
+            log(f"[{slug}] trusted grader skipped (non-fatal): {e}")
+            verdict = "ungraded"
+
+        # Publish the CANONICAL best recipe (beat-gated: only replaces the
+        # existing one if this run is faster). Records the real winning config
+        # + the trusted-grader verdict.
         dest = publish(
             run_dir=run_dir, out_root=out_root / "optimized_models",
             model_id=spec.model_id, backend=backend_name,
             toolchain=backend.toolchain_stamp(),
+            config=dict(getattr(best, "config", {}) or {}), verified=verdict,
         )
-        log(f"[{slug}] published recipe -> {dest}")
+        log(f"[{slug}] published new best recipe -> {dest}" if dest
+            else f"[{slug}] kept existing better recipe (this run didn't beat it)")
 
         # Chart the trajectory — the detailed engineer view (every attempt).
         chart = build_chart(
@@ -185,6 +241,16 @@ def run_one(
         # Emit a provisional lesson from the winning config, for the bank.
         _emit_lesson(bank, slug, spec, best, sdk_version, log)
 
+        # #5 Fill-the-box: once on the winner, measure TRUE box-level aggregate
+        # throughput (N independent DP replicas across the 64 cores). This is the
+        # perf-per-dollar headline; single-replica tok/s understates it by ~dp x.
+        box_tok_s = _box_throughput(spec, best, instance_type, log)
+
+        # PERMANENT improvement record — append-only, never wiped, survives every
+        # cycle and relaunch. This is how we prove we improved over time.
+        _append_history(out_root, cycle, slug, spec, ledger, sdk_version, log,
+                        box_tok_s, verdict)
+
         return ModelResult(
             slug=slug, ok=True,
             baseline=ledger.baseline().metric, best=best.metric,
@@ -198,6 +264,85 @@ def run_one(
     except Exception as e:  # noqa: BLE001 — never let one model kill the night
         log(f"[{slug}] CRASHED: {e}\n{traceback.format_exc()}")
         return ModelResult(slug=slug, ok=False, error=str(e))
+
+
+def _box_throughput(spec, best, instance_type, log) -> float:
+    """#5: measure real box-level aggregate throughput of the winning config by
+    launching N independent DP replicas across the whole box. Once per model,
+    post-publish, so it never slows the search. Non-fatal on any error."""
+    import json as _j
+    import subprocess as _sp
+    from pathlib import Path as _P
+    try:
+        cfg = dict(getattr(best, "config", {}) or {})
+        tp = int(cfg.get("tp_degree", 1))
+        batch = int(cfg.get("batch", 1))
+        compile_on = 1 if cfg.get("compile_mode") == "compile-default" else 0
+        attn = cfg.get("attn_implementation", "eager")
+        cores = _cores_for(instance_type)   # auto-detected via neuron-ls
+        # SATURATION GUARD: leave >=2 cores for the OS/sshd, and CAP concurrent
+        # replicas (each is a full model-loading process) so we never thrash
+        # CPU/RAM and starve sshd — the incident that took the 48xl offline.
+        MAX_REPLICAS = 12
+        dp = max(1, min((cores - 2) // tp, MAX_REPLICAS))
+        if dp <= 1:
+            return 0.0
+        import re as _re
+        raw = spec.probe_shape.split("/")[0].strip().split()[-1].lower()
+        input_len = int(float(raw[:-1]) * 1024) if raw.endswith("k") else int(raw)
+        dpb = _P(__file__).resolve().parent / "backends" / "dp_bench.py"
+        out = _P("/tmp") / f"box_{spec.model_id.split('/')[-1]}.json"
+        cmd = [__import__("sys").executable, str(dpb), "--model", spec.model_id,
+               "--tp", str(tp), "--dp", str(dp), "--batch", str(batch),
+               "--input-len", str(input_len), "--compile", str(compile_on),
+               "--attn", attn, "--base-core", "0", "--out", str(out)]
+        _sp.run(cmd, timeout=1800, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, check=False)
+        if out.exists():
+            d = _j.loads(out.read_text())
+            agg = float(d.get("aggregate_tok_s", 0.0))
+            log(f"[{spec.model_id.split('/')[-1]}] box throughput: {agg:,.0f} tok/s "
+                f"({d.get('replicas_ok')}/{dp} replicas, tp{tp}, compile={compile_on})")
+            return agg
+    except Exception as e:  # noqa: BLE001
+        log(f"box throughput failed (non-fatal): {e}")
+    return 0.0
+
+
+def _append_history(out_root, cycle, slug, spec, ledger, sdk_version, log,
+                    box_tok_s: float = 0.0, verified: str = "ungraded") -> None:
+    """Append one row per model per cycle to a PERMANENT, append-only
+    HISTORY.tsv. Never wiped — this is the durable proof-of-improvement record
+    across every cycle and relaunch. Records which stage produced the winner and
+    the deepest stage reached, so we can see e.g. whether Stage 5 ran."""
+    import time as _t
+    try:
+        rows = ledger.read()
+        base = ledger.baseline()
+        base_metric = base.metric if base else 0.0
+        kept = [r for r in rows if str(getattr(r, "status", "")) in ("keep", "Status.KEEP")]
+        best_row = max(kept, key=lambda r: r.metric) if kept else None
+        best_metric = best_row.metric if best_row else 0.0
+        win_stage = str(best_row.stage) if best_row else "-"
+        stages_run = sorted({str(r.stage) for r in rows})
+        deepest = stages_run[-1] if stages_run else "-"
+        speedup = (best_metric / base_metric) if base_metric > 0 else 0.0
+        corr = getattr(best_row, "correctness", 0.0) if best_row else 0.0
+        path = out_root / "HISTORY.tsv"
+        new = not path.exists()
+        with path.open("a") as fh:
+            if new:
+                fh.write("timestamp\tcycle\tmodel\tmodel_id\tbaseline\tbest\t"
+                         "speedup\tbox_tok_s\tverified\twin_stage\tcorrectness\t"
+                         "stages_run\tsdk\n")
+            fh.write(f"{_t.strftime('%Y-%m-%dT%H:%M:%SZ', _t.gmtime())}\t{cycle}\t"
+                     f"{slug}\t{spec.model_id}\t{base_metric:.1f}\t{best_metric:.1f}\t"
+                     f"{speedup:.3f}\t{box_tok_s:.0f}\t{verified}\t{win_stage}\t{corr:.1f}\t"
+                     f"{'+'.join(s.split('.')[-1] for s in stages_run)}\t{sdk_version}\n")
+        log(f"[{slug}] history += cycle{cycle} best={best_metric:.0f} "
+            f"({speedup:.2f}x, win={win_stage.split('.')[-1]}, "
+            f"deepest={deepest.split('.')[-1]})")
+    except Exception as e:  # noqa: BLE001 — history logging must never crash a run
+        log(f"[{slug}] history append failed (non-fatal): {e}")
 
 
 def _emit_lesson(bank, slug, spec, best, sdk_version, log) -> None:
