@@ -1,0 +1,2 @@
+# Populated by bank_publish.sh at each snapshot (lesson counts per tier/family).
+# This placeholder is replaced on the first real snapshot pushed from .211.
