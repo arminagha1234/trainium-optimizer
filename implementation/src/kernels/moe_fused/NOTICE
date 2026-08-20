@@ -1,0 +1,59 @@
+Vendored fused MoE megakernel
+=============================
+
+This directory contains source vendored from a third-party, Apache-2.0
+licensed Amazon repository:
+
+    Project : nki-moe-megakernel
+    Owner   : KevGomes1403 (Amazon)
+    URL     : https://github.com/KevGomes1403/nki-moe-megakernel
+    Commit  : 5879c39 (2026-08-17)
+    License : Apache License 2.0 (see ./LICENSE)
+
+The "Qwen3-30B-A3B Megakernel for Trainium" fuses the entire Qwen3-30B-A3B
+decoder stack into per-layer NKI subkernels. The upstream README reports
+1.76x end-to-end token-generation throughput over the XLA baseline on
+Trainium 3 (1.52x for the "XLA + NKI MoE" hybrid that swaps only the expert
+computation). See the upstream repo for full benchmark methodology.
+
+Files vendored (byte-for-byte, headers preserved / added):
+
+    moe_fused_nki.py
+        <- megakernels/qwen3_moe/moe_fused_nki.py
+        The fused MoE decode (TKG) subkernel. HBM-in/HBM-out entrypoint
+        `run(inp, gamma, router_w, gate_up_w, down_w) -> [T, H]`.
+
+    qwen_with_megakernel.py
+        <- megakernels/qwen3_moe/qwen_with_megakernel.py
+        The NxDI model integration (how the kernel binds to the model);
+        kept as reference for the eventual on-device wiring.
+
+    nki_moe/components/routed_experts_nki.py
+        <- nki_kernels/moe/components/routed_experts_nki.py
+        Raw-NKI selective routed-experts loop (self-contained; imports only
+        nki.isa / nki.language).
+
+    nki_moe/components/moe_layer.py
+        <- nki_kernels/moe/components/moe_layer.py
+        Fully fused MoE layer compose (rmsnorm -> router -> routed+shared
+        experts -> gated sum).
+
+    nki_moe/vendored/router_topk.py
+        <- nki_kernels/moe/vendored/router_topk.py
+        Router top-K kernel.
+
+NOT vendored (external dependency, DO NOT expect these to import here):
+    - `nki-library` / `nkilib.core.*` (SbufManager, TensorView, kernel
+      helpers). Upstream pulls this as a PRIVATE git submodule
+      (git@github.com:KevGomes1403/nki-library.git, branch 2.30_release).
+      `moe_fused_nki.py` and `moe_layer.py` import from `nkilib.core.*`, so
+      they only import successfully in an environment that provides that
+      package. `routed_experts_nki.py` and `router_topk.py` are self-contained
+      against `nki.*`.
+    - The `nki` toolchain itself (comes from the Neuron DLC, not pip).
+
+Modifications from upstream: NONE to the kernel bodies. The only edits are
+two prepended SPDX/attribution header comments on the two files that upstream
+carried under the repo-level LICENSE without a per-file header
+(moe_fused_nki.py, qwen_with_megakernel.py). All other files retain their
+original Amazon Apache-2.0 headers unchanged.
