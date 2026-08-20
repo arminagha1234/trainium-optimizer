@@ -65,6 +65,7 @@ STAGE_COLOR: dict[Stage, str] = {
     Stage.BORROW: "#3fb950",
     Stage.INVENT: "#f0883e",
     Stage.GRAPH_REWRITE: "#f85149",
+    Stage.PROFILE_LOOP: "#d29922",
 }
 
 # Provenance is encoded as marker shape so it reads at a glance alongside the
@@ -432,6 +433,7 @@ _STAGE_LABEL: dict[Stage, str] = {
     Stage.BORROW: "Stage 3\n(Borrow)",
     Stage.INVENT: "Stage 4\n(Invent)",
     Stage.GRAPH_REWRITE: "Stage 5\n(Graph Rewrite)",
+    Stage.PROFILE_LOOP: "Stage 6\n(Profile Loop)",
 }
 
 

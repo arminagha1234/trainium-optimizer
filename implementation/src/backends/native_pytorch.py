@@ -29,7 +29,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-from backends.base import Artifact, Measurements, Neff, OpSite, Profile
+from backends.base import (
+    Artifact,
+    Measurements,
+    Neff,
+    OpSite,
+    Profile,
+    placement_axes,
+)
 from transformers import AutoConfig
 
 _WORKER = Path(__file__).resolve().parent / "neuron_worker.py"
@@ -125,13 +132,47 @@ class NativePyTorchBackend:
         Stage 1 improves on."""
         tp = self._fit_baseline_tp(model_id)
         self._model_id = model_id   # cached so config_axes() can filter TP by heads
-        return Artifact(model_id=model_id, backend=self.name, config={
+        config: dict[str, Any] = {
             "tp_degree": tp,
             "weights_dtype": "bf16",
             "attn_implementation": "eager",
             "compile_mode": "eager",
             "batch": 1,
-        })
+        }
+        # Seed the baseline with the known-safe placement for any separable
+        # component this model exposes (CPU scheduler / device text-encoder —
+        # the Wan 2.2 evidence). The placement axis then searches the
+        # alternative, gated by measure() + equivalence. Causal LMs expose no
+        # such components, so this adds nothing for the LLM seeds.
+        for comp in self._placeable_components():
+            config[f"place:{comp}"] = self._DEFAULT_PLACEMENT.get(comp, "cpu")
+        return Artifact(model_id=model_id, backend=self.name, config=config)
+
+    # Known-safe default placement per separable component (see base.placement_axes
+    # and the Wan 2.2 evidence): the scheduler's bf16 solver drifts on device
+    # over many steps, so it defaults to CPU; a one-shot text-encode is a big
+    # device win with no drift, so it defaults to device.
+    _DEFAULT_PLACEMENT = {"scheduler": "cpu", "text_encoder": "device"}
+
+    def _placeable_components(self) -> list[str]:
+        """Separable components whose device-vs-CPU placement the search may
+        flip. Dense/hybrid causal LMs run entirely on-device and expose NONE,
+        so the placement axis is a graceful no-op for them. A diffusion pipeline
+        exposes its scheduler and text-encoder — where the Wan 2.2 evidence
+        (see base.placement_axes) applies. Detection is best-effort off the HF
+        config's architecture names; unknown/unloadable configs expose nothing."""
+        mid = getattr(self, "_model_id", None)
+        if not mid:
+            return []
+        try:
+            archs = " ".join(
+                getattr(self._hf_config(mid), "architectures", []) or [])
+        except Exception:  # noqa: BLE001
+            return []
+        diffusion_markers = ("Diffusion", "UNet", "Transformer2D", "DiT", "Pipeline")
+        if any(m in archs for m in diffusion_markers):
+            return ["scheduler", "text_encoder"]
+        return []
 
     # -- Stage 1 -------------------------------------------------------------
 
@@ -159,7 +200,7 @@ class NativePyTorchBackend:
                     tps = [t for t in tps if t <= cap]
             except Exception:  # noqa: BLE001
                 pass
-        return {
+        axes = {
             "tp_degree": tps or [1],
             "weights_dtype": ["bf16", "fp32"],
             "attn_implementation": ["eager", "sdpa"],
@@ -168,6 +209,12 @@ class NativePyTorchBackend:
             # (batch-1 leaves the box idle). The search finds the best batch.
             "batch": [1, 8, 32],
         }
+        # Placement axis (device vs CPU per separable component). Emitted ONLY
+        # for components the model actually exposes — none for causal LMs, so
+        # this is a no-op there. A placement that is faster but drifts is caught
+        # by the equivalence gate in the tournament, not assumed here.
+        axes.update(placement_axes(self._placeable_components()))
+        return axes
 
     def apply_config(self, artifact: Artifact, config: dict[str, Any]) -> Artifact:
         return Artifact(model_id=artifact.model_id, backend=self.name,
