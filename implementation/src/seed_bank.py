@@ -106,6 +106,54 @@ def seed_lessons() -> list[Lesson]:
             last_reverified_sdk="2.28.0",
         ),
 
+        # --- borrowed NKI kernel (Stage 3) ----------------------------------
+        # The fused MoE megakernel from KevGomes1403/nki-moe-megakernel, wired
+        # as a Stage-3 BORROW candidate for the MoE family (see
+        # implementation/src/kernels/moe_fused/). Recorded so the win is
+        # remembered for future MoE models. HONEST status: the 1.76x is
+        # SOURCE-REPORTED (upstream README), not re-measured in this framework
+        # yet — narrow applicability (Qwen3-30B-A3B @ TP4) keeps it from being
+        # applied where it cannot run, and the orchestrator's equivalence gate
+        # still guards every application.
+        Lesson(
+            lesson_id="moe-fused-nki-megakernel-a3b-tp4",
+            type=LessonType.NKI_KERNEL,
+            applicability=Applicability(
+                moe, (25e9, 35e9), parents_ok=["qwen"],
+                neuron_sdk_versions=sdk),
+            layer=Layer.KERNEL, migration_risk="low",
+            origin=Origin.BORROWED,
+            intervention={"spec": {"moe_kernel": "fused_nki", "tp_degree": 4}},
+            reason=(
+                "Fused MoE decode (TKG) megakernel: RMSNorm -> router top-K -> "
+                "selective gate/up/down expert GEMMs -> weighted sum -> "
+                "AllReduce, all SBUF-resident (no HBM round-trips between "
+                "layers). Swap the HF MoE layer forward with it for Qwen3-MoE. "
+                "Source-reported 1.76x over XLA on Trn3 (1.52x for the "
+                "expert-only hybrid); NOT yet re-validated in this framework — "
+                "applied only under the equivalence gate."),
+            symptoms_addressed=[Symptom(
+                bottleneck="dma_bound",
+                signature=("MoE decode dominated by per-layer graph boundaries "
+                           "+ small fragmented expert-weight DMAs"),
+                observed_via=("sync-engine + DMA-active time high on the profile; "
+                              "~98 graph boundaries per decoder block in XLA"),
+            )],
+            source="nki-moe-megakernel@5879c39",
+            confidence=Confidence(n_models_validated=1, architecture_diversity=1,
+                                  human_verified=False),
+            last_reverified_sdk="2.27.0",
+            evidence=[{
+                "model": "Qwen3-30B-A3B", "tp_degree": 4, "phase": "decode",
+                "source_reported_speedup_vs_xla": 1.76,
+                "hybrid_expert_only_speedup_vs_xla": 1.52,
+                "measured_in_framework": False,
+                "note": ("upstream README benchmark on Trainium 3, 640 output "
+                         "tokens, bs=1; NOT re-measured here — deferred to a "
+                         "free trn2 box (needs nki-library + XLA trace bridge)"),
+            }],
+        ),
+
         # --- config priors --------------------------------------------------
         Lesson(
             lesson_id="dense-30b-tp8-bf16",

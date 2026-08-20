@@ -251,6 +251,27 @@ class Orchestrator:
                 if evaluated is not None:
                     self._update_incumbent(evaluated)
 
+        # Stage 3 (BORROW) — family-specific kernel candidates. For the MoE
+        # family the backend offers "swap the HF MoE layer forward with the
+        # vendored fused NKI megakernel" (nki-moe-megakernel). Dense LLMs offer
+        # nothing here, so this is a graceful no-op for them. Each candidate is
+        # evaluated through the SAME _evaluate() path — real equivalence gate
+        # included — so a kernel whose output drifts past tolerance, or that is
+        # not faster, is discarded rather than forced. Backends predating this
+        # method simply expose no candidates (getattr default []).
+        moe_candidates = getattr(self.backend, "moe_kernel_candidates", None)
+        if callable(moe_candidates):
+            from kernels.moe_fused import KERNEL_SOURCE
+            base_artifact = self.backend.build_baseline(spec.model_id)
+            for label, patch in moe_candidates(base_artifact):
+                cand = Candidate(config={**base_cfg, **patch},
+                                 provenance=label, layer=Layer.KERNEL)
+                evaluated = self._evaluate(
+                    cand, spec, Stage.BORROW, origin=Origin.BORROWED,
+                    layer=Layer.KERNEL, source=KERNEL_SOURCE)
+                if evaluated is not None:
+                    self._update_incumbent(evaluated)
+
         # Stage 4 — invent: entered, but no auto-generated NKI kernel this run.
         self._record(
             Candidate(config=base_cfg, provenance="stage4-invent", layer=Layer.KERNEL),
