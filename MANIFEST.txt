@@ -1,2 +1,19 @@
-# Populated by bank_publish.sh at each snapshot (lesson counts per tier/family).
-# This placeholder is replaced on the first real snapshot pushed from .211.
+# knowledge-bank snapshot manifest
+# generated: 2026-08-20T20:36:51Z  by: ip-172-31-38-152  publisher: .211/shard0
+# layout: <tier>/<family>/<type>/<lesson_id>.yaml
+
+[provisional] total=0
+    dense-causal-lm: 0
+    diffusion: 0
+    encoder-only: 0
+    moe-causal-lm: 0
+    speech: 0
+[verified] total=10
+    dense-causal-lm: 7
+    diffusion: 1
+    encoder-only: 0
+    hybrid-attention-causal-lm: 1
+    moe-causal-lm: 1
+    speech: 0
+
+TOTAL_LESSONS=10

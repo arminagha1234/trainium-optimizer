@@ -1,0 +1,43 @@
+lesson_id: hybrid-attn-27b-tp-by-kvheads-then-fill-dp
+type: config_prior
+layer: config
+migration_risk: medium
+origin: ''
+applicability:
+  architecture_family: hybrid_attention_causal_lm
+  param_count_range:
+  - 20000000000.0
+  - 40000000000.0
+  seq_len_range:
+  - 0
+  - 10000000
+  batch_range:
+  - 1
+  - 4096
+  parents_ok: []
+  neuron_sdk_versions:
+  - 2.26.*
+  - 2.27.*
+  - 2.28.*
+confidence:
+  n_models_validated: 2
+  architecture_diversity: 1
+  human_verified: true
+intervention:
+  spec:
+    tp_degree: 4
+    weights_dtype: bf16
+    kv_cache_dtype: bf16
+reason: "Hybrid-attention ~27B (Qwen3.x-style GQA, often 4 KV heads) is capped at\
+  \ TP=num_kv_heads=4 for clean attention sharding. That is only 4 of 64 logical cores\
+  \ on trn2.48xlarge (LNC=2). Do NOT stop there: the search sweeps the whole TPxDP\
+  \ grid (TP=4xDP=16, TP=8xDP=8, ... TP=64xDP=1 \u2014 every box-filling partition)\
+  \ and MEASURES each; a good default is low-TP x many-DP for throughput, but the\
+  \ winner is decided by measurement. TP>kv_heads is possible via KV replication but\
+  \ must be measured, not assumed \u2014 it trades redundant KV work for tensor-parallel\
+  \ width and only sometimes wins. Leaving 12 cores idle is the failure mode to avoid."
+symptoms_addressed:
+- bottleneck: under_utilized
+  signature: TP group << instance cores; most of the box idle
+  observed_via: device_utilization low; MFU low despite fast per-replica
+last_reverified_sdk: 2.28.0
