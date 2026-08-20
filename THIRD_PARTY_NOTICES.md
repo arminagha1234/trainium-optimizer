@@ -23,6 +23,7 @@ header in its source file and a `reference_translation` (or `nki_kernel` with
 | [neuronx-distributed-inference `contrib/`](https://github.com/aws-neuron/neuronx-distributed-inference) | see repo | Per-architecture worked port recipes (config/sharding/kernels); mined from `contrib/` and PRs |
 | [Autocomp](https://github.com/ucb-bar/autocomp) | see repo | Search architecture (beam + plan/implement); no code copied |
 | internal-prior-optimization-run | private | Optimization techniques (Local-Q, Context Parallel, Local-MoE); trajectory-report format |
+| [KevGomes1403/nki-moe-megakernel](https://github.com/KevGomes1403/nki-moe-megakernel) | Apache-2.0 | **Code borrowed** — fused Qwen3-MoE NKI megakernel, vendored as a Stage-3 BORROW candidate (`implementation/src/kernels/moe_fused/`) |
 
 ## Per-borrow log
 
@@ -38,8 +39,22 @@ _(Appended as kernels are actually borrowed. Format:)_
 - Bank lesson: <lesson_id>
 ```
 
-_No code borrows have landed yet — the framework is the harness. This file is
-the standing obligation to log them when they do._
+### fused MoE megakernel (Qwen3-30B-A3B)
+- Source: https://github.com/KevGomes1403/nki-moe-megakernel @ 5879c39
+- License: Apache-2.0 (copy at `implementation/src/kernels/moe_fused/LICENSE`)
+- Taken: `moe_fused_nki.py`, `qwen_with_megakernel.py`,
+  `nki_kernels/moe/components/{routed_experts_nki,moe_layer}.py`,
+  `nki_kernels/moe/vendored/router_topk.py` — the fused MoE decode (TKG)
+  subkernel + its self-contained expert/router pieces and the model-integration
+  reference.
+- Changes: NONE to kernel bodies. Prepended SPDX/attribution headers to the two
+  files that upstream carried under the repo-level LICENSE only. Added a
+  framework `adapter.py` (new file) that offers + gates the swap.
+- Site: `implementation/src/kernels/moe_fused/` (see its `NOTICE` + `README.md`)
+- Bank lesson: `moe-fused-nki-megakernel-a3b-tp4`
+- On-device status: code-complete + mock-tested; NOT yet re-validated on device
+  (external `nki-library` dep + NxDI/XLA decode stack + A3B/TP4-only dims —
+  see the vendor `README.md` gap analysis).
 
 ## A note on model licenses
 
