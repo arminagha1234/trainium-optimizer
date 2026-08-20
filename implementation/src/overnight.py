@@ -161,6 +161,9 @@ def run_one(
     log,
     instance_type: str | None = "trn2.48xlarge",
     cycle: int = 1,
+    profile_loop: bool = True,
+    profile_loop_rounds: int = 3,
+    profile_loop_patience: int = 2,
 ) -> ModelResult:
     """Optimize a single model. Crashes are caught and returned, never raised,
     so one bad model does not end the night."""
@@ -191,6 +194,17 @@ def run_one(
         # (NEURON_CC_FLAGS) on top of the Stage-1 winner, equivalence-gated.
         log(f"[{slug}] Stages 2-5: compiler/kernel rewrites")
         best = orch.run_deep_stages(spec)
+
+        # Stage 6: bounded profile-guided re-entry. Re-profile the incumbent and
+        # re-enter the deep stages while a dominant bottleneck remains AND the
+        # incumbent keeps improving — bounded by patience (K no-improvement
+        # rounds) and a max-rounds cap so it can never loop forever.
+        if profile_loop:
+            log(f"[{slug}] Stage 6: profile-guided re-entry "
+                f"(max_rounds={profile_loop_rounds}, patience={profile_loop_patience})")
+            best = orch.run_profile_loop(
+                spec, max_rounds=profile_loop_rounds,
+                patience=profile_loop_patience)
 
         # TRUSTED GRADER (before publish) — never trust the search's self-
         # reported winner. Re-run it independently; it must REPRODUCE its metric
@@ -428,6 +442,14 @@ def main() -> None:
                          "later models/cycles compound (uses the overnight policy)")
     ap.add_argument("--cycle-pause", type=float, default=0.0,
                     help="seconds to sleep between cycles")
+    # --- Stage 6: bounded profile-guided re-entry loop ---
+    ap.add_argument("--no-profile-loop", dest="profile_loop", action="store_false",
+                    help="disable Stage 6 (on by default, bounded)")
+    ap.add_argument("--profile-loop-rounds", type=int, default=3,
+                    help="Stage 6 max re-entry rounds (hard cap)")
+    ap.add_argument("--profile-loop-patience", type=int, default=2,
+                    help="Stage 6: stop after K consecutive no-improvement rounds")
+    ap.set_defaults(profile_loop=True)
     a = ap.parse_args()
 
     out_root = a.out_root.resolve()
@@ -473,6 +495,9 @@ def main() -> None:
                 results.append(run_one(
                     slug, SEED_MODELS[slug], a.backend, out_root, bank, a.sdk, log,
                     instance_type=instance_type, cycle=cycle,
+                    profile_loop=a.profile_loop,
+                    profile_loop_rounds=a.profile_loop_rounds,
+                    profile_loop_patience=a.profile_loop_patience,
                 ))
 
             # Compound learning: promote qualifying provisional lessons so the

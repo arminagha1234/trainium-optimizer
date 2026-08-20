@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from backends.base import Backend, Measurements
+from backends.base import Backend, Measurements, OpSite, Profile
 from bank import KnowledgeBank
 from guardrails import Guardrails, StoppingState
 from ledger import (
@@ -258,6 +258,99 @@ class Orchestrator:
             metric=0.0, correctness=0.0, compile_s=0.0, status=Status.DISCARD,
             desc="Stage 4 entered: no auto-invention (needs NKI-writer agent)")
         return self.incumbent
+
+    # -- Stage 6 -------------------------------------------------------------
+
+    # A bottleneck is "dominant, attackable" when the hottest op owns at least
+    # this share of step time. Below it, the profile is flat and another pass of
+    # the deep stages has nothing to bite on, so the loop should stop rather than
+    # burn compiles chasing noise.
+    _PROFILE_LOOP_DOMINANCE_SHARE = 0.30
+
+    def run_profile_loop(
+        self, spec: ModelSpec, max_rounds: int = 3, patience: int = 2,
+    ) -> Candidate | None:
+        """Stage 6: bounded, profile-guided re-entry loop.
+
+        The pipeline above is linear — Stage 1 then the deep stages once. This
+        closes the loop: re-profile the current incumbent and, while the profile
+        still shows a dominant, attackable bottleneck, re-enter the deep stages
+        to attack it. It reuses the SAME incumbent / tournament / equivalence /
+        guardrail machinery (run_deep_stages) — it does not evaluate anything
+        itself, it only decides whether another pass is worth the compiles.
+
+        Bounding (must not loop forever). The loop stops on EITHER:
+          (a) no improvement past the guardrail's noise margin for `patience`
+              consecutive rounds (the incumbent stopped moving), OR
+          (b) the `max_rounds` cap, OR
+          (c) the profile no longer shows a dominant, attackable bottleneck.
+
+        Each round is recorded to the ledger as a PROFILE_LOOP row (profile ->
+        re-entry -> gained/didn't), so the bank can learn which profiled
+        bottlenecks re-entry actually helps.
+        """
+        if self.incumbent is None:
+            return self.incumbent
+
+        no_improvement = 0
+        for round_idx in range(1, max_rounds + 1):
+            prof = self._profile_incumbent(spec)
+            hot = self._dominant_op(prof)
+            if hot is None:
+                self._record(
+                    self.incumbent, Stage.PROFILE_LOOP, Origin.NONE, Layer.NONE,
+                    source="", metric=self.incumbent.metric, correctness=100.0,
+                    compile_s=0.0, status=Status.DISCARD,
+                    desc=(f"round {round_idx}: no dominant bottleneck "
+                          f"({prof.bottleneck or 'flat'}) -> loop done"))
+                break
+
+            prev_metric = self.incumbent.metric
+            # Re-enter the deep stages to attack the profiled bottleneck. All the
+            # real evaluation (compile/equivalence/guardrails/keep) happens there.
+            self.run_deep_stages(spec)
+            gain = (
+                (self.incumbent.metric / prev_metric - 1.0) * 100.0
+                if prev_metric > 0 else 0.0
+            )
+            improved = self.guards.is_improvement(
+                self.incumbent.metric, prev_metric)
+            self._record(
+                self.incumbent, Stage.PROFILE_LOOP, Origin.NONE, Layer.NONE,
+                source="", metric=self.incumbent.metric, correctness=100.0,
+                compile_s=0.0,
+                status=Status.KEEP if improved else Status.DISCARD,
+                desc=(f"round {round_idx}: profile={prof.bottleneck or '?'} "
+                      f"hot={hot.op_name}({hot.cost_share:.0%}) -> re-entered "
+                      f"deep stages -> {'+' if gain >= 0 else ''}{gain:.1f}% "
+                      f"({'improved' if improved else 'no gain'})"))
+
+            if improved:
+                no_improvement = 0
+            else:
+                no_improvement += 1
+                if no_improvement >= patience:
+                    break
+
+        return self.incumbent
+
+    def _profile_incumbent(self, spec: ModelSpec) -> Profile:
+        """Re-profile the current incumbent. Cheap: it builds+``compile``s the
+        incumbent config and asks the backend to classify the bottleneck — it
+        does NOT re-measure on device (the profile is a symptom key, not a run)."""
+        artifact = self.backend.apply_config(
+            self.backend.build_baseline(spec.model_id), self.incumbent.config
+        )
+        neff = self.backend.compile(artifact)
+        return self.backend.profile(neff, spec.probe_shape)
+
+    def _dominant_op(self, prof: Profile) -> OpSite | None:
+        """The hottest op site, if it dominates enough to be worth re-attacking."""
+        hottest = prof.hottest(1)
+        if not hottest:
+            return None
+        top = hottest[0]
+        return top if top.cost_share >= self._PROFILE_LOOP_DOMINANCE_SHARE else None
 
     # -- tournament primitives ----------------------------------------------
 

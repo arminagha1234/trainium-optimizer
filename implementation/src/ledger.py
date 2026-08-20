@@ -42,6 +42,12 @@ class Stage(StrEnum):
     BORROW = "borrow"
     INVENT = "invent"
     GRAPH_REWRITE = "graph_rewrite"
+    # Stage 6 — bounded profile-guided re-entry. Not a candidate generator of
+    # its own: it re-profiles the incumbent and re-enters the deep stages while
+    # a dominant, attackable bottleneck remains and the incumbent keeps
+    # improving. Each round is recorded so the bank learns "profile said X ->
+    # re-entered -> gained/didn't". See ../../optimization-stages.md#stage-6.
+    PROFILE_LOOP = "profile_loop"
 
 
 class Origin(StrEnum):
