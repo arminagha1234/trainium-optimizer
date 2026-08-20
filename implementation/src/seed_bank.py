@@ -207,6 +207,42 @@ def seed_lessons() -> list[Lesson]:
             backend_validated=["vllm-neuron-xla"],
         ),
         Lesson(
+            lesson_id="placement-device-scheduler-bf16-drift",
+            type=LessonType.ANTI_PATTERN,
+            applicability=Applicability("diffusion", (0, 300e9),
+                                        neuron_sdk_versions=sdk),
+            layer=Layer.CONFIG, migration_risk="medium",
+            # No matcher ON PURPOSE: this must NOT pre-prune. Moving a component
+            # to the device is sometimes the right call (the text-encoder was a
+            # 65s -> 0.7s win), so placement is decided by measure() + the
+            # equivalence gate, not assumed away before compile. The lesson is
+            # the recorded WARNING that a device placement of a sequential
+            # bf16 solver needs the correctness gate, and why.
+            reason=(
+                "Moving a bf16 reduction/solver op (e.g. a diffusion scheduler "
+                "step) to the device can drift accuracy over many sequential "
+                "steps — placement must be correctness-gated, not assumed. Wan "
+                "2.2 (50 steps): scheduler on device measured 72.3s (NOT faster "
+                "than 71.2s on CPU) AND degraded output to PSNR 34.7 dB vs the "
+                "CPU scheduler's 56.2 dB. Conversely the T5 text-encoder on "
+                "device was 65s -> 0.7s with no drift. So placement is "
+                "per-component: keep the sequential solver on CPU, put the "
+                "one-shot encoder on device — and let the equivalence gate "
+                "confirm each, rather than forcing everything on-device."),
+            symptoms_addressed=[Symptom(
+                bottleneck="accuracy_drift",
+                signature=("output quality (PSNR/token-match) degrades over many "
+                           "sequential steps after a component moved to device"),
+                observed_via="equivalence gate fails a fast device-placement candidate",
+            )],
+            confidence=Confidence(n_models_validated=1, human_verified=True),
+            last_reverified_sdk="2.28.0",
+            evidence=[{"model": "Wan2.2-TI2V-5B", "steps": 50,
+                       "scheduler_device_s": 72.3, "scheduler_cpu_s": 71.2,
+                       "scheduler_device_psnr_db": 34.7, "scheduler_cpu_psnr_db": 56.2,
+                       "text_encoder_cpu_s": 65.0, "text_encoder_device_s": 0.7}],
+        ),
+        Lesson(
             lesson_id="fp8-activations-rmsnorm-heavy",
             type=LessonType.ANTI_PATTERN,
             applicability=Applicability(dense, (0, 200e9), neuron_sdk_versions=sdk),
