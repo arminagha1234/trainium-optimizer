@@ -154,6 +154,39 @@ class NativePyTorchBackend:
     # device win with no drift, so it defaults to device.
     _DEFAULT_PLACEMENT = {"scheduler": "cpu", "text_encoder": "device"}
 
+    # -- Stage 3 (BORROW): fused MoE megakernel for the MoE family -----------
+
+    def _is_moe_model(self, model_id: str | None = None) -> bool:
+        """True if the HF config describes a (sparse) MoE causal LM. Best-effort
+        off the architecture names / expert-count attributes, mirroring
+        _placeable_components()'s config-only detection. Unknown/unloadable
+        configs are treated as non-MoE (the borrow is simply not offered)."""
+        mid = model_id or getattr(self, "_model_id", None)
+        if not mid:
+            return False
+        try:
+            from kernels.moe_fused import is_moe_arch
+            cfg = self._hf_config(mid)
+            cfg = getattr(cfg, "text_config", None) or cfg
+            return is_moe_arch(cfg)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def moe_kernel_candidates(self, artifact: Artifact) -> list[tuple[str, dict[str, Any]]]:
+        """Stage-3 BORROW candidates for this model: swap the HF MoE layer's
+        forward with the vendored fused NKI megakernel.
+
+        Returns a list of (ledger-label, config-patch) pairs. EMPTY for a
+        non-MoE model (a dense causal LM), so the borrow degrades to a graceful
+        no-op there — the same contract as placement_axes([]) for models with
+        no separable components. The orchestrator evaluates each patch as a
+        normal BORROW candidate, gated by the existing equivalence check; a
+        drifting or non-faster kernel is discarded, never forced."""
+        if not self._is_moe_model(artifact.model_id):
+            return []
+        from kernels.moe_fused import FUSED_NKI, MOE_KERNEL_KEY
+        return [("moe:fused-nki-megakernel", {MOE_KERNEL_KEY: FUSED_NKI})]
+
     def _placeable_components(self) -> list[str]:
         """Separable components whose device-vs-CPU placement the search may
         flip. Dense/hybrid causal LMs run entirely on-device and expose NONE,
@@ -250,6 +283,7 @@ class NativePyTorchBackend:
             "--input-len", str(input_len),
             "--batch", str(batch),
             "--cc-flags", str(cfg.get("cc_flags", "")),   # Stage 2-5 compiler rewrites
+            "--moe-kernel", str(cfg.get("moe_kernel", "")),  # Stage 3 MoE borrow
             "--out", str(out_f),
         ]
         env = {**os.environ,
