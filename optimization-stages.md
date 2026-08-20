@@ -33,7 +33,20 @@ Two principles govern the ordering:
                 |             (only wins if it beats Stage 3 by margin)
                 v
   Stage 5    GRAPH REWRITE   fusion, reordering, layout — highest risk
+                |
+                v
+  Stage 6    PROFILE LOOP    re-profile the incumbent; while a dominant,
+                             attackable bottleneck remains AND the incumbent
+                             keeps improving, RE-ENTER the deep stages.
+                             Bounded (patience + max-rounds) so it terminates.
 ```
+
+The first six rows are the linear pipeline. Stage 6 turns the tail into a
+**bounded closed loop**: a single deep-stage pass is one attack on whatever the
+profile said was hot, but fixing the top bottleneck can promote a *different*
+op to the top (Amdahl's law in reverse). Re-profiling and re-entering lets the
+optimizer chase the new bottleneck instead of stopping at the first one — but
+only while it is still paying off, and never forever.
 
 **Stage 0.5 is free and it front-loads everything else.** Full design in
 [`harvest-corpus.md`](./harvest-corpus.md). The short version: `nki-library`
@@ -96,6 +109,23 @@ Axes:
 | `attention_kernel` | whichever variants the stack already ships |
 | `batching` | static, dynamic, continuous |
 | `sequence_layout` | contiguous, paged, prefix-cached |
+| `place:<component>` | cpu, device — per separable component (see below) |
+
+**Component placement is a config axis, not a decree.** For models with
+separable components (a diffusion pipeline's `scheduler` and `text_encoder`,
+say), *where* each runs — device or CPU — is a searched axis like any other,
+gated by the same `measure()` + equivalence check. We do **not** hard-force
+"everything on Neuron"; we have direct evidence that backfires. In the Wan 2.2
+port, forcing the scheduler on-device measured **72.3 s vs 71.2 s** (no faster)
+**and** degraded output to **PSNR 34.7 dB vs the CPU scheduler's 56.2 dB** — a
+bf16 solver drifting over 50 sequential steps. The opposite move — putting the
+T5 text-encoder on device — was a large win (**65 s → 0.7 s**) with no drift.
+So placement is *per-component* and gated by both speed and correctness: the
+baseline seeds the known-safe placement (CPU scheduler, device text-encoder),
+the search tries the alternative, and the equivalence gate discards a placement
+that is fast-but-wrong. Models that expose no separable components (dense causal
+LMs run entirely on-device) emit no placement candidates — the axis is a no-op
+there rather than a fabricated knob.
 
 This is where bank `config_prior` lessons do the most work — a good prior can
 land within a few percent of the Stage-1 optimum on the first candidate.
@@ -295,6 +325,48 @@ eliminating redundant transposes, layout changes to avoid DMA.
 Last because these interact with everything before them. A fusion that helps
 at TP=8/bf16 may hurt at TP=16/fp8, so it must be evaluated against the
 already-settled config rather than searched jointly.
+
+## Stage 6 — Profile-guided re-entry (bounded loop)
+
+**What changes**: nothing on its own. Stage 6 is control flow, not a new
+candidate generator — it re-runs the deep stages (2–5) against a freshly
+profiled incumbent.
+**Cost**: one profile per round (cheap — it classifies the bottleneck, it does
+not re-measure on device) plus the compiles of whatever the re-entered stages
+try.
+**Risk**: none beyond the stages it re-enters — every candidate still passes the
+same equivalence + guardrail gates.
+
+Stages 1–5 run once, top to bottom. But optimization is not one-shot: killing
+the dominant bottleneck often just promotes the *next* op to the top. Stage 6
+closes the loop. After the deep stages it **re-profiles the current incumbent**;
+if the profile still shows a **dominant, attackable bottleneck** it **re-enters
+the deep stages** to attack it, and repeats.
+
+### Bounding — it must terminate
+
+The loop is explicitly bounded on three conditions; hitting any one stops it:
+
+1. **No-improvement patience.** If a round fails to beat the incumbent past the
+   guardrail's noise margin for `K` consecutive rounds (`patience`, default
+   **2**), stop — the incumbent has stopped moving.
+2. **Max rounds.** A hard cap (`max_rounds`, default **3**) regardless of
+   progress — the compile-budget backstop.
+3. **No dominant bottleneck.** If the profile is flat (no op owns ≥ 30% of step
+   time), there is nothing worth re-attacking, so stop.
+
+`K` (`patience`) and `max_rounds` are parameters with the defaults above
+(`--profile-loop-patience`, `--profile-loop-rounds`; disable the whole stage
+with `--no-profile-loop`).
+
+### What it records
+
+Each round appends a `profile_loop` row to the ledger: which bottleneck the
+profile pointed at, that the deep stages were re-entered, and whether the round
+gained or not. That is the substrate for the bank to learn *"profile said X →
+re-entering stage Y helped / didn't"* — the same keep/discard honesty as every
+other stage. It reuses the existing incumbent / tournament / equivalence /
+guardrail machinery; it never evaluates a candidate itself.
 
 ---
 

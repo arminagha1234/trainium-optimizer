@@ -20,6 +20,42 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 
+# -- component placement -----------------------------------------------------
+# A "placement" config axis moves one separable component (a diffusion
+# scheduler, a text-encoder, ...) between the device and the CPU. It is a normal
+# config axis: the search proposes both placements and the EXISTING measure() +
+# equivalence gate keep whichever is faster AND still correct. Placement is
+# NEVER hard-forced onto the device — we have direct evidence that backfires:
+#
+#   Wan 2.2 port, 50-step video diffusion:
+#     - scheduler on device: 72.3 s (NOT faster than 71.2 s on CPU) AND output
+#       degraded to PSNR 34.7 dB vs the CPU scheduler's 56.2 dB — a bf16
+#       reduction/solver drifting over 50 sequential steps.
+#     - text-encoder on device: 65 s -> 0.7 s, a large win with no drift.
+#
+# So placement is PER-COMPONENT and must be gated by both speed and correctness,
+# not assumed. See the "placement-device-scheduler-bf16-drift" anti-pattern.
+PLACEMENT_PREFIX = "place:"
+
+
+def placement_axis_key(component: str) -> str:
+    """The config-axis key for a component's device-vs-CPU placement."""
+    return f"{PLACEMENT_PREFIX}{component}"
+
+
+def placement_axes(components: list[str]) -> dict[str, list[str]]:
+    """Device-vs-CPU placement axes for the given separable components.
+
+    Returns {} for an empty component list, so a backend/model that exposes no
+    separable components (e.g. a dense causal LM, which runs entirely on-device)
+    contributes no placement candidates — the axis degrades to a no-op rather
+    than fabricating knobs the model does not have. The values are ordered
+    CPU-first so the safe placement is tried before the device one; the
+    equivalence gate, not the ordering, is what actually rejects a bad move.
+    """
+    return {placement_axis_key(c): ["cpu", "device"] for c in components}
+
+
 @dataclass
 class Artifact:
     """A configured, not-yet-compiled model implementation."""
