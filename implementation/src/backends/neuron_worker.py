@@ -284,6 +284,9 @@ def main() -> None:
     ap.add_argument("--iters", type=int, default=6)
     ap.add_argument("--cc-flags", default="",
                     help="extra NEURON_CC_FLAGS for Stage 2-5 compiler rewrites")
+    ap.add_argument("--moe-kernel", default="",
+                    help="Stage-3 MoE borrow: 'fused_nki' swaps the HF MoE "
+                         "layer forward with the vendored fused NKI megakernel")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -371,6 +374,27 @@ def main() -> None:
         per_rank_gb = (params * dtb / a.tp) / 1e9
         if per_rank_gb > 10.0:
             _shard_vocab(model, mesh, _log)
+    # Stage-3 BORROW: optionally swap the HF MoE block forward with the vendored
+    # fused NKI megakernel. The adapter runs a full precondition gauntlet (arch,
+    # exact A3B/TP4 dims, nkilib availability) and NEVER raises — on any unmet
+    # precondition it leaves the eager model untouched and returns a reason, so
+    # this measurement stays a correct, unchanged (non-faster) candidate that the
+    # orchestrator's equivalence gate handles normally. See kernels/moe_fused.
+    moe_swap = "not-requested"
+    if a.moe_kernel:
+        try:
+            try:
+                from kernels.moe_fused import swap_moe_forward
+            except Exception:  # noqa: BLE001
+                import os as _os, sys as _sys
+                _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+                from kernels.moe_fused import swap_moe_forward
+            swapped, reason = swap_moe_forward(model, a.tp, _log)
+            moe_swap = f"{'swapped' if swapped else 'eager-fallback'}: {reason}"
+        except Exception as e:  # noqa: BLE001 — never let the borrow crash a run
+            moe_swap = f"eager-fallback: adapter error {e!r}"
+            _log(f"moe-borrow adapter failed, running eager: {e!r}")
+
     model = model.to(dev)
     model.eval()
     load_s = time.time() - t_load
@@ -476,6 +500,7 @@ def main() -> None:
         "params_est": params,
         "world_size": world,
         "top1_tokens": eq_tokens,   # equivalence signature (last-K argmax)
+        "moe_kernel_swap": moe_swap,  # Stage-3 borrow status (audit trail)
     })
 
     sys.stdout.flush()
