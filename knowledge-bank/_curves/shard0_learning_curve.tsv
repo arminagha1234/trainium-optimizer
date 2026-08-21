@@ -15,3 +15,4 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	stabilityai-sdxl-turbo	stabilityai/sdxl-turbo	diffusion	25	0.000	296	ok
 1	sd-legacy-stable-diffusion-v1-5	sd-legacy/stable-diffusion-v1-5	diffusion	31	-	5400	TIMEOUT
 1	black-forest-labs-flux-1-schnell	black-forest-labs/FLUX.1-schnell	diffusion	25	0.000	130	ok
+2	qwen-qwen3-0-6b	Qwen/Qwen3-0.6B	dense_causal_lm	64	28.109	1850	ok
