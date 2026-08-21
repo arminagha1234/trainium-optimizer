@@ -220,6 +220,29 @@ def run_one(
     # optimized_models/<slug>/ by publish(). So this is just the live scratch.
     run_dir = out_root / "optimization_runs" / slug
     try:
+        # AUTO-ONBOARD (Tier-0, additive) — only for a queued model that carries
+        # NO explicit family (a discovery entry sets family="auto"). Fingerprint
+        # its config by SHAPE: a Tier-0 MAP replaces the family-less spec with a
+        # fully-resolved one and proceeds into the normal loop; a Tier-1/2 verdict
+        # records a `needs-onboarding` lesson (reuse the anti-pattern/bank path)
+        # instead of a bare FAIL_NO_BASELINE, and skips — the model is queued for
+        # onboarding (Phase 2/3), not dropped. Explicit-family seeds skip all this.
+        from onboarding import needs_auto_onboard, resolve_onboarding
+        if needs_auto_onboard(spec):
+            resolved, verdict = resolve_onboarding(spec)
+            if resolved is None:
+                # Tier-1/2: record a `needs-onboarding` lesson via the same
+                # arch-signature-keyed anti-pattern/bank path a pre-flight skip
+                # uses (so a sibling of the same unseen shape is flagged too),
+                # instead of a bare FAIL_NO_BASELINE.
+                reason = f"needs-onboarding [{verdict.verdict.value}]: {verdict.reason}"
+                _record_preflight_skip(
+                    run_dir, out_root, cycle, slug, spec, bank, sdk_version,
+                    reason, log)
+                return ModelResult(slug=slug, ok=False, skipped=True, error=reason)
+            log(f"[{slug}] auto-onboarded (Tier-0 MAP): {verdict.reason}")
+            spec = resolved
+
         # PRE-FLIGHT GATE (Rule 4 at the arch level) — cheap, no-compile, BEFORE
         # any backend/compiler work. Skip a model that will predictably fail the
         # expensive way (linear-attention ISA abort, or an arch the bank already
