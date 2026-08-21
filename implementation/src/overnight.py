@@ -31,6 +31,12 @@ from bank import AutoPromotionPolicy, KnowledgeBank
 from guardrails import Guardrails
 from ledger import Ledger, Origin
 from orchestrator import ModelSpec, Orchestrator
+from preflight import (
+    arch_signature,
+    load_hf_config,
+    make_anti_pattern_lesson,
+    preflight_check,
+)
 from publish import publish
 from leaderboard_chart import build_leaderboard_chart
 from trajectory_chart import build_chart, build_highlights_chart
@@ -95,6 +101,10 @@ class ModelResult:
     speedup: float = 0.0
     attempts: int = 0
     error: str = ""
+    # Set when the pre-flight gate skipped this model before any compile (a
+    # known-bad arch). Distinct from a crash (ok=False, skipped=False): a skip
+    # is a cheap, remembered decision, not a burned run.
+    skipped: bool = False
 
 
 def detect_cores() -> int:
@@ -179,6 +189,7 @@ def run_one(
     profile_loop: bool = True,
     profile_loop_rounds: int = 3,
     profile_loop_patience: int = 2,
+    preflight: bool = True,
 ) -> ModelResult:
     """Optimize a single model. Crashes are caught and returned, never raised,
     so one bad model does not end the night."""
@@ -188,6 +199,20 @@ def run_one(
     # optimized_models/<slug>/ by publish(). So this is just the live scratch.
     run_dir = out_root / "optimization_runs" / slug
     try:
+        # PRE-FLIGHT GATE (Rule 4 at the arch level) — cheap, no-compile, BEFORE
+        # any backend/compiler work. Skip a model that will predictably fail the
+        # expensive way (linear-attention ISA abort, or an arch the bank already
+        # burned a compile / NRT-abort / 0-metric on) and record the lesson so
+        # the whole class fails fast next time. Only skips KNOWN-BAD arches, so
+        # working dense models are untouched.
+        if preflight:
+            ok, reason = preflight_check(spec, bank=bank, sdk_version=sdk_version)
+            if not ok:
+                _record_preflight_skip(
+                    run_dir, out_root, cycle, slug, spec, bank, sdk_version,
+                    reason or "preflight skip", log)
+                return ModelResult(slug=slug, ok=False, skipped=True,
+                                   error=reason or "preflight skip")
         # Family-driven backend selection. The continuous driver always passes
         # --backend native-pytorch-beta3 (the causal-LM path), so the ONLY signal
         # that a model is text-to-image is spec.family. Route family="diffusion"
@@ -241,6 +266,24 @@ def run_one(
         except Exception as e:  # noqa: BLE001
             log(f"[{slug}] trusted grader skipped (non-fatal): {e}")
             verdict = "ungraded"
+
+        # A winner that produced NO throughput (0 img/s / 0 tok/s) is a silent
+        # backend failure, not a real win — the trusted grader can only mark it
+        # "unverified", and re-running the whole search next cycle would burn the
+        # launch + partial compile again. Record a pre-flight anti-pattern keyed
+        # by arch-signature so the class is skipped instantly next time. Kept
+        # conservative: fires only on a hard 0 (a deterministic no-throughput),
+        # never on a slow-but-real result.
+        if preflight and float(getattr(best, "metric", 0.0) or 0.0) <= 0.0:
+            try:
+                sig = arch_signature(spec, load_hf_config(spec.model_id))
+                reason = (f"metric=0 -> backend produced no throughput "
+                          f"(trusted-grader {verdict}); needs adapter/backend fix")
+                bank.save(make_anti_pattern_lesson(spec, sig, reason, sdk_version))
+                log(f"[{slug}] 0-metric run recorded as anti-pattern for arch "
+                    f"'{sig}' — will skip fast next cycle")
+            except Exception as e:  # noqa: BLE001
+                log(f"[{slug}] 0-metric anti-pattern emit failed (non-fatal): {e}")
 
         # Publish the CANONICAL best recipe (beat-gated: only replaces the
         # existing one if this run is faster). Records the real winning config
@@ -383,6 +426,41 @@ def _append_history(out_root, cycle, slug, spec, ledger, sdk_version, log,
         log(f"[{slug}] history append failed (non-fatal): {e}")
 
 
+def _record_preflight_skip(run_dir, out_root, cycle, slug, spec, bank,
+                           sdk_version, reason: str, log) -> None:
+    """Record a pre-flight skip the same way a real run is recorded, minus the
+    compile: a ledger row (Stage.PREFLIGHT, discarded, zero compile), an
+    arch-signature-keyed anti-pattern lesson so siblings are pruned too, and a
+    `skipped` HISTORY row. Never touches the backend/compiler."""
+    from ledger import Layer, Origin, Row, Stage, Status
+
+    ledger = Ledger(run_dir)
+    if ledger.path.exists():
+        ledger.path.unlink()          # fresh WIP ledger; HISTORY.tsv is the record
+    ledger.init()
+    ledger.append(Row(
+        commit="preflight", stage=Stage.PREFLIGHT, origin=Origin.NONE,
+        layer=Layer.NONE, source="", metric=0.0, mfu=-1.0, correctness=0.0,
+        compile_s=0.0, status=Status.DISCARD,
+        description=f"preflight skip: {reason}",
+    ))
+
+    # Emit the anti-pattern lesson the SAME way other lessons are emitted
+    # (bank.save). Keyed by arch-signature so a sibling model of this known-bad
+    # arch is pruned on its first encounter too — the learning compounds.
+    try:
+        sig = arch_signature(spec, load_hf_config(spec.model_id))
+        bank.save(make_anti_pattern_lesson(spec, sig, reason, sdk_version))
+        log(f"[{slug}] PRE-FLIGHT SKIP ({reason}) — no compile; "
+            f"emitted anti-pattern for arch '{sig}'")
+    except Exception as e:  # noqa: BLE001 — a skip must never crash the night
+        log(f"[{slug}] preflight skip lesson emit failed (non-fatal): {e}")
+
+    # PERMANENT record: one `skipped` HISTORY row (baseline/best 0, verified=skipped).
+    _append_history(out_root, cycle, slug, spec, ledger, sdk_version, log,
+                    box_tok_s=0.0, verified="skipped")
+
+
 def _emit_lesson(bank, slug, spec, best, sdk_version, log) -> None:
     """Write a provisional config_prior from the winning config. Provisional,
     not verified — humans triage before the proposer trusts it."""
@@ -438,6 +516,11 @@ def write_leaderboard(results: list[ModelResult], out_root: Path, backend: str,
                 f"| {r.slug} | ok | {r.baseline:,.0f} | {r.best:,.0f} | "
                 f"{r.speedup:.2f}x | {r.attempts} |"
             )
+        elif getattr(r, "skipped", False):
+            # A pre-flight skip is not a failure — it's a cheap, remembered
+            # decision to not burn a compile on a known-bad arch.
+            lines.append(f"| {r.slug} | skipped | — | — | — | — |")
+            lines.append(f"|  |  ↳ {r.error[:80]} |  |  |  |  |")
         else:
             lines.append(f"| {r.slug} | FAILED | — | — | — | — |")
             lines.append(f"|  |  ↳ {r.error[:80]} |  |  |  |  |")
@@ -474,6 +557,11 @@ def main() -> None:
     ap.add_argument("--profile-loop-patience", type=int, default=2,
                     help="Stage 6: stop after K consecutive no-improvement rounds")
     ap.set_defaults(profile_loop=True)
+    # --- pre-flight gate: prune known-bad arches before any compile (Rule 4) ---
+    ap.add_argument("--no-preflight", dest="preflight", action="store_false",
+                    help="disable the pre-flight arch gate (on by default; it "
+                         "only ever skips known-bad arches, so leaving it on is safe)")
+    ap.set_defaults(preflight=True)
     a = ap.parse_args()
 
     out_root = a.out_root.resolve()
@@ -500,7 +588,7 @@ def main() -> None:
 
     log(f"=== overnight START: backend={a.backend} instance={instance_type} "
         f"cycles={'forever' if cycles == 0 else cycles} auto_promote={a.auto_promote} "
-        f"models={models} ===")
+        f"preflight={a.preflight} models={models} ===")
     log(f"    (touch {stop_file} to stop cleanly after the current model)")
 
     cycle = 0
@@ -522,6 +610,7 @@ def main() -> None:
                     profile_loop=a.profile_loop,
                     profile_loop_rounds=a.profile_loop_rounds,
                     profile_loop_patience=a.profile_loop_patience,
+                    preflight=a.preflight,
                 ))
 
             # Compound learning: promote qualifying provisional lessons so the
