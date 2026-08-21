@@ -35,6 +35,10 @@ LEDGER_FILENAME = "results.tsv"
 class Stage(StrEnum):
     """The optimization pipeline stages. See ../../optimization-stages.md."""
 
+    # Pre-flight gate — Rule 4 at the model/arch level. Not a candidate
+    # generator: it records a model SKIPPED before any compile because its
+    # architecture predictably fails the expensive way (see ../src/preflight.py).
+    PREFLIGHT = "preflight"
     BASELINE = "baseline"
     HARVEST = "harvest"
     CONFIG = "config"
