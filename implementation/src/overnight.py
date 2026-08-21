@@ -39,6 +39,14 @@ from trajectory_chart import build_chart, build_highlights_chart
 # The three seed models, in escalation order (see CLAUDE.md). `family` drives
 # which adapter and tolerances apply; `param_count` sizes the instance.
 SEED_MODELS: dict[str, ModelSpec] = {
+    # Text-to-image diffusion seed (family="diffusion"). Measured with the
+    # DiffusionBackend -> diffusion_worker.py (images/sec + Wan decode-parity),
+    # NOT the causal-LM tok/s path. Small, few-step model = cheap validation.
+    "sd-turbo": ModelSpec(
+        model_id="/home/ubuntu/sd-turbo", family="diffusion",
+        param_count=0.9e9, parent="stabilityai",
+        probe_shape="512x512 x1step", probe_batch=1,
+    ),
     # Fast validation model (dense, tiny) — proves the whole loop on real HW.
     "qwen3-0-6b": ModelSpec(
         model_id="Qwen/Qwen3-0.6B", family="dense_causal_lm",
@@ -136,7 +144,14 @@ def _make_backend(name: str, instance_type: str | None = None):
         return NativePyTorchBackend(
             instance_type=instance_type or "trn2.48xlarge",
             core_count=_cores_for(instance_type))
-    raise SystemExit(f"unknown backend {name!r} (use: mock | native-pytorch-beta3)")
+    if name in ("diffusion-native", "diffusion"):
+        # Text-to-image diffusion backend (images/sec + Wan decode-parity gate).
+        from backends.native_diffusion import DiffusionBackend
+        return DiffusionBackend(
+            instance_type=instance_type or "trn2.3xlarge",
+            core_count=_cores_for(instance_type) or 4)
+    raise SystemExit(
+        f"unknown backend {name!r} (use: mock | native-pytorch-beta3 | diffusion-native)")
 
 
 def _equivalence_for(backend_name: str):
@@ -173,18 +188,27 @@ def run_one(
     # optimized_models/<slug>/ by publish(). So this is just the live scratch.
     run_dir = out_root / "optimization_runs" / slug
     try:
-        backend = _make_backend(backend_name, instance_type)
+        # Family-driven backend selection. The continuous driver always passes
+        # --backend native-pytorch-beta3 (the causal-LM path), so the ONLY signal
+        # that a model is text-to-image is spec.family. Route family="diffusion"
+        # to the DiffusionBackend (images/sec + Wan decode-parity) regardless of
+        # the requested backend; every other family uses the requested one. The
+        # 'mock' backend is left untouched so laptop smoke-runs stay synthetic.
+        effective_backend = backend_name
+        if getattr(spec, "family", "") == "diffusion" and backend_name != "mock":
+            effective_backend = "diffusion-native"
+        backend = _make_backend(effective_backend, instance_type)
         ledger = Ledger(run_dir)
         if ledger.path.exists():
             ledger.path.unlink()      # fresh WIP ledger; HISTORY.tsv is the record
         ledger.init()
         orch = Orchestrator(
             backend=backend, bank=bank, guards=Guardrails(), ledger=ledger,
-            equivalence=_equivalence_for(backend_name), sdk_version=sdk_version,
+            equivalence=_equivalence_for(effective_backend), sdk_version=sdk_version,
             instance_type=instance_type,   # fills the whole box (DP/CP), not just the TP group
         )
 
-        log(f"[{slug}] establishing baseline on {backend_name}")
+        log(f"[{slug}] establishing baseline on {effective_backend}")
         orch.establish_baseline(spec)
 
         log(f"[{slug}] Stage 1: config search")
@@ -223,7 +247,7 @@ def run_one(
         # + the trusted-grader verdict.
         dest = publish(
             run_dir=run_dir, out_root=out_root / "optimized_models",
-            model_id=spec.model_id, backend=backend_name,
+            model_id=spec.model_id, backend=effective_backend,
             toolchain=backend.toolchain_stamp(),
             config=dict(getattr(best, "config", {}) or {}), verified=verdict,
         )
