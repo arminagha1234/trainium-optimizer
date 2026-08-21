@@ -192,6 +192,13 @@ class Lesson:
     promoted_at: str = ""
     beat_borrowed_by: float | None = None   # fraction; required for origin=invented
 
+    # Demotion audit trail (verified->provisional). Set by KnowledgeBank.demote
+    # when toolchain re-validation finds a verified prior regressed under a new
+    # SDK (see bank_hygiene.revalidate). Additive: emitted only when a lesson
+    # was actually demoted, so untouched lessons round-trip byte-for-byte.
+    demoted_at: str = ""
+    demote_reason: str = ""
+
     # ---- serialization -----------------------------------------------------
 
     @classmethod
@@ -227,6 +234,8 @@ class Lesson:
             auto_promoted=d.get("auto_promoted", False),
             promoted_at=d.get("promoted_at", ""),
             beat_borrowed_by=d.get("beat_borrowed_by", None),
+            demoted_at=d.get("demoted_at", ""),
+            demote_reason=d.get("demote_reason", ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -281,6 +290,10 @@ class Lesson:
             out["promoted_at"] = self.promoted_at
         if self.beat_borrowed_by is not None:
             out["beat_borrowed_by"] = self.beat_borrowed_by
+        if self.demoted_at:
+            out["demoted_at"] = self.demoted_at
+        if self.demote_reason:
+            out["demote_reason"] = self.demote_reason
         return out
 
     # ---- anti-pattern matching --------------------------------------------
@@ -560,6 +573,30 @@ class KnowledgeBank:
                     old.unlink(missing_ok=True)
                 return new
         raise KeyError(f"no provisional lesson {lesson_id!r}")
+
+    def demote(self, lesson_id: str, reason: str = "") -> Path:
+        """Move a verified lesson back to provisional — the inverse of promote.
+
+        The toolchain-hygiene action (see bank_hygiene.revalidate): a verified
+        prior that regressed or failed equivalence under a new SDK is no longer
+        trusted by the proposer, so it drops to provisional for re-triage. Trust
+        is fully withdrawn — human_verified and auto_promoted are cleared — so a
+        stale-wrong prior can never be silently re-trusted without fresh
+        evidence, and the demotion is stamped for the audit trail.
+        """
+        for l in self.load_all(Tier.VERIFIED):
+            if l.lesson_id == lesson_id:
+                old = self._lesson_path(l)
+                l.tier = Tier.PROVISIONAL
+                l.confidence.human_verified = False
+                l.auto_promoted = False
+                l.demoted_at = _utcnow()
+                l.demote_reason = reason
+                new = self.save(l)
+                if old != new:
+                    old.unlink(missing_ok=True)
+                return new
+        raise KeyError(f"no verified lesson {lesson_id!r}")
 
     def _auto_promotion_reason(
         self, l: Lesson, policy: AutoPromotionPolicy, current_sdk: str,
