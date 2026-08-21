@@ -13,6 +13,22 @@ one paragraph:
 > models and publish a **Neuron-optimized leaderboard** that refreshes on
 > every SDK release.
 
+## Current state (2026-08-21, honest)
+
+Live and running on **two `trn2.3xlarge` boxes in parallel**, pooling one knowledge bank.
+
+- **Verified wins on real hardware** (native-pytorch-beta3, correctness-gated): Qwen3-0.6B **~28×**, Qwen2.5-0.5B **15.4×**, Qwen3-4B **~13×**, Qwen2.5-3B **12.4×** (see leaderboard). Dominant lever: Stage-1 config search — `torch.compile(backend="neuron")`, TP=4, bf16, batching.
+- **Full pipeline runs per model**: Stage 0 baseline → 1 config → 2 known-kernel → 3 borrow → 5 graph-rewrite → 6 profile-loop.
+- **Two-box parallel**: shard 0 + shard 1 over a **40-model × 10-pass** rolling queue across diverse architectures (Qwen, Gemma-2, Phi, Mistral, OPT, Pythia, GPT-NeoX, StableLM, OLMo, Falcon, StarCoder, Granite, BLOOM…), with bidirectional bank-sync.
+- **Knowledge bank compounding**: **25 lessons (10 verified / 15 provisional).** Priors promote provisional→verified once ≥2 models agree, then seed the beam. Early signal that it's *improving* not just growing: configs-to-win trending down (Qwen3-4B 88→83).
+- **Durable**: near-continuous (2-min) snapshots to the [`bank-snapshots`](../../tree/bank-snapshots) branch via a repo-scoped deploy key — accumulated learning survives box loss (a fresh box restores with `git fetch origin bank-snapshots`).
+- **Three backends behind one loop**: native-pytorch (throughput), diffusion (text-to-image; SD-Turbo validated), vllm-serve (latency-SLA).
+- **Learns from failure too**: losses banked as anti-patterns; a pre-flight arch-gate skips known-doomed architectures (e.g. linear-attention / GatedDeltaNet, which ISA-fail on neuronx-cc) *before* wasting a compile.
+
+**Honest edges (not overclaiming):**
+- **Stage 4 (author *new* NKI kernels)**: the engine is built and it authors, gates, and banks novel kernels — but on-device *execution* of authored kernels is still blocked by an NKI invocation-registration issue (parked). Most auto-authored kernels are expected to lose to the compiler anyway; the value is the occasional win + the anti-pattern lessons.
+- The learning curve is bending, but **weakly so far** — the compounding is early and gated on more architecture diversity cross-validating.
+
 ## 🏆 Trainium Optimizer Leaderboard
 
 Results published by the autonomous overnight loop on real Trainium hardware
@@ -25,15 +41,14 @@ recipes and trajectory charts (`optimization_timeline.png` +
 
 ### Text-to-text (LLMs)
 
-| Rank | Model            | Family  | Params | Baseline (tok/s) | Optimized (tok/s) |     Speedup | Best config                          | Hardware       | Status                          |
-|-----:|:-----------------|:--------|-------:|-----------------:|------------------:|------------:|:-------------------------------------|:---------------|:--------------------------------|
-|   🥇 | Qwen3-0.6B       | qwen3   |   0.6B |            3,085 |        **83,450** |  **27.05×** | TP=4, torch.compile, bf16, batch=8   | trn2.3xlarge   | ✅ Verified (93.8% correctness) |
-|    – | Qwen3-1.7B       | qwen3   |   1.7B |                — |                 — |           — | —                                    | —              | 🕒 Queued (next cycle)          |
-|    – | Qwen3-4B         | qwen3   |     4B |                — |                 — |           — | —                                    | —              | 🕒 Queued                        |
-|    – | Qwen3-8B         | qwen3   |     8B |                — |                 — |           — | —                                    | —              | 🕒 Queued                        |
-|    – | Qwen3-32B        | qwen3   |    32B |                — |                 — |           — | —                                    | —              | 🕒 Queued                        |
-|    – | Qwen3.8-27B      | qwen3.8 |    27B |                — |                 — |           — | —                                    | —              | 🛠 Adapter landed (`backends/qwen38_tp.py`) |
-|    – | Gemma-4-31B      | gemma4  |    31B |                — |                 — |           — | —                                    | —              | 🛠 Adapter in progress          |
+| Rank | Model                   | Family  | Params | Baseline (tok/s) | Optimized (tok/s) |     Speedup | Best config                             | Hardware     | Status                          |
+|-----:|:------------------------|:--------|-------:|-----------------:|------------------:|------------:|:----------------------------------------|:-------------|:--------------------------------|
+|   🥇 | Qwen3-0.6B              | qwen3   |   0.6B |            3,216 |        **84,827** |  **~28×**   | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ Verified                     |
+|   🥈 | Qwen2.5-0.5B-Instruct   | qwen2.5 |   0.5B |            4,833 |        **74,269** |  **15.4×**  | (same family recipe)                    | trn2.3xlarge | ✅ Verified                     |
+|   🥉 | Qwen3-4B                | qwen3   |     4B |            1,954 |        **26,342** |  **~13×**   | (same)                                  | trn2.3xlarge | ✅ Verified                     |
+|    4 | Qwen2.5-3B-Instruct     | qwen2.5 |     3B |            2,856 |        **35,343** |  **12.4×**  | (same)                                  | trn2.3xlarge | ✅ Verified                     |
+|    – | Qwen3-1.7B/8B/32B, Gemma-2, Phi, Mistral, OPT, Pythia, GPT-NeoX, StableLM, OLMo, Falcon, … | mixed | — | — | — | — | — | trn2.3xlarge | 🕒 In the 40-model rolling queue |
+|    – | Qwen3.5-* (GatedDeltaNet) | qwen3.5 |    — |                — |                 — |           — | —                                       | —            | ⛔ Skipped — neuronx-cc ISA-fail on linear-attn (needs adapter) |
 
 ### Text-to-image · Text-to-video · Speech (ASR / TTS)
 
