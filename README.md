@@ -1,5 +1,11 @@
 # Autonomous Trainium Model Optimizer + Leaderboard
 
+### Best result so far — Qwen3-0.6B, optimized end-to-end on one trn2.3xlarge
+
+![Qwen3-0.6B optimization trajectory](optimized_models/qwen3-0-6b/optimization_timeline.png)
+
+*The autonomous loop climbing the stages: eager baseline → `torch.compile(backend="neuron")` (+1007%, the single biggest gain) → TP → batching → TP=4, reaching **84,827 tok/s = 26.4× baseline**, correctness-verified. Each point is a kept candidate; the red ✗ are the 58 discarded ones. Per-model recipes + charts live in [`optimized_models/`](./optimized_models/).*
+
 An ambitious extension of the current Neuron autoport/NKI tooling. The idea in
 one paragraph:
 
