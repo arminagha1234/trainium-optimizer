@@ -1,0 +1,85 @@
+commit	stage	origin	layer	source	metric	mfu	correctness	compile_s	status	description
+unknown	baseline				2856.0324559472756	5.5032785734701655	100.0	0.0	keep	baseline
+unknown	config		config		2792.3068895414794	5.380486010853104	100.0	0.0	discard	prior:latency-track-fill-tp-cp-not-dp
+unknown	config		config		3153.514779413816	3.0382480914267886	93.75	0.0	keep	prior:dense-7b-tp2-bf16
+unknown	config		config		14886.615794143745	14.342482971577656	81.25	0.0	keep	compile_mode=compile-default
+unknown	config		config		3147.0010910175333	3.0319724901620204	87.5	0.0	discard	attn_implementation=sdpa
+unknown	config		config		2518.9803512171547	2.4269070480937196	87.5	0.0	discard	weights_dtype=fp32
+unknown	config		config		2971.082600184008	1.4312420697071135	87.5	0.0	discard	tp_degree=4
+unknown	config		config		9601.948787912406	9.250980134703987	93.75	0.0	discard	batch=8
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	batch=32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		12193.540344033638	23.49568863278462	87.5	0.0	discard	compile_mode=compile-default
+unknown	config		config		3260.6821717902912	6.282996642262578	87.5	0.0	discard	attn_implementation=sdpa
+unknown	config		config		2081.405274742742	4.010652269496119	87.5	0.0	discard	weights_dtype=fp32
+unknown	config		config		8056.618662985042	15.524269260420455	100.0	0.0	discard	batch=8
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	batch=32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		12279.12360411461	23.660598706012454	87.5	0.0	discard	compile_mode=compile-default
+unknown	config		config		3229.626538032056	6.223155654289438	87.5	0.0	discard	attn_implementation=sdpa
+unknown	config		config		2068.0747478687113	3.9849657256453455	87.5	0.0	discard	weights_dtype=fp32
+unknown	config		config		3035.7545310483365	2.9247921938429284	93.75	0.0	discard	tp_degree=2
+unknown	config		config		2984.2678871569888	1.4375937401102596	87.5	0.0	discard	tp_degree=4
+unknown	config		config		7951.771161279856	15.322238989925982	100.0	0.0	discard	batch=8
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	batch=32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		15501.10004872327	14.934506711525085	81.25	0.0	keep	attn_implementation=sdpa
+unknown	config		config		6185.727776937645	5.959628201222483	87.5	0.0	discard	weights_dtype=fp32
+unknown	config		config		20076.78925988772	9.671473089174842	81.25	0.0	keep	tp_degree=4
+unknown	config		config		21250.06392879319	20.473335528921893	81.25	0.0	keep	batch=8
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	batch=32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		12330.344637909999	23.759296330127395	87.5	0.0	discard	attn_implementation=sdpa
+unknown	config		config		4198.765188012263	8.090585401473074	87.5	0.0	discard	weights_dtype=fp32
+unknown	config		config		15450.523041060213	14.885778385276069	81.25	0.0	discard	tp_degree=2
+unknown	config		config		19369.995877925252	9.330993688570965	81.25	0.0	discard	tp_degree=4
+unknown	config		config		16657.1430493954	32.096588485217644	87.5	0.0	discard	batch=8
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	batch=32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		12324.824871370318	23.748660312015932	87.5	0.0	discard	attn_implementation=sdpa
+unknown	config		config		4193.308908139963	8.080071715590563	87.5	0.0	discard	weights_dtype=fp32
+unknown	config		config		16657.611421895035	32.097490990487245	87.5	0.0	discard	batch=8
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	batch=32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		9989.887449512305	9.624738934215829	87.5	0.0	discard	attn_implementation=sdpa
+unknown	config		config		5052.387803419446	4.867713860450178	87.5	0.0	discard	weights_dtype=fp32
+unknown	config		config		12487.729646590198	6.015640233032132	87.5	0.0	discard	tp_degree=4
+unknown	config		config		21247.120466401342	20.470499655422074	81.25	0.0	discard	attn_implementation=sdpa
+unknown	config		config		7175.201839171095	6.912935190846264	87.5	0.0	discard	weights_dtype=fp32
+unknown	config		config		32219.705526903097	15.521008409804066	81.25	0.0	keep	tp_degree=4
+unknown	config		config		19959.139431566815	9.614798332378692	81.25	0.0	discard	attn_implementation=sdpa
+unknown	config		config		8972.860381647175	4.322443025658829	87.5	0.0	discard	weights_dtype=fp32
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	batch=32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		19467.626817030112	9.378024864124024	81.25	0.0	discard	attn_implementation=sdpa
+unknown	config		config		8994.149666302988	4.332698586992426	87.5	0.0	discard	weights_dtype=fp32
+unknown	config		config		31919.374509268393	15.376331722844865	81.25	0.0	discard	batch=8
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	batch=32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		16659.477097893112	32.10108595479652	87.5	0.0	discard	attn_implementation=sdpa
+unknown	config		config		5407.896087020573	-1.0	87.5	0.0	discard	weights_dtype=fp32 (OOM 86% HBM)
+unknown	config		config		31842.818322178377	15.339452763083594	81.25	0.0	discard	attn_implementation=sdpa
+unknown	config		config		11233.973930181432	5.411675898163463	87.5	0.0	discard	weights_dtype=fp32
+unknown	config		config		12544.070095453944	6.0427807846394765	87.5	0.0	discard	compile_mode=eager
+unknown	config		config		31757.64404548883	15.29842226192977	81.25	0.0	discard	attn_implementation=sdpa
+unknown	config		config		11053.535539510578	5.324754378141644	87.5	0.0	discard	weights_dtype=fp32
+unknown	config		config		21234.76419900265	20.458595032020177	81.25	0.0	discard	tp_degree=2
+unknown	config		config		7125.977365102106	6.865509960633963	87.5	0.0	discard	weights_dtype=fp32
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	batch=32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		13239.88981368451	6.377973907039255	81.25	0.0	discard	compile_mode=eager
+unknown	config		config		11280.596591828727	5.434135157541576	87.5	0.0	discard	weights_dtype=fp32
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	batch=32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		13173.397649857166	6.345943029752418	81.25	0.0	discard	compile_mode=eager
+unknown	config		config		11282.230079127256	5.434922047728284	87.5	0.0	discard	weights_dtype=fp32
+unknown	config		config		16659.477097893112	32.10108595479652	87.5	0.0	discard	tp_degree=1
+unknown	config		config		21232.756514785797	20.45666073230487	81.25	0.0	discard	tp_degree=2
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	batch=32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	known_kernel	harvested	kernel	neuronx-cc	31675.31847765564	15.25876405246495	81.25	0.0	discard	cc:model-type-transformer
+unknown	borrow	borrowed	kernel	neuronx-cc	31881.49418084071	15.358083856004455	81.25	0.0	discard	cc:auto-cast-none
+unknown	graph_rewrite		graph	neuronx-cc	35343.34362097164	17.025740136378666	75.0	0.0	keep	cc:optlevel3
+unknown	graph_rewrite		graph	neuronx-cc	35358.54659213462	17.033063773867458	75.0	0.0	discard	cc:optlevel3+transformer+nocast
+unknown	invent		kernel		0.0	-1.0	0.0	0.0	discard	Stage 4 entered: no auto-invention (needs NKI-writer agent)
+unknown	known_kernel	harvested	kernel	neuronx-cc	32181.53141422798	15.502619020013626	81.25	0.0	discard	cc:model-type-transformer
+unknown	borrow	borrowed	kernel	neuronx-cc	31604.955621190198	15.224868569279169	81.25	0.0	discard	cc:auto-cast-none
+unknown	graph_rewrite		graph	neuronx-cc	35009.76466860193	16.865047118227373	75.0	0.0	discard	cc:optlevel3
+unknown	graph_rewrite		graph	neuronx-cc	35369.13820318057	17.038166008088073	75.0	0.0	discard	cc:optlevel3+transformer+nocast
+unknown	invent		kernel		0.0	-1.0	0.0	0.0	discard	Stage 4 entered: no auto-invention (needs NKI-writer agent)
+unknown	profile_loop				35343.34362097164	-1.0	100.0	0.0	discard	round 1: profile=compute_bound hot=attention_prefill(45%) -> re-entered deep stages -> +0.0% (no gain)
+unknown	known_kernel	harvested	kernel	neuronx-cc	31710.017588303752	15.275479450057034	81.25	0.0	discard	cc:model-type-transformer
+unknown	borrow	borrowed	kernel	neuronx-cc	32220.21915542248	15.521255837036513	81.25	0.0	discard	cc:auto-cast-none
+unknown	graph_rewrite		graph	neuronx-cc	35054.84080634909	16.886761379782964	75.0	0.0	discard	cc:optlevel3
+unknown	graph_rewrite		graph	neuronx-cc	34801.01524125916	16.76448748975332	75.0	0.0	discard	cc:optlevel3+transformer+nocast
+unknown	invent		kernel		0.0	-1.0	0.0	0.0	discard	Stage 4 entered: no auto-invention (needs NKI-writer agent)
+unknown	profile_loop				35343.34362097164	-1.0	100.0	0.0	discard	round 2: profile=compute_bound hot=attention_prefill(45%) -> re-entered deep stages -> +0.0% (no gain)
