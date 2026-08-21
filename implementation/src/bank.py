@@ -441,6 +441,34 @@ class KnowledgeBank:
             )
         ]
 
+    def preflight_antipatterns(
+        self, family: str, sdk_version: str,
+    ) -> list[Lesson]:
+        """Architecture-level anti-patterns for the pre-flight gate.
+
+        Unlike `antipatterns()` (config-matcher pruning, verified tier only),
+        these are keyed by architecture *signature* / model_id and record a
+        model or arch that failed the EXPENSIVE way — a compile-abort, an NRT
+        device-abort, or a 0-metric "unverified" run. BOTH tiers are consulted
+        on purpose: a class learned once (written provisional by the loop)
+        should fail fast the very next time, so the learning compounds without
+        waiting on weekly human promotion. Selected by the `arch_signature` /
+        `model_id` matcher keys the pre-flight writer uses, so config-only
+        anti-patterns (tp/dtype matchers) are never returned here.
+        """
+        out: list[Lesson] = []
+        for l in self.load_all():
+            if l.type is not LessonType.ANTI_PATTERN:
+                continue
+            if _norm_family(l.applicability.architecture_family) != _norm_family(family):
+                continue
+            pats = l.applicability.neuron_sdk_versions
+            if pats and not any(fnmatch.fnmatch(sdk_version, p) for p in pats):
+                continue
+            if "arch_signature" in l.matcher or "model_id" in l.matcher:
+                out.append(l)
+        return out
+
     def prune(
         self, candidates: list[dict[str, Any]], family: str, sdk_version: str,
         backend: str | None = None,

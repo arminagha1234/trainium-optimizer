@@ -432,6 +432,20 @@ class Orchestrator:
         # equivalence gate needs.
         m: Measurements = self.backend.measure(neff, spec.probe_shape, spec.probe_batch)
 
+        # Zero-throughput is a SILENT failure, not a benign result. A run that
+        # returns 0 img/s (a diffusion backend that produced no image) or 0 tok/s
+        # can still "pass" equivalence — the mock checker passes unconditionally,
+        # and an empty output signature trivially matches another empty one — so
+        # without this gate a 0-metric candidate could be recorded as a verified
+        # (or unverified) 0 rather than the failure it is. Record it as an
+        # explicit anti-pattern-style FAIL and discard, before equivalence.
+        if m.metric <= 0.0:
+            self._record(cand, stage, origin, layer, source, metric=0.0,
+                         correctness=0.0, compile_s=neff.compile_seconds,
+                         status=Status.DISCARD,
+                         desc=f"{cand.provenance} (metric=0 -> backend produced no throughput)")
+            return None
+
         # Equivalence — HARD gate. Compares this config's top-1 tokens against
         # the Stage-0 baseline signature; a config that changes the output is a
         # bug, not a win. (Falls back to the injected checker when no signature
