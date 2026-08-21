@@ -6,20 +6,19 @@ with one significant change: that version hardcodes its data arrays
 ("simplified from ~100 experiments"). This reads the ledger directly, so the
 chart can never drift from the record and it scales to 100 models.
 
-Design choices carried over from the reference because they work:
-  - dark GitHub palette, readable in a README and in dark-mode docs
-  - points colored by stage, with vertical stage separators
-  - gain annotations on meaningful jumps only, not every point
-  - a star on the single largest gain
-  - a red callout box counting the failures per stage
-  - final result badge
-  - subtitle carrying the conditions (without them the number is meaningless)
-
-Added here:
-  - roofline ceiling line, so the chart answers "how much headroom is left"
-  - MFU on a secondary axis, showing whether gains were real efficiency
-  - discarded candidates as faded X markers, so search width is visible
-  - marker shape by provenance (harvested / borrowed / invented / config)
+Design goals (clean light "report figure", modeled on the Tongyi-30B-A3B
+optimization-timeline reference):
+  - white background, dark text, high contrast, generous margins, large fonts
+  - x-axis = the optimization steps in order, grouped into labeled STAGE bands
+    that span the WHOLE pipeline (Baseline 0 .. Profile 6). Every stage the
+    optimizer walked gets a band, even one that produced no winning candidate,
+    so the viewer sees the full pipeline was explored honestly.
+  - one strong accent for the winning path: a stepped tok/s line, each kept
+    step a big dot labelled with its "+NN% . idea" and stage
+  - discarded candidates drawn faintly (light-gray x) so they never fight the
+    trajectory — the previous chart's clutter was the main complaint
+  - a subtle MFU strip below, on its own axis, so it can't confuse the story
+  - final headline badge (tok/s + speedup) and a conditions/correctness line
 
 Usage:
     python -m trajectory_chart --run-dir optimization_runs/gemma-4-31b \\
@@ -35,6 +34,8 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+from matplotlib.gridspec import GridSpec  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.ticker import FuncFormatter  # noqa: E402
 
@@ -44,18 +45,52 @@ from ledger import Ledger, Origin, Row, Stage  # noqa: E402
 # -- theme -------------------------------------------------------------------
 
 THEME = {
-    "figure.facecolor": "#0d1117",
-    "axes.facecolor": "#161b22",
-    "axes.edgecolor": "#30363d",
-    "text.color": "#c9d1d9",
-    "axes.labelcolor": "#8b949e",
-    "xtick.color": "#8b949e",
-    "ytick.color": "#8b949e",
-    "grid.color": "#21262d",
-    "grid.alpha": 0.8,
+    "figure.facecolor": "#ffffff",
+    "axes.facecolor": "#ffffff",
+    "axes.edgecolor": "#c9d0d8",
+    "text.color": "#1b2733",
+    "axes.labelcolor": "#3d4a57",
+    "xtick.color": "#54606c",
+    "ytick.color": "#54606c",
+    "grid.color": "#e3e8ee",
+    "grid.alpha": 1.0,
     "font.family": "DejaVu Sans",
-    "font.size": 10,
+    "font.size": 11,
 }
+
+# -- clean light-theme palette for build_chart -------------------------------
+# One strong accent for the winning path; everything else is muted context so
+# the tok/s improvement story reads instantly.
+INK = "#1b2733"            # primary text
+SUBTLE_INK = "#5b6875"     # secondary text / conditions line
+ACCENT = "#1668dc"         # winning trajectory line + kept dots
+ACCENT_DK = "#0d47a1"      # darker accent for the headline badge
+GAIN_GREEN = "#1a7f37"     # "+NNN%" gain labels
+HELD_GRAY = "#98a4b3"      # flat "incumbent held" line through no-win stages
+DISCARD_GRAY = "#b9c1cc"   # faded discarded-candidate marks
+
+# Band tints: gain-producing stages get a faint blue wash; stages walked but
+# producing no winning candidate get a neutral gray wash — so the viewer sees
+# the whole pipeline was explored honestly, not that stages were hidden.
+BAND_WIN_TINT = "#eaf2fd"
+BAND_NOWIN_TINT = "#f3f4f6"
+BAND_EDGE = "#dfe4ea"
+
+# Canonical pipeline order + display metadata (number, short label). Every
+# stage present in the ledger gets a band in this order, so stages 0..6 are
+# all visible even when a later stage produced no promoted candidate.
+STAGE_META: dict[Stage, tuple[str, str]] = {
+    Stage.PREFLIGHT: ("", "Preflight"),
+    Stage.BASELINE: ("0", "Baseline"),
+    Stage.HARVEST: ("0.5", "Harvest"),
+    Stage.CONFIG: ("1", "Config"),
+    Stage.KNOWN_KERNEL: ("2", "Known-Kernel"),
+    Stage.BORROW: ("3", "Borrow"),
+    Stage.INVENT: ("4", "Invent"),
+    Stage.GRAPH_REWRITE: ("5", "Graph-Rewrite"),
+    Stage.PROFILE_LOOP: ("6", "Profile"),
+}
+_PIPELINE_ORDER: list[Stage] = list(STAGE_META.keys())
 
 STAGE_COLOR: dict[Stage, str] = {
     Stage.BASELINE: "#8b949e",
@@ -108,6 +143,61 @@ def _stage_bands(kept: list[Row]) -> list[tuple[float, Stage]]:
     return bands
 
 
+def _pipeline_bands(rows: list[Row]) -> list[dict]:
+    """Lay every stage the optimizer walked onto the x-axis, in canonical
+    pipeline order, as contiguous bands.
+
+    Each kept row becomes a "win" step (a real improvement point). A stage that
+    was walked but promoted nothing still gets one flat placeholder slot, so the
+    full Baseline->Profile pipeline is always visible and the trajectory holds
+    at the incumbent through those stages instead of hiding them.
+
+    x is a continuous cursor. A win step takes unit width; a no-win stage takes
+    a wider slot so its header (e.g. "Known-Kernel") never collides with its
+    neighbour's. Band dicts carry left/right edges (x0, x1) directly.
+
+    Returns a list of band dicts:
+        {stage, number, label, x0, x1, has_win,
+         steps: [{x, row|None, y, is_win}], best_discarded_y}
+    """
+    win_w = 1.0
+    nowin_w = 1.9
+    present = [s for s in _PIPELINE_ORDER if any(r.stage is s for r in rows)]
+    bands: list[dict] = []
+    cursor = 0.0
+    incumbent = 0.0
+    for s in present:
+        stage_rows = [r for r in rows if r.stage is s]
+        kept_in = [r for r in stage_rows if r.kept]
+        disc_pos = [r.metric for r in stage_rows if not r.kept and r.metric > 0]
+        num, label = STAGE_META[s]
+        x0 = cursor
+        steps: list[dict] = []
+        if kept_in:
+            for r in kept_in:
+                incumbent = r.metric
+                steps.append({"x": cursor + win_w / 2, "row": r,
+                              "y": r.metric, "is_win": True})
+                cursor += win_w
+        else:
+            # walked, no promoted candidate: one flat slot at the incumbent
+            steps.append({"x": cursor + nowin_w / 2, "row": None,
+                          "y": incumbent, "is_win": False})
+            cursor += nowin_w
+        bands.append({
+            "stage": s, "number": num, "label": label,
+            "x0": x0, "x1": cursor, "has_win": bool(kept_in), "steps": steps,
+            "best_discarded_y": max(disc_pos) if disc_pos else None,
+        })
+    return bands
+
+
+def _idea_short(row: Row) -> str:
+    """One short prose phrase for a kept step's label (idea, not knob name)."""
+    idea = _ideafy(row).replace("\n", " ")
+    return " ".join(idea.split())
+
+
 def build_chart(
     run_dir: Path,
     out_path: Path,
@@ -119,6 +209,14 @@ def build_chart(
     roofline: float | None = None,
     metric_label: str = "tok/s",
 ) -> Path:
+    """Clean, white, report-style optimization trajectory.
+
+    The winning tok/s path is a stepped accent line climbing left->right; every
+    kept step is a labelled dot ("+NN% . idea"); the full Baseline->Profile
+    pipeline is drawn as labelled stage bands even where a stage produced no
+    winner; discards are faint; MFU is a subtle strip below. Signature is
+    unchanged so the overnight loop keeps calling it as-is.
+    """
     led = Ledger(run_dir)
     rows = led.read()
     if not rows:
@@ -129,229 +227,246 @@ def build_chart(
     if not kept:
         raise SystemExit("no kept rows — nothing to plot")
 
+    bands = _pipeline_bands(rows)
+    steps = [st for b in bands for st in b["steps"]]
+    xs = [st["x"] for st in steps]
+    ys = [st["y"] for st in steps]
+    n = len(steps)
+    ymax_data = max(ys)
+
+    # First step where a win was recorded (baseline) and the incumbent step.
+    win_steps = [st for st in steps if st["is_win"]]
+    baseline_y = win_steps[0]["y"] if win_steps else ys[0]
+    incumbent_y = ymax_data
+    incumbent_x = max((st["x"] for st in win_steps if st["y"] == incumbent_y),
+                      default=xs[-1])
+
     plt.rcParams.update(THEME)
     has_mfu = any(r.mfu >= 0 for r in kept)
-    fig, ax = plt.subplots(figsize=(14, 7))
-    fig.subplots_adjust(top=0.86, bottom=0.16, left=0.08, right=0.92)
+
+    fig = plt.figure(figsize=(15, 8.2))
+    if has_mfu:
+        gs = GridSpec(2, 1, height_ratios=[5.2, 1.0], hspace=0.08, figure=fig)
+        ax = fig.add_subplot(gs[0])
+        axm = fig.add_subplot(gs[1], sharex=ax)
+    else:
+        ax = fig.add_subplot(1, 1, 1)
+        axm = None
+    fig.subplots_adjust(top=0.83, bottom=0.16, left=0.075, right=0.975)
 
     # -- title + conditions --------------------------------------------------
     fig.suptitle(
         f"{model} — Optimization Trajectory",
-        fontsize=16, fontweight="bold", color="#f0f6fc", y=0.97,
+        fontsize=20, fontweight="bold", color=INK, x=0.075, ha="left", y=0.965,
     )
-    cond = " │ ".join(
+    min_corr = min((r.correctness for r in kept), default=0.0)
+    cond = "   ·   ".join(
         p for p in (
             hardware,
             f"TP={tp}" if tp else "",
             shape,
             f"SDK {sdk}" if sdk else "",
-            f"{min(r.correctness for r in kept):.0f}% correctness",
+            f"correctness ≥ {min_corr:.3g}% on every kept step",
         ) if p
     )
-    fig.text(0.5, 0.915, cond, ha="center", fontsize=9.5, color="#8b949e")
+    fig.text(0.075, 0.905, cond, ha="left", fontsize=11.5, color=SUBTLE_INK)
 
-    xs = list(range(len(kept)))
-    ys = [r.metric for r in kept]
+    # -- headroom above the data for band labels + step labels ---------------
+    ymax = ymax_data * 1.42
+    x_right = bands[-1]["x1"]
+    ax.set_ylim(0, ymax)
+    ax.set_xlim(-0.15, x_right + 0.15)
+
+    band_label_y = 0.965       # axes fraction — stage-name row along the top
+    band_note_y = 0.905
+
+    # -- stage bands: shaded, labelled, spanning the whole pipeline ----------
+    # No-win stages get a wider slot (see _pipeline_bands) so their header
+    # never collides with the neighbouring stage's.
+    xtrans = ax.get_xaxis_transform()  # x in data coords, y in axes fraction
+    for i, b in enumerate(bands):
+        left, right = b["x0"], b["x1"]
+        tint = BAND_WIN_TINT if b["has_win"] else BAND_NOWIN_TINT
+        ax.axvspan(left, right, color=tint, zorder=0)
+        if i > 0:
+            ax.axvline(left, color=BAND_EDGE, linewidth=1.1, zorder=1)
+        cx = (left + right) / 2
+        num, label = b["number"], b["label"]
+        head = f"{num}   {label}" if num else label
+        ax.text(cx, band_label_y, head, transform=xtrans,
+                ha="center", va="top", fontsize=12, fontweight="bold",
+                color=INK if b["has_win"] else SUBTLE_INK)
+        if not b["has_win"]:
+            ax.text(cx, band_note_y, "walked\nno gain over config",
+                    transform=xtrans, ha="center", va="top", fontsize=8.5,
+                    color="#93a0ad", style="italic", linespacing=1.1)
+
+    # -- discarded candidates, faint (search width, without the clutter) -----
+    rng = np.random.default_rng(7)
+    for b in bands:
+        stage_disc = [r for r in discarded
+                      if r.stage is b["stage"] and r.metric > 0]
+        if not stage_disc:
+            continue
+        span = max(0.28, (b["x1"] - b["x0"]) * 0.5)
+        for r in stage_disc:
+            jx = (b["x0"] + b["x1"]) / 2 + rng.uniform(-span, span)
+            ax.scatter(jx, r.metric, marker="x", s=34, linewidths=1.1,
+                       color=DISCARD_GRAY, alpha=0.45, zorder=2)
 
     # -- the winning path ----------------------------------------------------
-    ax.plot(xs, ys, color="#3fb950", linewidth=2, alpha=0.55, zorder=2)
-    ax.fill_between(xs, ys, alpha=0.07, color="#3fb950", zorder=1)
+    # Solid accent line over the gain-producing steps; a lighter dashed line
+    # continues flat through the no-win stages to show the incumbent "held".
+    solid_x = [st["x"] for st in steps if st["x"] <= incumbent_x]
+    solid_y = [st["y"] for st in steps if st["x"] <= incumbent_x]
+    ax.plot(solid_x, solid_y, color=ACCENT, linewidth=3.0, zorder=4,
+            solid_capstyle="round", solid_joinstyle="round")
+    ax.fill_between(solid_x, solid_y, color=ACCENT, alpha=0.06, zorder=1)
+    if incumbent_x < xs[-1]:
+        held_x = [st["x"] for st in steps if st["x"] >= incumbent_x]
+        held_y = [st["y"] for st in steps if st["x"] >= incumbent_x]
+        ax.plot(held_x, held_y, color=HELD_GRAY, linewidth=2.0,
+                linestyle=(0, (5, 3)), zorder=3)
 
-    # Per-point execution mode (eager vs torch.compile). Only meaningful for
-    # backends that expose a compile_mode axis (native PyTorch); a no-op for
-    # mock/XLA runs that carry no such signal, so those charts are unchanged.
-    modes = _classify_modes(kept) if _mode_signal_present(rows) else [None] * len(kept)
+    # kept-step dots
+    for st in win_steps:
+        ax.scatter(st["x"], st["y"], s=150, color=ACCENT, edgecolors="white",
+                   linewidths=1.8, zorder=6)
+    # flat placeholder markers for no-win stages: hollow ring on the held line
+    for st in steps:
+        if not st["is_win"]:
+            ax.scatter(st["x"], st["y"], s=70, facecolors="white",
+                       edgecolors=HELD_GRAY, linewidths=1.6, zorder=5)
 
-    for x, r, mode in zip(xs, kept, modes):
-        # Compiled points get a bright ring; eager a muted ring. Stage color
-        # stays the fill so all three encodings (stage/provenance/mode) coexist.
-        edge = ("white" if mode is None
-                else COMPILED_EDGE if mode == "compiled" else EAGER_EDGE)
-        ax.scatter(
-            x, r.metric,
-            c=STAGE_COLOR[r.stage],
-            marker=ORIGIN_MARKER[r.origin],
-            s=95, zorder=4, edgecolors=edge,
-            linewidths=0.6 if mode is None else 1.8,
-        )
-        # Explicit per-point text tag, in the mode's color, just below the point.
-        if mode is not None:
-            ax.annotate(
-                "compiled" if mode == "compiled" else "eager",
-                xy=(x, r.metric), xytext=(0, -13), textcoords="offset points",
-                ha="center", va="top", fontsize=6.5,
-                color=COMPILED_EDGE if mode == "compiled" else EAGER_EDGE,
-                fontweight="bold" if mode == "compiled" else "normal",
-            )
-
-    # Prominent callout on the first eager -> compiled transition (the money jump).
-    for i in range(1, len(modes)):
-        if modes[i] == "compiled" and modes[i - 1] == "eager":
-            prev, cur = kept[i - 1].metric, kept[i].metric
-            pct = (cur / prev - 1.0) * 100.0 if prev > 0 else 0.0
-            ax.annotate(
-                f"torch.compile\n(backend=neuron)\n{'+' if pct >= 0 else ''}{pct:.0f}% vs eager",
-                xy=(i, cur), xytext=(max(0, i - 1.6), cur + max(ys) * 0.09),
-                fontsize=8.5, color=COMPILED_EDGE, fontweight="bold", ha="center",
-                arrowprops=dict(arrowstyle="->", color=COMPILED_EDGE, lw=1.4),
-            )
-            break
-
-    # -- discarded candidates, faded -----------------------------------------
-    # Placed at the x of the kept row they were competing against, so the
-    # width of the search is visible without implying they advanced the path.
-    for r in discarded:
-        x = _nearest_x_for_stage(kept, r.stage)
-        if x is None:
+    # -- per-step gain + idea labels -----------------------------------------
+    prev_y = None
+    for idx, st in enumerate(steps):
+        if not st["is_win"]:
+            prev_y = st["y"]
             continue
-        ax.scatter(
-            x + 0.22, r.metric,
-            marker="x", c="#f85149", s=42, alpha=0.32, zorder=3, linewidths=1.2,
-        )
+        r = st["row"]
+        if prev_y is None:
+            # baseline sits near the axis floor: label above-right of the dot
+            # so it is never clipped by the bottom margin / MFU strip.
+            ax.annotate(
+                f"baseline\n{st['y']:,.0f} {metric_label}",
+                xy=(st["x"], st["y"]), xytext=(14, 24),
+                textcoords="offset points", ha="left", va="bottom",
+                fontsize=9.5, color=SUBTLE_INK, linespacing=1.2,
+            )
+        else:
+            pct = (st["y"] / prev_y - 1.0) * 100.0 if prev_y > 0 else 0.0
+            sign = "+" if pct >= 0 else ""
+            ax.annotate(
+                f"{sign}{pct:.0f}%",
+                xy=(st["x"], st["y"]), xytext=(0, 30),
+                textcoords="offset points", ha="center", va="bottom",
+                fontsize=13, fontweight="bold", color=GAIN_GREEN,
+            )
+            ax.annotate(
+                _idea_short(r),
+                xy=(st["x"], st["y"]), xytext=(0, 15),
+                textcoords="offset points", ha="center", va="bottom",
+                fontsize=9.5, color=INK,
+            )
+        prev_y = st["y"]
 
-    # -- roofline ceiling ----------------------------------------------------
-    if roofline:
-        ax.axhline(roofline, color="#f0f6fc", linestyle=":", linewidth=1.3, alpha=0.55)
-        attainment = ys[-1] / roofline * 100
-        ax.text(
-            len(kept) - 0.5, roofline,
-            f"  roofline bound — {attainment:.0f}% attained",
-            fontsize=8.5, color="#f0f6fc", alpha=0.7, va="bottom", ha="right",
-        )
-
-    # -- stage separators + labels ------------------------------------------
-    bands = _stage_bands(kept)
-    ymax = max(ys) * (1.30 if roofline is None else 1.18)
-    for xpos, stage in bands:
-        if xpos > 0:
-            ax.axvline(xpos, color="#30363d", linestyle="--", linewidth=1, alpha=0.7)
-        ax.text(
-            xpos + 0.35, ymax * 0.965, stage.value,
-            fontsize=8.5, color=STAGE_COLOR[stage], alpha=0.9, ha="left",
-        )
-
-    # -- gain annotations, meaningful jumps only ----------------------------
-    gains: list[tuple[int, float, float]] = []
-    for i in range(1, len(kept)):
-        prev, cur = kept[i - 1].metric, kept[i].metric
-        if prev > 0:
-            pct = (cur / prev - 1.0) * 100.0
-            if pct >= ANNOTATE_THRESHOLD_PCT:
-                gains.append((i, cur, pct))
-
-    star_i = max(gains, key=lambda g: g[2])[0] if gains else None
-    for i, y, pct in gains:
-        is_star = i == star_i
-        ax.annotate(
-            f"+{pct:.0f}%",
-            xy=(i, y), xytext=(i, y + max(ys) * 0.055),
-            fontsize=11 if is_star else 8.5,
-            color="#f0883e" if is_star else "#8b949e",
-            fontweight="bold" if is_star else "normal",
-            ha="center",
-        )
-
-    if star_i is not None:
-        r = kept[star_i]
-        ax.annotate(
-            f"★ largest single gain\n{r.stage.value}"
-            + (f" / {r.origin.value}" if r.origin is not Origin.NONE else ""),
-            xy=(star_i, kept[star_i].metric),
-            xytext=(max(0, star_i - 2.0), kept[star_i].metric * 0.74),
-            fontsize=9, color="#f0883e", fontweight="bold", ha="center",
-            arrowprops=dict(arrowstyle="->", color="#f0883e", lw=1.5),
-        )
-
-    # -- failure callout -----------------------------------------------------
-    # Failures belong on the chart. The reference implementation's
-    # "~40 MoE kernel experiments: all <1%" is arguably more useful to the
-    # next engineer than knowing which one worked.
-    if discarded:
-        by_stage: dict[str, int] = {}
-        for r in discarded:
-            by_stage[r.stage.value] = by_stage.get(r.stage.value, 0) + 1
-        worst = max(by_stage.items(), key=lambda kv: kv[1])
-        ax.text(
-            len(kept) * 0.5, min(ys) * 0.9,
-            f"{len(discarded)} discarded overall\n"
-            f"({worst[1]} in {worst[0]})",
-            fontsize=8.5, color="#f85149", ha="center", style="italic",
-            bbox=dict(boxstyle="round,pad=0.35", facecolor="#f8514912",
-                      edgecolor="#f8514940"),
-        )
-
-    # -- final badge ---------------------------------------------------------
-    # Anchored below-right of the last point and nudged down, so it never
-    # collides with that point's gain annotation (which sits above it).
-    speedup = led.speedup()
-    badge = f"{ys[-1]:,.0f} {metric_label}"
+    # -- headline badge on the incumbent -------------------------------------
+    speedup = led.speedup() or (incumbent_y / baseline_y if baseline_y > 0 else 0.0)
+    headline = f"{incumbent_y:,.0f} {metric_label}"
     if speedup:
-        badge += f"   ({speedup:.1f}× baseline)"
+        headline += f"\n{speedup:.1f}× baseline"
     ax.annotate(
-        badge,
-        xy=(len(kept) - 1, ys[-1]),
-        xytext=(len(kept) - 1.4, ys[-1] - max(ys) * 0.11),
-        fontsize=11, fontweight="bold", color="#f0f6fc",
-        ha="right", va="top",
-        bbox=dict(boxstyle="round,pad=0.4", facecolor="#a371f7",
-                  edgecolor="none", alpha=0.92),
-        arrowprops=dict(arrowstyle="-", color="#a371f7", lw=1.0, alpha=0.6),
+        headline,
+        xy=(incumbent_x, incumbent_y),
+        xytext=(0.985, 0.60), textcoords="axes fraction",
+        ha="right", va="center", fontsize=15, fontweight="bold", color="white",
+        bbox=dict(boxstyle="round,pad=0.55", facecolor=ACCENT_DK,
+                  edgecolor="none"),
+        arrowprops=dict(arrowstyle="-", color=ACCENT_DK, lw=1.4, alpha=0.7,
+                        shrinkB=10),
+        zorder=8,
     )
 
-    # -- MFU secondary axis --------------------------------------------------
-    if has_mfu:
-        ax2 = ax.twinx()
-        ax2.plot(
-            xs, [r.mfu for r in kept],
-            color="#f0883e", linewidth=1.2, linestyle="--", alpha=0.6, zorder=2,
-        )
-        ax2.set_ylabel("MFU %", color="#f0883e", fontsize=9)
-        ax2.tick_params(axis="y", colors="#f0883e", labelsize=8)
-        ax2.set_ylim(0, max(r.mfu for r in kept) * 1.9)
-        ax2.grid(False)
+    # -- roofline ceiling (optional) -----------------------------------------
+    if roofline:
+        ax.axhline(roofline, color="#b0472b", linestyle=":", linewidth=1.6,
+                   alpha=0.8, zorder=2)
+        ax.text(n - 0.5, roofline, f"  roofline · {incumbent_y / roofline * 100:.0f}% attained",
+                fontsize=9.5, color="#b0472b", va="bottom", ha="right")
 
-    # -- axes ----------------------------------------------------------------
-    ax.set_xticks(xs)
-    ax.set_xticklabels(
-        [_short_label(r.description) for r in kept], fontsize=7.5, rotation=38,
-        ha="right",
-    )
-    ax.set_ylabel(metric_label)
-    ax.set_ylim(min(ys) * 0.8, ymax)
+    # -- primary axis cosmetics ----------------------------------------------
+    ax.set_ylabel(f"throughput ({metric_label})", fontsize=12.5)
     ax.yaxis.set_major_formatter(FuncFormatter(_fmt_thousands))
-    ax.grid(True, axis="y", alpha=0.45)
+    ax.grid(True, axis="y", alpha=0.9, zorder=0)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    if has_mfu:
+        _blank_step_axis(ax, steps, xlabel=False)
+        plt.setp(ax.get_xticklabels(), visible=False)
+    else:
+        _blank_step_axis(ax, steps, xlabel=True)
+
+    # -- MFU strip below -----------------------------------------------------
+    if has_mfu:
+        m_y = []
+        cur = 0.0
+        for st in steps:
+            if st["is_win"] and st["row"].mfu >= 0:
+                cur = st["row"].mfu
+            m_y.append(cur)
+        axm.fill_between(xs, m_y, color="#8a94a3", alpha=0.18, zorder=1)
+        axm.plot(xs, m_y, color="#6b7684", linewidth=1.8, zorder=2)
+        axm.scatter([st["x"] for st in win_steps],
+                    [st["row"].mfu if st["row"].mfu >= 0 else 0 for st in win_steps],
+                    s=28, color="#6b7684", zorder=3)
+        axm.set_ylabel("MFU %", fontsize=10, color="#6b7684")
+        axm.set_ylim(0, max(m_y) * 1.5 if max(m_y) > 0 else 1)
+        axm.tick_params(axis="y", labelsize=8.5, colors="#6b7684")
+        axm.grid(True, axis="y", alpha=0.7)
+        axm.set_axisbelow(True)
+        for side in ("top", "right"):
+            axm.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            axm.spines[side].set_color("#c9d0d8")
+        _blank_step_axis(axm, steps, xlabel=True)
 
     # -- legend --------------------------------------------------------------
     handles = [
-        Line2D([], [], marker=m, color="none", markerfacecolor="#8b949e",
-               markeredgecolor="white", markersize=8, label=o.value or "config")
-        for o, m in ORIGIN_MARKER.items()
+        Line2D([], [], color=ACCENT, linewidth=3, marker="o", markersize=9,
+               markerfacecolor=ACCENT, markeredgecolor="white",
+               label="kept step (promoted)"),
+        Line2D([], [], color=HELD_GRAY, linewidth=2, linestyle=(0, (5, 3)),
+               marker="o", markersize=8, markerfacecolor="white",
+               markeredgecolor=HELD_GRAY, label="incumbent held (no gain)"),
+        Line2D([], [], color=DISCARD_GRAY, marker="x", linestyle="none",
+               markersize=8, label="discarded candidate"),
     ]
-    handles.append(
-        Line2D([], [], marker="x", color="#f85149", linestyle="none",
-               markersize=7, label="discarded", alpha=0.5)
-    )
-    # Only advertise the eager/compiled ring encoding when it's actually in use.
-    if _mode_signal_present(rows):
-        handles.append(
-            Line2D([], [], marker="o", color="none", markerfacecolor="#8b949e",
-                   markeredgecolor=COMPILED_EDGE, markeredgewidth=1.8,
-                   markersize=8, label="compiled (torch.compile)")
-        )
-        handles.append(
-            Line2D([], [], marker="o", color="none", markerfacecolor="#8b949e",
-                   markeredgecolor=EAGER_EDGE, markeredgewidth=1.8,
-                   markersize=8, label="eager")
-        )
-    ax.legend(
-        handles=handles, loc="lower right", fontsize=8, frameon=True,
-        facecolor="#161b22", edgecolor="#30363d", ncol=3,
-    )
+    ax.legend(handles=handles, loc="lower right", fontsize=10.5, frameon=True,
+              facecolor="white", edgecolor="#d5dbe2", framealpha=0.95,
+              borderpad=0.7)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.savefig(out_path, dpi=170, facecolor="white")
     plt.close(fig)
     return out_path
+
+
+def _blank_step_axis(axis, steps: list[dict], xlabel: bool = False) -> None:
+    """Blank the per-step x ticks — the idea for each kept step is already
+    labelled above its dot, and the stage bands label the groups, so a second
+    set of tick labels would just re-clutter the axis. Optionally add a single
+    clean axis caption naming what the x-axis is."""
+    axis.set_xticks([st["x"] for st in steps])
+    axis.set_xticklabels([""] * len(steps))
+    axis.tick_params(axis="x", length=0)
+    if xlabel:
+        axis.set_xlabel(
+            "optimization steps  (left → right = the order the optimizer tried them)",
+            fontsize=11, color=SUBTLE_INK,
+        )
+
 
 
 def _nearest_x_for_stage(kept: list[Row], stage: Stage) -> int | None:
@@ -546,7 +661,7 @@ def build_highlights_chart(
 
     fig.suptitle(
         f"{model}: Every Optimization Step",
-        fontsize=17, fontweight="bold", color="#f0f6fc", y=0.965,
+        fontsize=17, fontweight="bold", color=INK, y=0.965,
     )
     cond = " │ ".join(
         p for p in (
@@ -557,7 +672,7 @@ def build_highlights_chart(
         ) if p
     )
     if cond:
-        fig.text(0.5, 0.895, cond, ha="center", fontsize=10, color="#8b949e")
+        fig.text(0.5, 0.895, cond, ha="center", fontsize=10, color=SUBTLE_INK)
 
     xs = list(range(len(kept)))
     ys = [r.metric for r in kept]
@@ -565,10 +680,10 @@ def build_highlights_chart(
     # -- the staircase itself ------------------------------------------------
     # steps-post = horizontal-then-vertical: each improvement "holds" until
     # the next win. This is the visual signature of Wutong's chart.
-    ax.plot(xs, ys, drawstyle="steps-post", color="#58a6ff",
+    ax.plot(xs, ys, drawstyle="steps-post", color=ACCENT,
             linewidth=2.5, alpha=0.95, zorder=2)
-    ax.scatter(xs, ys, s=80, color="#58a6ff",
-               edgecolors="#0d1117", linewidths=1.2, zorder=3)
+    ax.scatter(xs, ys, s=80, color=ACCENT,
+               edgecolors="white", linewidths=1.4, zorder=3)
 
     # -- per-point tok/s values (blue text, always above the dot) -----------
     # Alternating above/below sounds nice but breaks the moment two adjacent
@@ -583,7 +698,7 @@ def build_highlights_chart(
             f"{r.metric:,.0f}",
             xy=(i, r.metric),
             xytext=(0, 14), textcoords="offset points",
-            ha="center", fontsize=8.5, fontweight="bold", color="#79c0ff",
+            ha="center", fontsize=8.5, fontweight="bold", color=ACCENT_DK,
         )
 
     # -- stage dividers + labels at the top (wutong's "Round 1 (Params)") ---
@@ -598,14 +713,14 @@ def build_highlights_chart(
     for i, (xpos, stage) in enumerate(bands):
         # Vertical dashed line between stages — never at the plot's left edge.
         if i > 0:
-            ax.axvline(xpos, color="#30363d", linestyle="--",
-                       linewidth=1.2, alpha=0.75)
+            ax.axvline(xpos, color=BAND_EDGE, linestyle="--",
+                       linewidth=1.2, alpha=0.9)
         # Centered stage label above the band it names.
         next_xpos = bands[i + 1][0] if i + 1 < len(bands) else len(kept) - 0.5
         ax.text(
             (xpos + next_xpos) / 2, top_y,
             _stage_label(stage),
-            fontsize=10.5, color="#8b949e", ha="center", va="top",
+            fontsize=10.5, color=SUBTLE_INK, ha="center", va="top",
             style="italic",
         )
 
