@@ -128,6 +128,17 @@ python run_overnight.py --backend mock
 python run_overnight.py --backend native-pytorch-beta3
 ```
 
+Text-to-image diffusion is a first-class family. Any seed with
+`family="diffusion"` (e.g. the `sd-turbo` seed) is routed automatically to the
+`diffusion-native` backend regardless of `--backend`, so the same command
+covers both tracks. The diffusion backend measures **images/sec + step-latency**
+(not tok/s) and gates correctness with a Wan-style decode-parity check
+(Neuron-bf16 vs CPU-fp32 PSNR/SSIM) plus a quantised-latent fingerprint mapped
+onto the orchestrator's existing signature gate. The PR #5 placement axis is
+active for its `scheduler` and `text_encoder` components. Validated end-to-end
+on SD-Turbo on trn2 (3.84 img/s eager, step ~100 ms, decode-parity PASS at
+PSNR 43.5 dB / SSIM 0.995).
+
 Outputs land in `implementation/artifacts/`:
 - `LEADERBOARD.md` — cross-model summary (self-labels synthetic runs)
 - `OVERNIGHT_LOG.md` — timestamped running log
