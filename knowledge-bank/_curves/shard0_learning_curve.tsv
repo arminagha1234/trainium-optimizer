@@ -11,3 +11,4 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	qwen-qwen2-5-14b-instruct	Qwen/Qwen2.5-14B-Instruct	dense_causal_lm	43	-	5400	TIMEOUT
 1	microsoft-phi-4	microsoft/phi-4	dense_causal_lm	26	0.000	1274	ok
 1	meta-llama-llama-3-2-3b	meta-llama/Llama-3.2-3B	dense_causal_lm	0	-	4	FAIL_NO_BASELINE
+1	qwen-qwen3-30b-a3b	Qwen/Qwen3-30B-A3B	moe_causal_lm	25	0.000	2727	ok
