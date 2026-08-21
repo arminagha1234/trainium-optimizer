@@ -195,6 +195,72 @@ def test_staleness_flags_old_lessons(tmp_path: Path):
     assert "fresh-lesson" not in stale_ids
 
 
+def _vllm_prior() -> Lesson:
+    """A config_prior learned under the vllm-serve stack (distinct lesson_id and
+    param range so it can co-exist with the native _config_prior)."""
+    l = _config_prior()
+    l.lesson_id = "vllm-32b-tp8-baseline"
+    l.backend = "vllm-serve"
+    return l
+
+
+def test_query_is_backend_scoped(tmp_path: Path):
+    """A native-tagged prior is returned for a native query but NOT a vllm one,
+    and vice-versa — lessons don't leak across execution backends."""
+    bank = KnowledgeBank(tmp_path)
+    bank.save(_config_prior())     # default backend: native-pytorch
+    bank.save(_vllm_prior())       # backend: vllm-serve
+    qkw = dict(family="dense_causal_lm", param_count=31e9, seq_len=1024,
+               batch=1, sdk_version="2.28.0")
+
+    native = bank.query_interventions(backend="native-pytorch-beta3", **qkw)
+    assert [l.lesson_id for l in native] == ["dense-32b-tp8-baseline"]
+
+    vllm = bank.query_interventions(backend="vllm-serve", **qkw)
+    assert [l.lesson_id for l in vllm] == ["vllm-32b-tp8-baseline"]
+
+    # backend=None (existing callers) never filters: both are returned.
+    both = bank.query_interventions(**qkw)
+    assert len(both) == 2
+
+
+def test_untagged_legacy_lesson_defaults_native(tmp_path: Path):
+    """A legacy lesson whose YAML has no `backend` key loads as native-pytorch
+    and is returned for a native query but not a vllm one."""
+    bank = KnowledgeBank(tmp_path)
+    p = bank.save(_config_prior())
+    # Assert the on-disk YAML never carried the field (byte-for-byte roundtrip
+    # for the native default) and simulate an older lesson explicitly.
+    assert "backend:" not in p.read_text()
+
+    loaded = bank.load_all(Tier.VERIFIED)[0]
+    assert loaded.backend == "native-pytorch"
+
+    qkw = dict(family="dense_causal_lm", param_count=31e9, seq_len=1024,
+               batch=1, sdk_version="2.28.0")
+    assert len(bank.query_interventions(backend="native-pytorch-beta3", **qkw)) == 1
+    assert bank.query_interventions(backend="vllm-serve", **qkw) == []
+
+
+def test_nondefault_backend_roundtrips_and_mock_matches_all(tmp_path: Path):
+    """A non-default backend survives save/load, and the synthetic `mock`
+    backend matches every stack (so mock-backed tests seed priors unchanged)."""
+    bank = KnowledgeBank(tmp_path)
+    p = bank.save(_vllm_prior())
+    assert "backend: vllm-serve" in p.read_text()   # non-default IS emitted
+
+    loaded = next(l for l in bank.load_all(Tier.VERIFIED)
+                  if l.lesson_id == "vllm-32b-tp8-baseline")
+    assert loaded.backend == "vllm-serve"
+
+    # A mock query matches the vllm-tagged lesson (mock matches every stack).
+    hits = bank.query_interventions(
+        family="dense_causal_lm", param_count=31e9, seq_len=1024, batch=1,
+        sdk_version="2.28.0", backend="mock",
+    )
+    assert loaded.lesson_id in {l.lesson_id for l in hits}
+
+
 def test_stats(tmp_path: Path):
     bank = KnowledgeBank(tmp_path)
     bank.save(_config_prior())

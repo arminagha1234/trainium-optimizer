@@ -139,6 +139,9 @@ class Orchestrator:
             family=spec.family, param_count=spec.param_count,
             seq_len=spec.seq_len, batch=spec.probe_batch,
             sdk_version=self.sdk_version,
+            # Scope priors to this run's execution stack: don't seed a native
+            # beam with vllm-serve priors or vice-versa. mock matches all.
+            backend=self.backend.name,
         )
 
         # Score the seed beam (skip the pure-baseline member; already measured).
