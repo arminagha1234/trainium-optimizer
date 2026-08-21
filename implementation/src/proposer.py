@@ -131,11 +131,16 @@ class BeamProposer:
         seq_len: int,
         batch: int,
         sdk_version: str,
+        backend: str | None = None,
     ) -> list[Candidate]:
         """Initial beam: baseline plus any bank config_priors that apply.
 
         A good prior can land within a few percent of the Stage-1 optimum on
         the first candidate, which is the whole point of the knowledge bank.
+
+        `backend` scopes the prior query to the current execution stack, so a
+        prior learned on one backend never seeds another's beam. None (the
+        default) preserves the old backend-agnostic seeding.
         """
         beam = [Candidate(config=self._fill(dict(baseline)), provenance="baseline")]
         self._seen.add(beam[0].key())
@@ -145,6 +150,7 @@ class BeamProposer:
                 family=family, param_count=param_count, seq_len=seq_len,
                 batch=batch, sdk_version=sdk_version,
                 types=(LessonType.CONFIG_PRIOR,),
+                backend=backend,
             )
             for lesson in priors[: self.beam_size]:
                 cfg = self._fill({**baseline, **lesson.intervention.get("spec", {})})
