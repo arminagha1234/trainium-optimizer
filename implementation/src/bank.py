@@ -175,6 +175,15 @@ class Lesson:
     # backend like native PyTorch.
     backend_validated: list[str] = field(default_factory=list)
 
+    # Execution backend this lesson was LEARNED under, normalized to a stack key
+    # (build suffix stripped — see _backend_stack). Distinct from
+    # backend_validated above: that is the verify-first prune allowlist for
+    # anti-patterns; THIS just partitions priors by stack so a lesson learned on
+    # one backend (e.g. config priors from native-pytorch) never seeds a beam on
+    # a different one (e.g. vllm-serve). Defaults to native-pytorch so legacy,
+    # untagged lessons load as native. See _backend_matches for the match rule.
+    backend: str = "native-pytorch"
+
     # Promotion audit trail. auto_promoted is deliberately distinct from
     # confidence.human_verified: an auto-promoted lesson is trusted by the
     # proposer (it lives in verified/) but was NOT signed off by a human, and
@@ -214,6 +223,7 @@ class Lesson:
             last_reverified_sdk=d.get("last_reverified_sdk", ""),
             evidence=d.get("evidence", []),
             backend_validated=d.get("backend_validated", []),
+            backend=d.get("backend", "native-pytorch"),
             auto_promoted=d.get("auto_promoted", False),
             promoted_at=d.get("promoted_at", ""),
             beat_borrowed_by=d.get("beat_borrowed_by", None),
@@ -261,6 +271,10 @@ class Lesson:
             out["evidence"] = self.evidence
         if self.backend_validated:
             out["backend_validated"] = self.backend_validated
+        # Emit only when non-default, so existing native-pytorch lesson YAML
+        # (which never carried this field) round-trips byte-for-byte.
+        if self.backend != "native-pytorch":
+            out["backend"] = self.backend
         if self.auto_promoted:
             out["auto_promoted"] = self.auto_promoted
         if self.promoted_at:
@@ -391,10 +405,16 @@ class KnowledgeBank:
             LessonType.OP_REWRITE,
             LessonType.NKI_KERNEL,
         ),
+        backend: str | None = None,
     ) -> list[Lesson]:
         """Stage-1 style query: what applies to this model class, ranked by
         confidence. Reads verified tier only — the proposer never sees
         provisional lessons in v0.
+
+        When `backend` is given, lessons learned on a different execution stack
+        are dropped (see _backend_matches), so native-pytorch priors don't seed
+        a vllm-serve beam and vice-versa. `backend=None` never filters, keeping
+        existing callers unchanged.
         """
         hits = [
             l for l in self.load_all(Tier.VERIFIED)
@@ -402,6 +422,7 @@ class KnowledgeBank:
             and l.applicability.matches(
                 family, param_count, seq_len, batch, sdk_version, parent
             )
+            and (backend is None or _backend_matches(l, backend))
         ]
         return sorted(hits, key=lambda l: l.confidence.score(), reverse=True)
 
@@ -413,16 +434,19 @@ class KnowledgeBank:
         seq_len: int,
         batch: int,
         sdk_version: str,
+        backend: str | None = None,
     ) -> list[Lesson]:
         """Stages 3-5 query: given a profiled bottleneck, what has fixed it?
 
         The ADIAS symptom index. More useful once we have profile data,
-        because by then the problem is known.
+        because by then the problem is known. `backend` filters by execution
+        stack exactly as in query_interventions; None never filters.
         """
         hits = [
             l for l in self.load_all(Tier.VERIFIED)
             if any(s.bottleneck == bottleneck for s in l.symptoms_addressed)
             and l.applicability.matches(family, param_count, seq_len, batch, sdk_version)
+            and (backend is None or _backend_matches(l, backend))
         ]
         return sorted(hits, key=lambda l: l.confidence.score(), reverse=True)
 
@@ -616,6 +640,33 @@ class KnowledgeBank:
 def _utcnow() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _backend_stack(name: str) -> str:
+    """Normalize a backend name to its STACK key by stripping the build suffix.
+
+    A backend `.name` carries a build tag (e.g. native-pytorch-beta3); the stack
+    is what actually decides whether a lesson transfers, so beta3 and a future
+    beta4 must share priors. Only the `-beta<N>` suffix is stripped —
+    vllm-serve, diffusion-native, and mock are already stack keys and pass
+    through unchanged. Empty/None normalizes to the native default.
+    """
+    return re.sub(r"-beta\d+$", "", name or "native-pytorch")
+
+
+def _backend_matches(lesson: Lesson, backend: str) -> bool:
+    """Does `lesson` apply on execution backend `backend`?
+
+    Compared on stack keys (build suffix stripped). The synthetic `mock` backend
+    matches EVERY stack — on either side — so mock-backed tests keep seeding
+    priors for any target unchanged. A lesson with no backend tag defaults to
+    native-pytorch (see Lesson.backend).
+    """
+    want = _backend_stack(backend)
+    have = _backend_stack(lesson.backend)
+    if want == "mock" or have == "mock":
+        return True
+    return want == have
 
 
 def _norm_family(name: str) -> str:

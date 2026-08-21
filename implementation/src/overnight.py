@@ -320,7 +320,9 @@ def run_one(
             log(f"[{slug}] highlights chart failed (non-fatal): {e}")
 
         # Emit a provisional lesson from the winning config, for the bank.
-        _emit_lesson(bank, slug, spec, best, sdk_version, log)
+        # Stamp it with the backend it was actually validated on, so its priors
+        # only ever seed beams on the same execution stack.
+        _emit_lesson(bank, slug, spec, best, sdk_version, log, effective_backend)
 
         # #5 Fill-the-box: once on the winner, measure TRUE box-level aggregate
         # throughput (N independent DP replicas across the 64 cores). This is the
@@ -461,10 +463,14 @@ def _record_preflight_skip(run_dir, out_root, cycle, slug, spec, bank,
                     box_tok_s=0.0, verified="skipped")
 
 
-def _emit_lesson(bank, slug, spec, best, sdk_version, log) -> None:
+def _emit_lesson(bank, slug, spec, best, sdk_version, log,
+                 backend_name: str = "native-pytorch-beta3") -> None:
     """Write a provisional config_prior from the winning config. Provisional,
-    not verified — humans triage before the proposer trusts it."""
-    from bank import Applicability, Confidence, Lesson, LessonType, Tier
+    not verified — humans triage before the proposer trusts it.
+
+    Tagged with the run's backend (normalized to a stack key) so these priors
+    only ever seed beams on the same execution backend they were learned on."""
+    from bank import Applicability, Confidence, Lesson, LessonType, Tier, _backend_stack
     from ledger import Layer
     try:
         lesson = Lesson(
@@ -477,6 +483,7 @@ def _emit_lesson(bank, slug, spec, best, sdk_version, log) -> None:
             ),
             layer=Layer.CONFIG, migration_risk="medium", tier=Tier.PROVISIONAL,
             intervention={"spec": best.config},
+            backend=_backend_stack(backend_name),
             confidence=Confidence(n_models_validated=1, human_verified=False),
             last_reverified_sdk=sdk_version,
             evidence=[{"model": spec.model_id, "metric": best.metric}],
