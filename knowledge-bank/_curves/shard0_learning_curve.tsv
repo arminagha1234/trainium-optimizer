@@ -9,3 +9,5 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	mistralai-mistral-7b-instruct-v0-3	mistralai/Mistral-7B-Instruct-v0.3	dense_causal_lm	68	-	5400	TIMEOUT
 1	qwen-qwen3-14b	Qwen/Qwen3-14B	dense_causal_lm	42	-	5400	TIMEOUT
 1	qwen-qwen2-5-14b-instruct	Qwen/Qwen2.5-14B-Instruct	dense_causal_lm	43	-	5400	TIMEOUT
+1	microsoft-phi-4	microsoft/phi-4	dense_causal_lm	26	0.000	1274	ok
+1	meta-llama-llama-3-2-3b	meta-llama/Llama-3.2-3B	dense_causal_lm	0	-	4	FAIL_NO_BASELINE
