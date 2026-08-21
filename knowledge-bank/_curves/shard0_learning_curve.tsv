@@ -18,3 +18,4 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 2	qwen-qwen3-0-6b	Qwen/Qwen3-0.6B	dense_causal_lm	64	28.109	1850	ok
 2	qwen-qwen3-4b	Qwen/Qwen3-4B	dense_causal_lm	86	13.445	3389	ok
 2	qwen-qwen3-5-0-8b	Qwen/Qwen3.5-0.8B	dense_causal_lm	29	-	5400	TIMEOUT
+1	qwen-qwen3-0-6b	Qwen/Qwen3-0.6B	dense_causal_lm	64	26.379	1851	ok
