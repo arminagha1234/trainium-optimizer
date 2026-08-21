@@ -21,3 +21,5 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	qwen-qwen3-0-6b	Qwen/Qwen3-0.6B	dense_causal_lm	64	26.379	1851	ok
 1	qwen-qwen3-4b	Qwen/Qwen3-4B	dense_causal_lm	83	12.792	3168	ok
 1	qwen-qwen2-5-0-5b-instruct	Qwen/Qwen2.5-0.5B-Instruct	dense_causal_lm	59	15.368	1447	ok
+1	qwen-qwen2-5-3b-instruct	Qwen/Qwen2.5-3B-Instruct	dense_causal_lm	84	12.375	3369	ok
+1	google-gemma-2-2b	google/gemma-2-2b	dense_causal_lm	0	-	4	FAIL_NO_BASELINE
