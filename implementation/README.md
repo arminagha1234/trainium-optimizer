@@ -19,6 +19,7 @@ See the design docs one level up (`../plan.md`, `../optimization-stages.md`,
 | `src/orchestrator.py` | Walks the stage pipeline, runs the tournament, keep/discard, records everything | ✅ tested |
 | `src/backends/base.py` | The backend interface (the ~20% that is backend-specific) | ✅ |
 | `src/backends/mock.py` | Hardware-free stand-in modeling compile cost + config effects | ✅ tested |
+| `src/backends/vllm_serve.py` | vLLM-Neuron **serving** backend: auto-tunes serving configs (tp / fp8 / buckets / async-scheduling / spec-decode) toward a latency SLA; primary metric decode tok/s, records TTFT/TPOT/e2e/hits_sla | ✅ mock-tested · on-device deferred |
 
 **31 tests, all passing.** Run them:
 
@@ -32,6 +33,10 @@ python -m pytest -q
 - **Real backends.** `backends/vllm_neuron_xla.py`, `nxdi_xla.py`,
   `native_pytorch.py` — these wrap the actual Neuron toolchain and NAD agents.
   The mock proves the core; the real ones are the next milestone.
+  `backends/vllm_serve.py` (serving, latency-SLA) is code-complete and
+  mock-tested; its **on-device sweep is deferred** (boxes busy) — once a box
+  frees, point it at a served model with
+  `python run_overnight.py --backend vllm-serve --model google/gemma-4-12B-it --sla 2.0 --in 2048 --out 512`.
 - **Stages 2-5 candidate generators.** The tournament shell exists in the
   orchestrator; the kernel-authoring stages delegate to the NAD worker agents,
   which are not wired in yet.

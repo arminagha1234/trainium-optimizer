@@ -124,7 +124,18 @@ def _cores_for(instance_type: str | None) -> int:
     return 8
 
 
-def _make_backend(name: str, instance_type: str | None = None):
+@dataclass
+class ServeTarget:
+    """The latency-SLA target for the vllm-serve backend: an input_len ->
+    output_len shape and the wall-clock SLA the search hunts a config to meet
+    (e.g. 2048 -> 512 in <= 2.0 s). Ignored by the throughput backends."""
+    input_len: int = 2048
+    output_len: int = 512
+    sla_seconds: float = 2.0
+
+
+def _make_backend(name: str, instance_type: str | None = None,
+                  serve_target: "ServeTarget | None" = None):
     """Import the requested backend lazily, so a laptop run (mock) never
     needs the on-device deps, and a missing native backend fails cleanly."""
     if name == "mock":
@@ -136,7 +147,16 @@ def _make_backend(name: str, instance_type: str | None = None):
         return NativePyTorchBackend(
             instance_type=instance_type or "trn2.48xlarge",
             core_count=_cores_for(instance_type))
-    raise SystemExit(f"unknown backend {name!r} (use: mock | native-pytorch-beta3)")
+    if name in ("vllm-serve", "vllm_serve"):
+        from backends.vllm_serve import VllmServeBackend
+        t = serve_target or ServeTarget()
+        return VllmServeBackend(
+            instance_type=instance_type or "trn2.48xlarge",
+            core_count=_cores_for(instance_type),
+            target_input_len=t.input_len, target_output_len=t.output_len,
+            sla_seconds=t.sla_seconds)
+    raise SystemExit(
+        f"unknown backend {name!r} (use: mock | native-pytorch-beta3 | vllm-serve)")
 
 
 def _equivalence_for(backend_name: str):
@@ -164,6 +184,7 @@ def run_one(
     profile_loop: bool = True,
     profile_loop_rounds: int = 3,
     profile_loop_patience: int = 2,
+    serve_target: "ServeTarget | None" = None,
 ) -> ModelResult:
     """Optimize a single model. Crashes are caught and returned, never raised,
     so one bad model does not end the night."""
@@ -173,7 +194,7 @@ def run_one(
     # optimized_models/<slug>/ by publish(). So this is just the live scratch.
     run_dir = out_root / "optimization_runs" / slug
     try:
-        backend = _make_backend(backend_name, instance_type)
+        backend = _make_backend(backend_name, instance_type, serve_target)
         ledger = Ledger(run_dir)
         if ledger.path.exists():
             ledger.path.unlink()      # fresh WIP ledger; HISTORY.tsv is the record
@@ -425,9 +446,16 @@ def write_leaderboard(results: list[ModelResult], out_root: Path, backend: str,
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--backend", default="mock",
-                    help="mock | native-pytorch-beta3")
+                    help="mock | native-pytorch-beta3 | vllm-serve")
     ap.add_argument("--models", nargs="*", default=list(SEED_MODELS),
                     help="subset of: " + ", ".join(SEED_MODELS))
+    # Ad-hoc target (esp. for --backend vllm-serve): point the framework at any
+    # HF model id directly, e.g.
+    #   --backend vllm-serve --model google/gemma-4-12B-it --sla 2.0 --in 2048 --out 512
+    ap.add_argument("--model", dest="model_id", default=None,
+                    help="ad-hoc HF model id to optimize (bypasses --models)")
+    ap.add_argument("--family", default="dense_causal_lm",
+                    help="architecture family for the ad-hoc --model")
     ap.add_argument("--out-root", type=Path, default=Path("../artifacts"))
     ap.add_argument("--bank-root", type=Path, default=Path("../../knowledge-bank"))
     ap.add_argument("--sdk", default="2.28.0")
@@ -449,8 +477,18 @@ def main() -> None:
                     help="Stage 6 max re-entry rounds (hard cap)")
     ap.add_argument("--profile-loop-patience", type=int, default=2,
                     help="Stage 6: stop after K consecutive no-improvement rounds")
+    # --- vllm-serve latency-SLA target (input_len -> output_len in <= sla s) ---
+    ap.add_argument("--in", dest="in_len", type=int, default=2048,
+                    help="vllm-serve: target input length (tokens)")
+    ap.add_argument("--out", dest="out_len", type=int, default=512,
+                    help="vllm-serve: target output length (tokens)")
+    ap.add_argument("--sla", type=float, default=2.0,
+                    help="vllm-serve: end-to-end SLA in seconds (e.g. 2.0)")
     ap.set_defaults(profile_loop=True)
     a = ap.parse_args()
+
+    serve_target = ServeTarget(input_len=a.in_len, output_len=a.out_len,
+                               sla_seconds=a.sla)
 
     out_root = a.out_root.resolve()
     out_root.mkdir(parents=True, exist_ok=True)
@@ -470,9 +508,22 @@ def main() -> None:
         log_fh.write(line + "\n")
         log_fh.flush()
 
-    models = [s for s in a.models if s in SEED_MODELS]
-    for bad in (s for s in a.models if s not in SEED_MODELS):
-        log(f"skip unknown model {bad!r}")
+    # Model set: either the named seeds, or a single ad-hoc --model id (the
+    # vllm-serve path — "point it at Gemma-4-12B the moment it serves"). The
+    # ad-hoc spec runs on the latency track so the fill/search behavior matches
+    # a serving deployment (one sequence in flight, not DP replicas).
+    if a.model_id:
+        slug = a.model_id.split("/")[-1].replace(".", "-").lower()
+        specs: dict[str, ModelSpec] = {slug: ModelSpec(
+            model_id=a.model_id, family=a.family, param_count=0.0,
+            probe_shape=f"serve {a.in_len}/{a.out_len}", probe_batch=1,
+            track="latency")}
+        models = [slug]
+    else:
+        specs = SEED_MODELS
+        models = [s for s in a.models if s in SEED_MODELS]
+        for bad in (s for s in a.models if s not in SEED_MODELS):
+            log(f"skip unknown model {bad!r}")
 
     log(f"=== overnight START: backend={a.backend} instance={instance_type} "
         f"cycles={'forever' if cycles == 0 else cycles} auto_promote={a.auto_promote} "
@@ -493,11 +544,12 @@ def main() -> None:
                     log("STOP file seen mid-cycle — finishing up")
                     break
                 results.append(run_one(
-                    slug, SEED_MODELS[slug], a.backend, out_root, bank, a.sdk, log,
+                    slug, specs[slug], a.backend, out_root, bank, a.sdk, log,
                     instance_type=instance_type, cycle=cycle,
                     profile_loop=a.profile_loop,
                     profile_loop_rounds=a.profile_loop_rounds,
                     profile_loop_patience=a.profile_loop_patience,
+                    serve_target=serve_target,
                 ))
 
             # Compound learning: promote qualifying provisional lessons so the

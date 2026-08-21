@@ -102,6 +102,17 @@ class Measurements:
     # a fixed deterministic prompt. The orchestrator compares a candidate's
     # signature against the Stage-0 baseline's to gate correctness for real.
     top1_tokens: list = field(default_factory=list)
+    # Serving-latency fields (populated by the vllm-serve backend; left at their
+    # defaults by every other backend, so this is additive and changes no
+    # existing behavior). TTFT already has a home above (ttft_ms_*); these make
+    # the rest of a latency-SLA measurement first-class on the measurement type
+    # itself, not just in the worker JSON:
+    #   tpot_ms   — time-per-output-token (decode), inversely tracks decode tok/s
+    #   e2e_seconds — total end-to-end for the target (input_len -> output_len)
+    #   hits_sla  — whether e2e met the caller's SLA (e.g. <= 2.0 s)
+    tpot_ms_p50: float = 0.0
+    e2e_seconds: float = 0.0
+    hits_sla: bool = False
 
     @property
     def hbm_utilization(self) -> float:
