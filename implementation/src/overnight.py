@@ -28,6 +28,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from bank import AutoPromotionPolicy, KnowledgeBank
+from bank_hygiene import (
+    canary_from_specs,
+    current_toolchain,
+    maybe_revalidate_at_startup,
+)
 from guardrails import Guardrails
 from ledger import Ledger, Origin
 from orchestrator import ModelSpec, Orchestrator
@@ -220,29 +225,6 @@ def run_one(
     # optimized_models/<slug>/ by publish(). So this is just the live scratch.
     run_dir = out_root / "optimization_runs" / slug
     try:
-        # AUTO-ONBOARD (Tier-0, additive) — only for a queued model that carries
-        # NO explicit family (a discovery entry sets family="auto"). Fingerprint
-        # its config by SHAPE: a Tier-0 MAP replaces the family-less spec with a
-        # fully-resolved one and proceeds into the normal loop; a Tier-1/2 verdict
-        # records a `needs-onboarding` lesson (reuse the anti-pattern/bank path)
-        # instead of a bare FAIL_NO_BASELINE, and skips — the model is queued for
-        # onboarding (Phase 2/3), not dropped. Explicit-family seeds skip all this.
-        from onboarding import needs_auto_onboard, resolve_onboarding
-        if needs_auto_onboard(spec):
-            resolved, verdict = resolve_onboarding(spec)
-            if resolved is None:
-                # Tier-1/2: record a `needs-onboarding` lesson via the same
-                # arch-signature-keyed anti-pattern/bank path a pre-flight skip
-                # uses (so a sibling of the same unseen shape is flagged too),
-                # instead of a bare FAIL_NO_BASELINE.
-                reason = f"needs-onboarding [{verdict.verdict.value}]: {verdict.reason}"
-                _record_preflight_skip(
-                    run_dir, out_root, cycle, slug, spec, bank, sdk_version,
-                    reason, log)
-                return ModelResult(slug=slug, ok=False, skipped=True, error=reason)
-            log(f"[{slug}] auto-onboarded (Tier-0 MAP): {verdict.reason}")
-            spec = resolved
-
         # PRE-FLIGHT GATE (Rule 4 at the arch level) — cheap, no-compile, BEFORE
         # any backend/compiler work. Skip a model that will predictably fail the
         # expensive way (linear-attention ISA abort, or an arch the bank already
@@ -627,6 +609,12 @@ def main() -> None:
                     help="disable the pre-flight arch gate (on by default; it "
                          "only ever skips known-bad arches, so leaving it on is safe)")
     ap.set_defaults(preflight=True)
+    # --- bank hygiene: re-validate stale verified priors when the SDK changed ---
+    ap.add_argument("--revalidate", action="store_true",
+                    help="at STARTUP, re-validate verified config-priors whose "
+                         "SDK stamp doesn't cover the live toolchain, before the "
+                         "run loop. A no-op unless the toolchain changed (fresh "
+                         "box / SDK bump), so it's safe to leave on. Off by default.")
     a = ap.parse_args()
 
     serve_target = ServeTarget(input_len=a.in_len, output_len=a.out_len,
@@ -671,6 +659,23 @@ def main() -> None:
         f"cycles={'forever' if cycles == 0 else cycles} auto_promote={a.auto_promote} "
         f"preflight={a.preflight} models={models} ===")
     log(f"    (touch {stop_file} to stop cleanly after the current model)")
+
+    # BANK HYGIENE (startup, opt-in) — re-validate stale verified priors when
+    # the toolchain has moved off the bank's dominant stamped SDK. Additive and
+    # a no-op unless the SDK actually changed, so it never disrupts the run
+    # loop; runs once at startup, before the first cycle, so the loop below
+    # never seeds a beam from a prior the new toolchain already invalidated.
+    if a.revalidate:
+        try:
+            live_sdk = current_toolchain() or a.sdk
+            hygiene_backend = _make_backend(a.backend, instance_type, serve_target)
+            report = maybe_revalidate_at_startup(
+                bank, hygiene_backend, canary_from_specs(SEED_MODELS),
+                current_sdk=live_sdk, guards=Guardrails(), log=log)
+            if report is not None:
+                log(f"=== revalidation: {report.summary()} ===")
+        except Exception as e:  # noqa: BLE001 — hygiene must never block the run
+            log(f"startup revalidation failed (non-fatal): {e}")
 
     cycle = 0
     try:
