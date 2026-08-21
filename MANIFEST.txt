@@ -1,5 +1,5 @@
 # knowledge-bank snapshot manifest
-# generated: 2026-08-21T04:10:32Z  by: ip-172-31-38-152  publisher: .211/shard0
+# generated: 2026-08-21T05:40:44Z  by: ip-172-31-38-152  publisher: .211/shard0
 # layout: <tier>/<family>/<type>/<lesson_id>.yaml
 
 [provisional] total=4
