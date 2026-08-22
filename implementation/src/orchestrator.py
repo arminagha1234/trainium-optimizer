@@ -106,6 +106,14 @@ class Orchestrator:
     incumbent: Candidate | None = None
     # Stage-0 baseline top-1 token signature; the real equivalence reference.
     _baseline_tokens: list = field(default_factory=list)
+    # Config-keys already compiled+measured in the deep stages. run_deep_stages
+    # is re-entered by the profile loop (Stage 6) up to max_rounds times; without
+    # this, each round recompiles the SAME fixed flag candidates against an
+    # unchanged incumbent → guaranteed "no gain" + wasted 5-20 min compiles per
+    # round. Keyed by the FULL merged config, so a candidate is only skipped when
+    # the exact config was already tried; if a deep stage moved the incumbent,
+    # the merged configs differ and the sweep legitimately re-runs.
+    _deep_tried: set = field(default_factory=set)
 
     def establish_baseline(self, spec: ModelSpec) -> Candidate:
         """Stage 0. Measure the autoport baseline and set it as the incumbent.
@@ -271,8 +279,21 @@ class Orchestrator:
              [("cc:model-type-transformer", "--model-type transformer")]),
             (Stage.BORROW, Origin.BORROWED, Layer.KERNEL,
              [("cc:auto-cast-none", "--auto-cast none")]),
+            # Stage 5 GRAPH-REWRITE — sweep the neuronx-cc optimization LEVEL
+            # (O1/O2/O3) and the auto-cast policy, not just optlevel-3. The
+            # Gemma-4-12B evidence showed a single optlevel bump (the
+            # LowerDynamicDMA pass) was worth ~2.4x on its own, so compiling
+            # ONLY at optlevel 3 can miss the real optimum outright — and can
+            # never ATTRIBUTE a win to a level. The `--optlevel N` spelling is
+            # the one already proven on-device (it produced Qwen3-1.7B's +14%
+            # graph-rewrite win). Each flagset is a distinct compile, gated by
+            # the same equivalence + guardrails, so a slower/drifting level is
+            # discarded honestly.
             (Stage.GRAPH_REWRITE, Origin.NONE, Layer.GRAPH,
-             [("cc:optlevel3", "--optlevel 3"),
+             [("cc:optlevel1", "--optlevel 1"),
+              ("cc:optlevel2", "--optlevel 2"),
+              ("cc:optlevel3", "--optlevel 3"),
+              ("cc:optlevel2+nocast", "--optlevel 2 --auto-cast none"),
               ("cc:optlevel3+transformer+nocast",
                "--optlevel 3 --model-type transformer --auto-cast none")]),
         ]
@@ -280,6 +301,9 @@ class Orchestrator:
             for label, flags in flagsets:
                 cand = Candidate(config={**base_cfg, "cc_flags": flags},
                                  provenance=label, layer=layer)
+                if cand.key() in self._deep_tried:
+                    continue                       # already compiled this exact config
+                self._deep_tried.add(cand.key())
                 evaluated = self._evaluate(cand, spec, stage, origin=origin,
                                            layer=layer, source="neuronx-cc")
                 if evaluated is not None:
@@ -300,18 +324,29 @@ class Orchestrator:
             for label, patch in moe_candidates(base_artifact):
                 cand = Candidate(config={**base_cfg, **patch},
                                  provenance=label, layer=Layer.KERNEL)
+                if cand.key() in self._deep_tried:
+                    continue
+                self._deep_tried.add(cand.key())
                 evaluated = self._evaluate(
                     cand, spec, Stage.BORROW, origin=Origin.BORROWED,
                     layer=Layer.KERNEL, source=KERNEL_SOURCE)
                 if evaluated is not None:
                     self._update_incumbent(evaluated)
 
-        # Stage 4 — invent: entered, but no auto-generated NKI kernel this run.
-        self._record(
-            Candidate(config=base_cfg, provenance="stage4-invent", layer=Layer.KERNEL),
-            Stage.INVENT, Origin.NONE, Layer.KERNEL, source="",
-            metric=0.0, correctness=0.0, compile_s=0.0, status=Status.DISCARD,
-            desc="Stage 4 entered: no auto-invention (needs NKI-writer agent)")
+        # Stage 4 — invent: NOT integrated into this pipeline. The invent_engine
+        # module (author -> offline-gate -> on-device race -> bank) exists but is
+        # not wired here — auto-authoring novel NKI kernels needs the NKI-writer
+        # agent + a validated on-device execution path. Record the DISCARD once
+        # per run (not once per profile-loop round) so the ledger reflects
+        # "Stage 4 not run" honestly without spamming a row every re-entry.
+        if "stage4-invent-recorded" not in self._deep_tried:
+            self._deep_tried.add("stage4-invent-recorded")
+            self._record(
+                Candidate(config=base_cfg, provenance="stage4-invent", layer=Layer.KERNEL),
+                Stage.INVENT, Origin.NONE, Layer.KERNEL, source="",
+                metric=0.0, correctness=0.0, compile_s=0.0, status=Status.DISCARD,
+                desc="Stage 4 not integrated: invent_engine not wired to pipeline "
+                     "(needs NKI-writer agent + validated on-device execution)")
         return self.incumbent
 
     # -- Stage 6 -------------------------------------------------------------
@@ -466,6 +501,21 @@ class Orchestrator:
         # equivalence gate needs.
         m: Measurements = self.backend.measure(neff, spec.probe_shape, spec.probe_batch)
 
+        # REAL compile time. For native PyTorch the compile happens on the first
+        # forward INSIDE the worker, so it is 0.0 at compile() and only known now
+        # (the worker reports it in m.compile_seconds). Prefer the measured value;
+        # fall back to the up-front estimate for backends that know it at
+        # compile() (mock/XLA). Before this fix the orchestrator only ever saw
+        # neff.compile_seconds == 0.0 for native runs, so the compile-timeout
+        # guardrail was dead and every deep-stage row logged compile_s=0.0.
+        compile_s = m.compile_seconds or neff.compile_seconds
+        if compile_s and not self.guards.compile_ok(compile_s):
+            self._record(cand, stage, origin, layer, source, metric=0.0,
+                         correctness=0.0, compile_s=compile_s,
+                         status=Status.DISCARD,
+                         desc=f"{cand.provenance} (compile too slow: {compile_s:.0f}s)")
+            return None
+
         # Zero-throughput is a SILENT failure, not a benign result. A run that
         # returns 0 img/s (a diffusion backend that produced no image) or 0 tok/s
         # can still "pass" equivalence — the mock checker passes unconditionally,
@@ -475,7 +525,7 @@ class Orchestrator:
         # explicit anti-pattern-style FAIL and discard, before equivalence.
         if m.metric <= 0.0:
             self._record(cand, stage, origin, layer, source, metric=0.0,
-                         correctness=0.0, compile_s=neff.compile_seconds,
+                         correctness=0.0, compile_s=compile_s,
                          status=Status.DISCARD,
                          desc=f"{cand.provenance} (metric=0 -> backend produced no throughput)")
             return None
@@ -488,7 +538,7 @@ class Orchestrator:
         if not eq.passed:
             self._record(cand, stage, origin, layer, source, metric=0.0,
                          correctness=eq.correctness_pct,
-                         compile_s=neff.compile_seconds, status=Status.DISCARD,
+                         compile_s=compile_s, status=Status.DISCARD,
                          desc=f"{cand.provenance} (equivalence fail: {eq.notes})")
             return None
 
@@ -496,13 +546,13 @@ class Orchestrator:
         if not self.guards.hbm_ok(m):
             self._record(cand, stage, origin, layer, source, metric=m.metric,
                          correctness=eq.correctness_pct,
-                         compile_s=neff.compile_seconds, status=Status.DISCARD,
+                         compile_s=compile_s, status=Status.DISCARD,
                          desc=f"{cand.provenance} (OOM {m.hbm_utilization:.0%} HBM)")
             return None
         if not self.guards.measurement_trustworthy(m):
             self._record(cand, stage, origin, layer, source, metric=m.metric,
                          correctness=eq.correctness_pct,
-                         compile_s=neff.compile_seconds, status=Status.DISCARD,
+                         compile_s=compile_s, status=Status.DISCARD,
                          desc=f"{cand.provenance} (noisy measurement)")
             return None
 
@@ -522,7 +572,7 @@ class Orchestrator:
                     f"{m.cores_available} cores]")
         self._record(
             cand, stage, origin, layer, source, metric=m.metric,
-            correctness=eq.correctness_pct, compile_s=neff.compile_seconds,
+            correctness=eq.correctness_pct, compile_s=compile_s,
             mfu=m.mfu_percent,
             status=Status.KEEP if beats else Status.DISCARD,
             desc=desc,
