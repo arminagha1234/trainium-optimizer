@@ -31,3 +31,4 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	allenai-olmoe-1b-7b-0924	allenai/OLMoE-1B-7B-0924	moe_causal_lm	25	0.000	713	ok
 1	qwen-qwen1-5-moe-a2-7b	Qwen/Qwen1.5-MoE-A2.7B	moe_causal_lm	25	0.000	842	ok
 1	deepseek-ai-deepseek-moe-16b-base	deepseek-ai/deepseek-moe-16b-base	moe_causal_lm	25	0.000	319	ok
+1	01-ai-yi-1-5-9b	01-ai/Yi-1.5-9B	dense_causal_lm	33	-	5400	TIMEOUT
