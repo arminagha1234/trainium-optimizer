@@ -50,3 +50,5 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	qwen-qwen3-5-0-8b	Qwen/Qwen3.5-0.8B	hybrid_attention_causal_lm	1	0.000	5	ok
 1	qwen-qwen3-5-2b	Qwen/Qwen3.5-2B	hybrid_attention_causal_lm	1	0.000	4	ok
 1	allenai-olmoe-1b-7b-0924	allenai/OLMoE-1B-7B-0924	moe_causal_lm	1	0.000	120	ok
+1	qwen-qwen1-5-moe-a2-7b	Qwen/Qwen1.5-MoE-A2.7B	moe_causal_lm	1	0.000	230	ok
+1	deepseek-ai-deepseek-moe-16b-base	deepseek-ai/deepseek-moe-16b-base	moe_causal_lm	1	0.000	18	ok
