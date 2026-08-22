@@ -79,3 +79,4 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	openai-community-gpt2	openai-community/gpt2	dense_causal_lm	83	12.794	1955	ok
 1	facebook-opt-1-3b	facebook/opt-1.3b	dense_causal_lm	67	2.900	2406	ok
 1	facebook-opt-2-7b	facebook/opt-2.7b	dense_causal_lm	63	2.422	2545	ok
+1	eleutherai-pythia-1-4b	EleutherAI/pythia-1.4b	dense_causal_lm	61	2.438	2406	ok
