@@ -35,3 +35,4 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	huggingfacetb-smollm3-3b	HuggingFaceTB/SmolLM3-3B	dense_causal_lm	70	-	5400	TIMEOUT
 1	qwen-qwen3-0-6b	Qwen/Qwen3-0.6B	dense_causal_lm	63	26.587	1887	ok
 1	qwen-qwen3-1-7b	Qwen/Qwen3-1.7B	dense_causal_lm	83	17.239	2715	ok
+1	qwen-qwen3-4b	Qwen/Qwen3-4B	dense_causal_lm	81	14.104	3177	ok
