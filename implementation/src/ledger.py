@@ -87,6 +87,11 @@ class Layer(StrEnum):
 class Status(StrEnum):
     KEEP = "keep"
     DISCARD = "discard"
+    # A Stage-0 baseline whose worker produced NO throughput (crash / 0 tok/s).
+    # This is NOT a benign discard: it means the model never established a
+    # baseline at all, so the whole optimization run is void. Recorded distinctly
+    # so a crashed baseline is never silently reported as an "ok, 0.000" row.
+    FAIL_NO_BASELINE = "fail_no_baseline"
 
 
 # Migration risk is a pure function of layer, so derive it rather than storing
