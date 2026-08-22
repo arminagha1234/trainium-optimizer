@@ -180,11 +180,21 @@ def test_preflight_lesson_never_prunes_a_real_config(tmp_path: Path):
 # -- 0-metric is a real failure, not a benign 0 ------------------------------
 
 class _ZeroMetricBackend(MockBackend):
-    """A backend whose measure() always reports 0 throughput — the diffusion
-    "0 img/s" silent failure. Everything else behaves like the mock."""
+    """A backend whose *config candidates* report 0 throughput — the diffusion
+    "0 img/s" silent failure. The Stage-0 baseline measures normally (positive),
+    so the run has a valid incumbent; only the searched candidates come back at
+    0, exercising the Stage-1 config gate. (A 0-metric BASELINE is now its own
+    honest FAIL_NO_BASELINE case — see test_moe_baseline_fix.)"""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self._measured = 0
 
     def measure(self, neff, shape, batch):
         m = super().measure(neff, shape, batch)
+        self._measured += 1
+        if self._measured == 1:
+            return m                       # first call = baseline: keep positive
         m.metric = 0.0
         m.metric_p50 = 0.0
         m.metric_p99 = 0.0
