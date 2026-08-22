@@ -1,9 +1,9 @@
 {
-  "model_id": "Qwen/Qwen3-4B",
+  "model_id": "Qwen/Qwen3-1.7B",
   "backend": "native-pytorch-beta3",
-  "baseline_metric": 1882.2121906925543,
-  "best_metric": 26547.52001162042,
-  "speedup": 14.104,
+  "baseline_metric": 2974.5332966736914,
+  "best_metric": 51278.14031453618,
+  "speedup": 17.239,
   "metric_label": "tok/s",
   "config": {
     "tp_degree": 4,
@@ -11,12 +11,10 @@
     "attn_implementation": "eager",
     "compile_mode": "compile-default",
     "batch": 8,
-    "track": "latency",
+    "cp_degree": 1,
     "dp_degree": 1,
-    "cp_degree": 2,
-    "batching": "static",
     "kv_replication": 1,
-    "cores_used": 8,
+    "cores_used": 4,
     "cores_available": 4,
     "cc_flags": "--optlevel 3"
   },
@@ -33,5 +31,5 @@
   "kernels": [],
   "measurements": {},
   "verified": "verified",
-  "generated_at": "2026-08-22T04:06:25Z"
+  "generated_at": "2026-08-22T03:13:25Z"
 }

@@ -1,0 +1,58 @@
+commit	stage	origin	layer	source	metric	mfu	correctness	compile_s	status	description
+unknown	baseline				2916.1482487361	6.317179728988596	100.0	0.0	keep	baseline
+unknown	config		config		2936.1495718111087	6.360508099806904	100.0	0.0	discard	prior:latency-track-fill-tp-cp-not-dp
+unknown	config		config		0.0	-1.0	68.75	0.0	discard	compile_mode=compile-default (equivalence fail: top1 match 69% vs baseline)
+unknown	config		config		0.0	-1.0	50.0	0.0	discard	attn_implementation=sdpa (equivalence fail: top1 match 50% vs baseline)
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	weights_dtype=fp32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		2501.1937080085977	10.836547968611605	100.0	0.0	discard	tp_degree=1
+unknown	config		config		3384.841073605683	3.666248693854533	93.75	0.0	keep	tp_degree=4
+unknown	config		config		6755.744809430903	14.634802665760821	100.0	0.0	keep	batch=8
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	batch=32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		0.0	-1.0	68.75	0.0	discard	compile_mode=compile-default (equivalence fail: top1 match 69% vs baseline)
+unknown	config		config		0.0	-1.0	50.0	0.0	discard	attn_implementation=sdpa (equivalence fail: top1 match 50% vs baseline)
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	weights_dtype=fp32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		2591.3290850095145	11.227064038363356	100.0	0.0	discard	tp_degree=1
+unknown	config		config		3394.0397963086475	3.676212176441013	93.75	0.0	discard	tp_degree=4
+unknown	config		config		6826.42633224605	14.787918298114361	100.0	0.0	discard	batch=8
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	batch=32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		0.0	-1.0	68.75	0.0	discard	compile_mode=compile-default (equivalence fail: top1 match 69% vs baseline)
+unknown	config		config		0.0	-1.0	50.0	0.0	discard	attn_implementation=sdpa (equivalence fail: top1 match 50% vs baseline)
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	weights_dtype=fp32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		5088.867524039751	-1.0	93.75	0.0	discard	tp_degree=1 (OOM 94% HBM)
+unknown	config		config		9869.594084862496	10.690128616276901	93.75	0.0	keep	tp_degree=4
+unknown	config		config		0.0	-1.0	68.75	0.0	discard	compile_mode=compile-default (equivalence fail: top1 match 69% vs baseline)
+unknown	config		config		0.0	-1.0	50.0	0.0	discard	attn_implementation=sdpa (equivalence fail: top1 match 50% vs baseline)
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	weights_dtype=fp32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		5068.355969458055	-1.0	93.75	0.0	discard	tp_degree=1 (OOM 94% HBM)
+unknown	config		config		9820.123566446817	10.6365452368562	93.75	0.0	discard	tp_degree=4
+unknown	config		config		0.0	-1.0	68.75	0.0	discard	compile_mode=compile-default (equivalence fail: top1 match 69% vs baseline)
+unknown	config		config		0.0	-1.0	43.75	0.0	discard	attn_implementation=sdpa (equivalence fail: top1 match 44% vs baseline)
+unknown	config		config		0.0	-1.0	50.0	0.0	discard	weights_dtype=fp32 (equivalence fail: top1 match 50% vs baseline)
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	batch=32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		0.0	-1.0	68.75	0.0	discard	compile_mode=compile-default (equivalence fail: top1 match 69% vs baseline)
+unknown	config		config		0.0	-1.0	43.75	0.0	discard	attn_implementation=sdpa (equivalence fail: top1 match 44% vs baseline)
+unknown	config		config		0.0	-1.0	50.0	0.0	discard	weights_dtype=fp32 (equivalence fail: top1 match 50% vs baseline)
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	batch=32 (equivalence fail: no output tokens (run failed/OOM))
+unknown	config		config		0.0	-1.0	68.75	0.0	discard	compile_mode=compile-default (equivalence fail: top1 match 69% vs baseline)
+unknown	config		config		0.0	-1.0	43.75	0.0	discard	attn_implementation=sdpa (equivalence fail: top1 match 44% vs baseline)
+unknown	config		config		0.0	-1.0	50.0	0.0	discard	weights_dtype=fp32 (equivalence fail: top1 match 50% vs baseline)
+unknown	config		config		0.0	-1.0	68.75	0.0	discard	compile_mode=compile-default (equivalence fail: top1 match 69% vs baseline)
+unknown	config		config		0.0	-1.0	43.75	0.0	discard	attn_implementation=sdpa (equivalence fail: top1 match 44% vs baseline)
+unknown	config		config		0.0	-1.0	50.0	0.0	discard	weights_dtype=fp32 (equivalence fail: top1 match 50% vs baseline)
+unknown	known_kernel	harvested	kernel	neuronx-cc	0.0	-1.0	68.75	0.0	discard	cc:model-type-transformer (equivalence fail: top1 match 69% vs baseline)
+unknown	borrow	borrowed	kernel	neuronx-cc	0.0	-1.0	68.75	0.0	discard	cc:auto-cast-none (equivalence fail: top1 match 69% vs baseline)
+unknown	graph_rewrite		graph	neuronx-cc	0.0	-1.0	62.5	0.0	discard	cc:optlevel3 (equivalence fail: top1 match 62% vs baseline)
+unknown	graph_rewrite		graph	neuronx-cc	0.0	-1.0	62.5	0.0	discard	cc:optlevel3+transformer+nocast (equivalence fail: top1 match 62% vs baseline)
+unknown	invent		kernel		0.0	-1.0	0.0	0.0	discard	Stage 4 entered: no auto-invention (needs NKI-writer agent)
+unknown	known_kernel	harvested	kernel	neuronx-cc	0.0	-1.0	68.75	0.0	discard	cc:model-type-transformer (equivalence fail: top1 match 69% vs baseline)
+unknown	borrow	borrowed	kernel	neuronx-cc	0.0	-1.0	68.75	0.0	discard	cc:auto-cast-none (equivalence fail: top1 match 69% vs baseline)
+unknown	graph_rewrite		graph	neuronx-cc	0.0	-1.0	62.5	0.0	discard	cc:optlevel3 (equivalence fail: top1 match 62% vs baseline)
+unknown	graph_rewrite		graph	neuronx-cc	0.0	-1.0	62.5	0.0	discard	cc:optlevel3+transformer+nocast (equivalence fail: top1 match 62% vs baseline)
+unknown	invent		kernel		0.0	-1.0	0.0	0.0	discard	Stage 4 entered: no auto-invention (needs NKI-writer agent)
+unknown	profile_loop				9869.594084862496	-1.0	100.0	0.0	discard	round 1: profile=compute_bound hot=attention_prefill(45%) -> re-entered deep stages -> +0.0% (no gain)
+unknown	known_kernel	harvested	kernel	neuronx-cc	0.0	-1.0	68.75	0.0	discard	cc:model-type-transformer (equivalence fail: top1 match 69% vs baseline)
+unknown	borrow	borrowed	kernel	neuronx-cc	0.0	-1.0	68.75	0.0	discard	cc:auto-cast-none (equivalence fail: top1 match 69% vs baseline)
+unknown	graph_rewrite		graph	neuronx-cc	0.0	-1.0	62.5	0.0	discard	cc:optlevel3 (equivalence fail: top1 match 62% vs baseline)
+unknown	graph_rewrite		graph	neuronx-cc	0.0	-1.0	62.5	0.0	discard	cc:optlevel3+transformer+nocast (equivalence fail: top1 match 62% vs baseline)
+unknown	invent		kernel		0.0	-1.0	0.0	0.0	discard	Stage 4 entered: no auto-invention (needs NKI-writer agent)
+unknown	profile_loop				9869.594084862496	-1.0	100.0	0.0	discard	round 2: profile=compute_bound hot=attention_prefill(45%) -> re-entered deep stages -> +0.0% (no gain)

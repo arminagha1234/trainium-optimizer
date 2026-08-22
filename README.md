@@ -47,14 +47,18 @@ recipes and trajectory charts (`optimization_timeline.png` +
 
 ### Text-to-text (LLMs)
 
-| Rank | Model                   | Family  | Params | Baseline (tok/s) | Optimized (tok/s) |     Speedup | Best config                             | Hardware     | Status                          |
-|-----:|:------------------------|:--------|-------:|-----------------:|------------------:|------------:|:----------------------------------------|:-------------|:--------------------------------|
-|   🥇 | Qwen3-0.6B              | qwen3   |   0.6B |            3,216 |        **84,827** |  **~28×**   | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ Verified                     |
-|   🥈 | Qwen2.5-0.5B-Instruct   | qwen2.5 |   0.5B |            4,833 |        **74,269** |  **15.4×**  | (same family recipe)                    | trn2.3xlarge | ✅ Verified                     |
-|   🥉 | Qwen3-4B                | qwen3   |     4B |            1,954 |        **26,342** |  **~13×**   | (same)                                  | trn2.3xlarge | ✅ Verified                     |
-|    4 | Qwen2.5-3B-Instruct     | qwen2.5 |     3B |            2,856 |        **35,343** |  **12.4×**  | (same)                                  | trn2.3xlarge | ✅ Verified                     |
-|    – | Qwen3-1.7B/8B/32B, Gemma-2, Phi, Mistral, OPT, Pythia, GPT-NeoX, StableLM, OLMo, Falcon, … | mixed | — | — | — | — | — | trn2.3xlarge | 🕒 In the 40-model rolling queue |
-|    – | Qwen3.5-* (GatedDeltaNet) | qwen3.5 |    — |                — |                 — |           — | —                                       | —            | ⛔ Skipped — neuronx-cc ISA-fail on linear-attn (needs adapter) |
+<!-- LEADERBOARD:START -->
+| Rank | Model | Family | Params | Baseline (tok/s) | Optimized (tok/s) | Speedup | Best config | Hardware | Status |
+|-----:|:------|:-------|-------:|-----------------:|------------------:|--------:|:------------|:-------------|:-------|
+| 🥇 | Qwen3-0.6B | qwen3 | 0.6B | 3,333 | **85,937** | **25.788×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ Verified |
+| 🥈 | Qwen3-1.7B | qwen3 | 1.7B | 2,975 | **51,278** | **17.239×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ Verified |
+| 🥉 | Qwen2.5-0.5B-Instruct | qwen2.5 | 0.5B | 4,833 | **74,269** | **15.368×** | TP=2, torch.compile(neuron), bf16, batch=8, DP=2 | trn2.3xlarge | ✅ Verified |
+| 4 | Qwen3-4B | qwen3 | 4B | 1,882 | **26,548** | **14.104×** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ Verified |
+| 5 | Qwen2.5-3B-Instruct | qwen2.5 | 3B | 2,856 | **35,343** | **12.375×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ Verified |
+| 6 | Mistral-7B-Instruct-v0.3 | mistral | 7B | 2,555 | **23,270** | **9.108×** | TP=4, torch.compile(neuron), bf16, batch=32 | trn2.3xlarge | ✅ Verified |
+| 7 | Qwen3-8B | qwen3 | 8B | 1,903 | **16,876** | **8.87×** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ Verified |
+| 8 | Qwen2.5-7B-Instruct | qwen2.5 | 7B | 2,916 | **9,870** | **3.384×** | TP=4, bf16, batch=8 | trn2.3xlarge | ✅ Verified |
+<!-- LEADERBOARD:END -->
 
 ### Text-to-image · Text-to-video · Speech (ASR / TTS)
 
