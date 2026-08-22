@@ -1,10 +1,10 @@
-# Optimized Recipe: Qwen/Qwen3-4B
+# Optimized Recipe: Qwen/Qwen2.5-7B-Instruct
 
-**26,548 tok/s** — 14.104x over baseline
-(1,882 tok/s).
+**9,870 tok/s** — 3.384x over baseline
+(2,916 tok/s).
 
 Backend: `native-pytorch-beta3`  ·  Correctness: **verified** (trusted-grader re-measure)
-Generated: 2026-08-22T04:06:25Z
+Generated: 2026-08-22T10:32:16Z
 
 ## Winning config
 
@@ -13,16 +13,13 @@ Generated: 2026-08-22T04:06:25Z
   "tp_degree": 4,
   "weights_dtype": "bf16",
   "attn_implementation": "eager",
-  "compile_mode": "compile-default",
+  "compile_mode": "eager",
   "batch": 8,
-  "track": "latency",
+  "cp_degree": 1,
   "dp_degree": 1,
-  "cp_degree": 2,
-  "batching": "static",
   "kv_replication": 1,
-  "cores_used": 8,
-  "cores_available": 4,
-  "cc_flags": "--optlevel 3"
+  "cores_used": 4,
+  "cores_available": 4
 }
 ```
 

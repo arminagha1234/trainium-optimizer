@@ -1,24 +1,21 @@
 {
-  "model_id": "Qwen/Qwen3-4B",
+  "model_id": "mistralai/Mistral-7B-Instruct-v0.3",
   "backend": "native-pytorch-beta3",
-  "baseline_metric": 1882.2121906925543,
-  "best_metric": 26547.52001162042,
-  "speedup": 14.104,
+  "baseline_metric": 2554.8340540855647,
+  "best_metric": 23270.44983761017,
+  "speedup": 9.108,
   "metric_label": "tok/s",
   "config": {
     "tp_degree": 4,
     "weights_dtype": "bf16",
     "attn_implementation": "eager",
     "compile_mode": "compile-default",
-    "batch": 8,
-    "track": "latency",
+    "batch": 32,
+    "cp_degree": 1,
     "dp_degree": 1,
-    "cp_degree": 2,
-    "batching": "static",
     "kv_replication": 1,
-    "cores_used": 8,
-    "cores_available": 4,
-    "cc_flags": "--optlevel 3"
+    "cores_used": 4,
+    "cores_available": 4
   },
   "toolchain": {
     "backend": "native-pytorch-beta3",
@@ -33,5 +30,5 @@
   "kernels": [],
   "measurements": {},
   "verified": "verified",
-  "generated_at": "2026-08-22T04:06:25Z"
+  "generated_at": "2026-08-22T09:21:15Z"
 }

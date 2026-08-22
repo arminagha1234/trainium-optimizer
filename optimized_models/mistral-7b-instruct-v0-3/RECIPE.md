@@ -1,10 +1,10 @@
-# Optimized Recipe: Qwen/Qwen3-4B
+# Optimized Recipe: mistralai/Mistral-7B-Instruct-v0.3
 
-**26,548 tok/s** — 14.104x over baseline
-(1,882 tok/s).
+**23,270 tok/s** — 9.108x over baseline
+(2,555 tok/s).
 
 Backend: `native-pytorch-beta3`  ·  Correctness: **verified** (trusted-grader re-measure)
-Generated: 2026-08-22T04:06:25Z
+Generated: 2026-08-22T09:21:15Z
 
 ## Winning config
 
@@ -14,15 +14,12 @@ Generated: 2026-08-22T04:06:25Z
   "weights_dtype": "bf16",
   "attn_implementation": "eager",
   "compile_mode": "compile-default",
-  "batch": 8,
-  "track": "latency",
+  "batch": 32,
+  "cp_degree": 1,
   "dp_degree": 1,
-  "cp_degree": 2,
-  "batching": "static",
   "kv_replication": 1,
-  "cores_used": 8,
-  "cores_available": 4,
-  "cc_flags": "--optlevel 3"
+  "cores_used": 4,
+  "cores_available": 4
 }
 ```
 

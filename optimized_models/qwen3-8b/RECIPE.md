@@ -1,10 +1,10 @@
-# Optimized Recipe: Qwen/Qwen3-4B
+# Optimized Recipe: Qwen/Qwen3-8B
 
-**26,548 tok/s** — 14.104x over baseline
-(1,882 tok/s).
+**16,876 tok/s** — 8.87x over baseline
+(1,903 tok/s).
 
 Backend: `native-pytorch-beta3`  ·  Correctness: **verified** (trusted-grader re-measure)
-Generated: 2026-08-22T04:06:25Z
+Generated: 2026-08-22T07:56:30Z
 
 ## Winning config
 
@@ -21,8 +21,7 @@ Generated: 2026-08-22T04:06:25Z
   "batching": "static",
   "kv_replication": 1,
   "cores_used": 8,
-  "cores_available": 4,
-  "cc_flags": "--optlevel 3"
+  "cores_available": 4
 }
 ```
 
