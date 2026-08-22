@@ -28,12 +28,14 @@ intervention:
     attn_implementation: eager
     compile_mode: compile-default
     batch: 32
-    cp_degree: 1
+    track: latency
     dp_degree: 1
+    cp_degree: 2
+    batching: static
     kv_replication: 1
-    cores_used: 4
+    cores_used: 8
     cores_available: 4
 last_reverified_sdk: 2.28.0
 evidence:
 - model: mistralai/Mistral-7B-Instruct-v0.3
-  metric: 23359.653959035993
+  metric: 23293.739009496712

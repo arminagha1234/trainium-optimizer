@@ -45,3 +45,4 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	qwen-qwen3-5-0-8b	Qwen/Qwen3.5-0.8B	hybrid_attention_causal_lm	53	6.217	8168	ok
 1	qwen-qwen3-5-2b	Qwen/Qwen3.5-2B	hybrid_attention_causal_lm	34	-	10503	TIMEOUT
 1	qwen-qwen3-8b	Qwen/Qwen3-8B	dense_causal_lm	82	8.774	4309	ok
+1	mistralai-mistral-7b-instruct-v0-3	mistralai/Mistral-7B-Instruct-v0.3	dense_causal_lm	85	8.936	5216	ok

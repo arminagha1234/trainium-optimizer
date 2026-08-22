@@ -36,4 +36,4 @@ intervention:
 last_reverified_sdk: 2.28.0
 evidence:
 - model: Qwen/Qwen2.5-0.5B-Instruct
-  metric: 74253.59734621328
+  metric: 74518.99179113703
