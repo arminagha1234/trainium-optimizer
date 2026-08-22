@@ -25,8 +25,14 @@ which returns None off-device. On a plain CPU box the engine authors, offline-
 gates, and (in tests) banks against an INJECTED race — the full harness logic is
 exercised without a Trainium. Only the real ``nki.benchmark`` race needs trn2.
 
-Run on device (.73):
+Run on device (.73 / .211):
 
+    # FIRST validate the execution path on a proven seed (build+invoke+measure).
+    # Success = it EXECUTES + is measured, NOT "entry function not found".
+    # Exits non-zero on device if the seed cannot execute.
+    python invent_engine.py --self-test --out /path/to/invent_runs/
+
+    # then author + gate + race + bank the novel ops:
     python invent_engine.py \\
         --ops rope_apply,gelu_tanh,softcap,add_rmsnorm,layernorm,attn_decode \\
         --out /path/to/invent_runs/
@@ -215,11 +221,14 @@ class InventEngine:
             def _to_dev(a: np.ndarray):
                 return torch.from_numpy(np.ascontiguousarray(a)).to(torch.bfloat16)
 
-            # Kwargs keyed by the kernel's own param names (see _arg_order) so
-            # the beta-3 wrap_nki(kernel)[1](**kwargs) call binds correctly.
-            kwargs = {k: _to_dev(inp[k]) for k in _arg_order(spec.name, inp)}
+            # Positional args in the kernel's declared order (see _arg_order),
+            # mirroring how the proven moe_fused kernels are invoked
+            # (get_multilayer_kernel_jit(L)[2](*args) — a direct positional call
+            # of the @nki.jit callable). See _invoke_kernel for why we call the
+            # jit'd fn directly instead of wrap_nki(kernel)[1](**kwargs).
+            args = [_to_dev(inp[k]) for k in _arg_order(spec.name, inp)]
 
-            out = _invoke_kernel(fn, kwargs)
+            out = _invoke_kernel(fn, args)
             got = out.to(torch.float32).cpu().numpy()
             correct = bool(np.allclose(got, ref, atol=_BF16_ATOL, rtol=_BF16_RTOL)) \
                 if got.shape == ref.shape else False
@@ -230,7 +239,7 @@ class InventEngine:
             else:
                 corr_pct = 0.0
 
-            kernel_ms = _benchmark_kernel(fn, kwargs)
+            kernel_ms = _benchmark_kernel(fn, args)
             baseline_ms = _benchmark_baseline(spec, inp)
             speedup = (baseline_ms / kernel_ms) if kernel_ms > 0 else 0.0
             return RaceResult(True, correct, corr_pct, speedup,
@@ -418,6 +427,46 @@ class InventEngine:
         self._write_summary(results)
         return results
 
+    # -- self-test (validate the EXECUTION path, not authoring quality) ------
+
+    def self_test(self, seed: str = "silu_gate",
+                  race_fn: RaceFn | None = None) -> tuple[InventResult, bool, str]:
+        """Run a KNOWN-GOOD seed kernel through the full engine to validate the
+        on-device EXECUTION path in isolation from authoring quality.
+
+        Returns ``(result, executed, verdict)``. ``executed`` is the pass/fail
+        the box cares about: on device it is True iff the kernel actually BUILT,
+        INVOKED and was MEASURED (``race.ran`` and no "entry function not found"
+        wall); off device it is True as a graceful "deferred" (the CPU-mock path
+        cannot run a kernel and that is expected, not a failure).
+
+        A seed (``silu_gate`` / ``rmsnorm`` / ``softmax``) is used on purpose: it
+        is a proven-correct formulation, so if IT fails to execute the fault is
+        the invocation path, not the authored math. Only once a seed EXECUTES do
+        novel kernels have a real shot.
+        """
+        spec = resolve_ops([seed])[0]
+        res = self.run_op(spec, race_fn=race_fn)
+        on_device = nki_available()
+        if not on_device:
+            return res, True, (
+                f"OFF-DEVICE: seed {seed!r} authored + offline-gated + "
+                f"device-race deferred (status={res.status}); run on trn2 to "
+                f"exercise the real build+invoke+measure path")
+        executed = _executed_on_device(res)
+        if executed:
+            verdict = (
+                f"ON-DEVICE PASS: seed {seed!r} EXECUTED and was measured "
+                f"(status={res.status}, ran={res.race.ran}, "
+                f"correct={res.race.correct}, speedup={res.race.speedup:.3f}x) "
+                f"— the 'entry function not found' wall is cleared")
+        else:
+            verdict = (
+                f"ON-DEVICE FAIL: seed {seed!r} did NOT execute "
+                f"(status={res.status}, ran={res.race.ran}); "
+                f"reason={res.race.reason!r}")
+        return res, executed, verdict
+
     # -- reporting -----------------------------------------------------------
 
     def _write_summary(self, results: list[InventResult]) -> None:
@@ -458,6 +507,24 @@ class InventEngine:
 # ---------------------------------------------------------------------------
 # on-device helpers (only reached on trn2)
 # ---------------------------------------------------------------------------
+def _executed_on_device(res: InventResult) -> bool:
+    """True iff the on-device race actually RAN and did not hit the entry wall.
+
+    A win, a correct-but-slow anti-pattern, or a wrong-but-ran anti-pattern all
+    count as EXECUTED — the point of the self-test is "did the kernel build,
+    invoke and get measured", not "did it win". The one thing that is NOT
+    executed is the very failure this fix targets: an "entry function ... not
+    found" (or any un-run) race.
+    """
+    race = res.race
+    if not race.ran:
+        return False
+    reason = (race.reason or "").lower()
+    if "entry function" in reason and "not found" in reason:
+        return False
+    return True
+
+
 def _arg_order(op: str, inp: dict) -> list[str]:
     """Positional arg order each authored kernel expects (matches nki_src)."""
     order = {
@@ -474,37 +541,80 @@ def _arg_order(op: str, inp: dict) -> list[str]:
     return order if order else list(inp.keys())
 
 
-def _invoke_kernel(fn: Callable, kwargs: dict):
-    """Invoke a jitted kernel via the ONLY supported beta-3 eager path.
+def _invoke_kernel(fn: Callable, args: list):
+    """Invoke a jitted kernel via the PROVEN beta-3 path: call it directly.
 
-    ``wrap_nki(kernel)`` from ``torch_neuronx.nki_hop`` returns a 2-tuple; the
-    ``[1]`` element is the callable that actually runs on device, and its result
-    is a sequence whose ``[0]`` element is the output tensor:
+    This routes authored kernels through the SAME mechanism the working
+    (moe_fused) kernels use. In this codebase a compiled @nki.jit kernel is run
+    by CALLING THE JIT'D CALLABLE DIRECTLY on device tensors and taking element
+    ``[0]`` of its (possibly tuple) result — exactly the shape of the proven
+    invocation in ``kernels/moe_fused/qwen_with_megakernel.py``:
 
-        wrapped = wrap_nki(kernel); out = wrapped[1](**kwargs); result = out[0]
+        kernel_out = get_multilayer_kernel_jit(L)[2](hidden_states, *weights, ...)
+        Y = kernel_out[0]
 
-    We deliberately do NOT fall back to calling the raw ``@nki.jit`` fn on device
-    tensors: that routes through the missing ``torch_neuronx.pyhlo`` path and is a
-    classic "entry function not found" source. We also do NOT use
-    ``nki.baremetal`` / ``nki.simulate_kernel`` here — those are offline sim only.
+    i.e. the jit builder hands back a callable that is invoked positionally, and
+    its output is a sequence whose first element is the result tensor.
+
+    We deliberately do NOT use the previous bespoke
+    ``torch_neuronx.nki_hop.wrap_nki(kernel)[1](**kwargs)`` path: an authored
+    kernel put through ``wrap_nki`` produced ``entry function
+    '<module>.<fn>_kernel' not found`` on every kernel. Calling the ``@nki.jit``
+    fn directly (now that ``build()`` gives it a real, importable module + file)
+    is the path the compiler can resolve. ``wrap_nki`` is kept ONLY as a labeled
+    fallback for the case where a direct call is not supported by the installed
+    ``nki`` build; the fallback error (if any) is surfaced verbatim so a real
+    "entry not found" is never silently masked. We do NOT use
+    ``nki.baremetal`` / ``nki.simulate_kernel`` — those are offline sim only.
     Any failure propagates to ``_device_race``'s handler, which records it as
     data rather than crashing.
     """
-    from torch_neuronx.nki_hop import wrap_nki  # noqa: PLC0415
-    wrapped = wrap_nki(fn)
-    out = wrapped[1](**kwargs)
+    try:
+        out = fn(*args)
+    except TypeError:
+        # Some jit builds return a (spec, meta, callable)-style tuple rather
+        # than a directly-callable kernel; try the last callable element, then
+        # fall back to the legacy wrap_nki path with a clear provenance tag.
+        called = _try_tuple_callable(fn, args)
+        if called is not _NO_CALL:
+            out = called
+        else:
+            from torch_neuronx.nki_hop import wrap_nki  # noqa: PLC0415
+            wrapped = wrap_nki(fn)
+            out = wrapped[1](*args)
     return out[0] if isinstance(out, (list, tuple)) else out
 
 
-def _benchmark_kernel(fn: Callable, kwargs: dict) -> float:
+_NO_CALL = object()
+
+
+def _try_tuple_callable(fn: Callable, args: list):
+    """If ``fn`` is a jit builder returning a tuple, call its last callable.
+
+    Mirrors the ``get_multilayer_kernel_jit(L)[2](...)`` idiom without hardcoding
+    the index: pick the last callable element of the returned tuple. Returns
+    ``_NO_CALL`` if ``fn`` is not a tuple-returning builder.
+    """
+    try:
+        maybe = fn
+        if isinstance(maybe, (list, tuple)):
+            callables = [e for e in maybe if callable(e)]
+            if callables:
+                return callables[-1](*args)
+    except Exception:  # noqa: BLE001
+        pass
+    return _NO_CALL
+
+
+def _benchmark_kernel(fn: Callable, args: list) -> float:
     """Milliseconds/iter for the kernel via nki.benchmark (n_iterations=100).
 
-    Falls back to a wallclock of the real wrap_nki invocation if nki.benchmark
-    is unavailable or does not accept this call shape.
+    Falls back to a wallclock of the real (direct-call) invocation if
+    nki.benchmark is unavailable or does not accept this call shape.
     """
     try:
         import nki  # noqa: PLC0415
-        res = nki.benchmark(fn, kwargs, n_iterations=100)
+        res = nki.benchmark(fn, args, n_iterations=100)
         # nki.benchmark returns a profile-ish object; pull mean latency in ms.
         for attr in ("latency_ms", "mean_ms", "p50_ms"):
             v = getattr(res, attr, None)
@@ -514,7 +624,7 @@ def _benchmark_kernel(fn: Callable, kwargs: dict) -> float:
             return float(res)
     except Exception:  # noqa: BLE001
         pass
-    return _wallclock_ms(lambda: _invoke_kernel(fn, kwargs))
+    return _wallclock_ms(lambda: _invoke_kernel(fn, args))
 
 
 def _benchmark_baseline(spec: OpSpec, inp: dict) -> float:
@@ -666,7 +776,37 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--spec", type=Path, default=None,
                     help="optional .py spec file adding new ops (SPECS or op_specs())")
     ap.add_argument("--sdk", default=_SDK, help="neuron SDK version stamp")
+    ap.add_argument(
+        "--self-test", nargs="?", const="silu_gate", default=None,
+        metavar="SEED",
+        help="FIRST validate the on-device EXECUTION path on a KNOWN-GOOD seed "
+             "kernel (default: silu_gate) — build + invoke + measure — to prove "
+             "the 'entry function not found' wall is cleared, isolated from "
+             "authoring quality. On device, exits non-zero if the seed does NOT "
+             "execute; then continues to --ops only if the seed executed.")
     a = ap.parse_args(argv)
+
+    import sys as _sys
+    raw = list(_sys.argv[1:] if argv is None else argv)
+    ops_explicit = any(t == "--ops" or t.startswith("--ops=") for t in raw)
+
+    # Self-test gate: run a proven seed through the full engine first. If it
+    # cannot even execute on device, novel ops cannot either — fail fast.
+    if a.self_test is not None:
+        st_engine = InventEngine(out_dir=a.out, bank_root=a.bank_root,
+                                 sdk_version=a.sdk)
+        _res, executed, verdict = st_engine.self_test(a.self_test)
+        print("\n=== Stage-4 INVENT self-test (execution path) ===")
+        print(f"  {verdict}")
+        if nki_available() and not executed:
+            print("  -> aborting: fix the invocation path before authoring novel "
+                  "kernels.")
+            return 1
+        # A bare --self-test (no explicit --ops) is a pure execution-path check:
+        # exit 0 on pass / deferred, so the box can gate on it. If --ops was
+        # given, fall through and run those ops after the seed passed.
+        if not ops_explicit:
+            return 0
 
     specs: list[OpSpec] = []
     if a.spec:

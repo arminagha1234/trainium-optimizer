@@ -33,6 +33,8 @@ from invent_kernels import (
     catalog,
     resolve_ops,
     static_lint,
+    _load_entry_from_file,
+    _authored_module_name,
     WRITE_NEW_OPS,
     SEED_OPS,
 )
@@ -242,6 +244,98 @@ def test_full_run_writes_ledger_and_summary(tmp_path):
     summary = json.loads((tmp_path / "invent_summary.json").read_text())
     assert summary["n_ops"] == len(WRITE_NEW_OPS)
     assert set(summary["wins"]) == set(WRITE_NEW_OPS)
+
+
+# -- file-backed loader (the "entry function not found" fix) -----------------
+# These exercise the loader MECHANISM on CPU (no nki needed): the fix is that
+# the authored kernel is a REAL, importable, file-backed module-level object
+# whose source linecache can read — that is what lets the compiler resolve the
+# entry symbol on device. We prove the CPU-testable half here.
+def _with_authored_dir(tmp_path):
+    """Point the loader's on-disk dir at tmp_path; return a restore callable.
+
+    Manual (not monkeypatch) so the standalone runner — which injects only
+    tmp_path — exercises these too.
+    """
+    import invent_kernels
+    prev = invent_kernels._AUTHORED_DIR
+    invent_kernels._AUTHORED_DIR = tmp_path
+    return lambda: setattr(invent_kernels, "_AUTHORED_DIR", prev)
+
+
+def test_file_backed_loader_returns_real_module_function(tmp_path):
+    restore = _with_authored_dir(tmp_path)
+    try:
+        src = "def my_entry(a, b):\n    return a + b\n"
+        fn = _load_entry_from_file(src, "my_entry", "adder")
+        assert callable(fn)
+        assert fn(2, 3) == 5
+        # It is a GENUINE file-backed module object: real __file__ on disk, and
+        # linecache/inspect can read its source (the property the device
+        # compiler needs to register <module>.<fn>_kernel — a synthetic
+        # exec-dict lacked it).
+        import inspect
+        assert fn.__module__.startswith("invent_authored_adder_")
+        assert Path(fn.__globals__["__file__"]).exists()
+        assert "def my_entry" in inspect.getsource(fn)
+    finally:
+        restore()
+
+
+def test_file_backed_loader_missing_entry_is_none(tmp_path):
+    restore = _with_authored_dir(tmp_path)
+    try:
+        assert _load_entry_from_file("x = 1\n", "nope", "op") is None
+        assert _load_entry_from_file("", "e", "op") is None
+    finally:
+        restore()
+
+
+def test_file_backed_loader_build_error_is_data_not_crash(tmp_path):
+    restore = _with_authored_dir(tmp_path)
+    try:
+        # A syntax error must degrade to None (recorded as "could not build"),
+        # never propagate — an un-compilable authored kernel is the common case.
+        assert _load_entry_from_file("def broken(:\n", "broken", "op") is None
+    finally:
+        restore()
+
+
+def test_authored_module_name_is_content_addressed():
+    # Different source -> different module name (so a source edit yields a fresh
+    # module/file and is never masked by Python's import cache).
+    a = _authored_module_name("silu_gate", "def k(): return 1\n")
+    b = _authored_module_name("silu_gate", "def k(): return 2\n")
+    assert a != b
+    assert a == _authored_module_name("silu_gate", "def k(): return 1\n")
+
+
+# -- self-test target (execution-path validation on a known-good seed) -------
+def test_self_test_off_device_defers_gracefully(tmp_path):
+    # Off-device (no nki), the self-test authors + offline-gates the seed and
+    # reports a graceful deferral (executed=True as "deferred", not a failure).
+    eng = InventEngine(out_dir=tmp_path)
+    res, executed, verdict = eng.self_test("silu_gate")
+    assert res.status == "device_deferred"
+    assert executed is True
+    assert "OFF-DEVICE" in verdict
+
+
+def test_self_test_flags_entry_not_found_as_non_execution(tmp_path):
+    # If a race reports the exact "entry function not found" wall, the execution
+    # classifier must NOT count it as executed (that is the failure we target).
+    from invent_engine import _executed_on_device
+    win = RaceResult(True, correct=True, correctness_pct=100.0, speedup=1.2)
+    wall = RaceResult(True, correct=False, correctness_pct=0.0, speedup=0.0,
+                      reason="device race error: entry function "
+                             "'invent_authored_silu_gate.silu_gate_kernel' not found")
+    from invent_engine import InventResult, OfflineGate
+    ok_res = InventResult("silu_gate", "s", "seed", "win",
+                          OfflineGate(True, True, 0.0), win)
+    bad_res = InventResult("silu_gate", "s", "seed", "anti_pattern",
+                           OfflineGate(True, True, 0.0), wall)
+    assert _executed_on_device(ok_res) is True
+    assert _executed_on_device(bad_res) is False
 
 
 # -- op resolution + groups --------------------------------------------------

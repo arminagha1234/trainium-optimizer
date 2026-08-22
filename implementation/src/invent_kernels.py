@@ -46,12 +46,15 @@ loss banks, so the next model does not re-derive the same dead end.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import linecache
 import os
 import re
 import sys
-import types
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -116,51 +119,112 @@ class AuthoredKernel:
     pipeline_notes: str = ""
 
     def build(self) -> Callable | None:
-        """Exec ``nki_src`` and return the jitted kernel fn — or None off-device.
+        """Import ``nki_src`` from a REAL on-disk file and return the jitted fn.
 
-        Never raises: an import error (no ``nki``) or a syntax/trace error
-        degrades to None, and the engine records "could not build" honestly
-        rather than crashing the run. This is the lazy ``_build_kernel`` gate the
-        build spec asks for.
+        Returns None off-device (no ``nki``) or on any build/trace error, so the
+        engine records "could not build" honestly rather than crashing. Never
+        raises. This is the lazy ``_build_kernel`` gate the build spec asks for.
 
-        Beta-3 eager wiring (the fix for "entry function '.<name>' not found"):
+        Beta-3 eager wiring — the fix for "entry function '<module>.<name>_kernel'
+        not found" (which hit EVERY authored kernel):
 
-          * The ``@nki.jit`` entry function MUST be a genuine MODULE-TOP-LEVEL
-            object. Exec'ing the source into a bare ``dict`` gives a function
-            whose ``__globals__`` are a throwaway namespace that is NOT in
-            ``sys.modules``; ``wrap_nki`` / the neuronx-cc lowering then cannot
-            register the entry symbol the compiler looks up by name, which is
-            exactly the "entry function not found" failure that hit ALL of the
-            authored kernels. We therefore build a real ``types.ModuleType``,
-            register it in ``sys.modules`` BEFORE exec (so the decorator captures
-            a valid ``__module__``), and exec into that module's ``__dict__``.
+          * The prior fix registered a *synthetic* ``types.ModuleType`` in
+            ``sys.modules`` and ``exec``-ed the source into it with a fake
+            ``__file__ = "<nki:op>"``. That did NOT crack it, because the NKI
+            tracer / neuronx-cc lowering re-reads the kernel's Python SOURCE (via
+            ``inspect.getsource`` / ``linecache``) to build the kernel graph and
+            to name the compiled entry ``<module>.<fn>_kernel``. A fake
+            ``<nki:op>`` filename is not on disk, so ``linecache`` returns no
+            lines and the entry symbol is never registered — the exact
+            "entry function not found" wall.
 
-          * ``NKI_ENABLE_TRACE_CACHE=0`` is forced in-process: the beta-3 trace
-            cache is shape-keyed, not body-keyed, so a stale/failed-compile
+          * FIX: write ``nki_src`` to a genuine ``.py`` file on disk and import
+            it via ``importlib`` (``spec_from_file_location`` /
+            ``module_from_spec`` — the SAME loader Python uses for any real
+            module). The ``@nki.jit`` function is then a true top-level module
+            object with a real, ``linecache``-readable ``__file__``, so the
+            tracer's source introspection succeeds and the compiler can find the
+            entry symbol. This mirrors how the proven moe_fused kernels are
+            ordinary importable module-level ``@nki.jit`` functions.
+
+          * The module name is content-addressed (``op`` + sha1 of the source)
+            so a source edit yields a FRESH module rather than being masked by
+            Python's import cache — the on-disk analogue of forcing recompile.
+
+          * ``NKI_ENABLE_TRACE_CACHE=0`` is still forced in-process: the beta-3
+            trace cache is shape-keyed, not body-keyed, so a stale/failed-compile
             artifact from before a source fix would otherwise survive and mask
-            the rebuilt kernel. Setting it here (not only in the caller) makes a
-            rebuild always recompile.
+            the rebuilt kernel.
         """
         if not nki_available():
             return None
         # Shape-keyed (not body-keyed) trace cache would resurrect a stale
         # failed-compile artifact after a source fix — disable it in-process.
         os.environ["NKI_ENABLE_TRACE_CACHE"] = "0"
-        # Register a REAL module so the @nki.jit fn is a true top-level object
-        # (module_from_spec-style) — see docstring for why a bare exec dict
-        # yields "entry function not found".
-        mod_name = f"invent_authored_{self.op}"
-        module = types.ModuleType(mod_name)
-        module.__file__ = f"<nki:{self.op}>"
+        return _load_entry_from_file(self.nki_src, self.entry, self.op)
+
+
+# ---------------------------------------------------------------------------
+# file-backed kernel loader — the beta-3 "entry function not found" fix.
+# ---------------------------------------------------------------------------
+# Authored kernels are materialized as real .py files here so importlib gives
+# them a genuine __file__ (linecache-readable), which the NKI tracer/compiler
+# needs to register the entry symbol. Kept out of the source tree (a run
+# artifact, not committed) but overridable for debugging.
+_AUTHORED_DIR = Path(
+    os.environ.get("INVENT_AUTHORED_DIR",
+                   str(Path(tempfile.gettempdir()) / "invent_authored_kernels"))
+)
+
+
+def _authored_module_name(op: str, nki_src: str) -> str:
+    """Content-addressed module name: op + short sha1 of the source.
+
+    The digest makes a source edit produce a NEW module (and a NEW on-disk
+    file), so a rebuild is never masked by Python's module import cache — the
+    on-disk analogue of the shape-keyed trace-cache disable.
+    """
+    digest = hashlib.sha1(nki_src.encode("utf-8")).hexdigest()[:12]
+    safe_op = re.sub(r"\W+", "_", op)
+    return f"invent_authored_{safe_op}_{digest}"
+
+
+def _load_entry_from_file(nki_src: str, entry: str, op: str) -> Callable | None:
+    """Write ``nki_src`` to a real .py file, import it, return the ``entry`` fn.
+
+    Returns None on empty source, a missing entry, or any import/trace error —
+    a device build failure is DATA the engine records, never a crash. Only ever
+    reached on-device (``build()`` gates on ``nki_available()``); off-device the
+    CPU-mock harness never materializes a file.
+    """
+    if not nki_src or not entry:
+        return None
+    try:
+        _AUTHORED_DIR.mkdir(parents=True, exist_ok=True)
+        mod_name = _authored_module_name(op, nki_src)
+        path = _AUTHORED_DIR / f"{mod_name}.py"
+        # Content-addressed name => path content is stable; (re)write only if
+        # absent or drifted, then refresh linecache so the tracer reads the
+        # current source lines (belt-and-suspenders after any rewrite).
+        if not path.exists() or path.read_text() != nki_src:
+            path.write_text(nki_src)
+        linecache.checkcache(str(path))
+        spec = importlib.util.spec_from_file_location(mod_name, str(path))
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        # Register BEFORE exec so the @nki.jit decorator captures a valid, real
+        # __module__ (and the compiler can resolve <module>.<fn>_kernel).
         sys.modules[mod_name] = module
         try:
-            exec(compile(self.nki_src, f"<nki:{self.op}>", "exec"),
-                 module.__dict__)
+            spec.loader.exec_module(module)
         except Exception:  # noqa: BLE001 — device build failures are data, not crashes
             sys.modules.pop(mod_name, None)
             return None
-        fn = module.__dict__.get(self.entry)
-        return fn if callable(fn) else None
+    except Exception:  # noqa: BLE001 — filesystem / import wiring failure, also data
+        return None
+    fn = getattr(module, entry, None)
+    return fn if callable(fn) else None
 
 
 # ---------------------------------------------------------------------------
