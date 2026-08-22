@@ -14,7 +14,8 @@ The loop, per op (see ../../docs/stage4-invent-design.md):
       -> author_kernel(op_spec) -> AuthoredKernel        (the headline: novel authoring)
       -> OFFLINE gate:   numpy-ref parity @128x128  +  static NKI lint
       -> ON-DEVICE gate: correctness (allclose vs ref, real shape)
-                         + speed race (nki.benchmark vs baseline)
+                         + speed race (FAIR: kernel and baseline timed by the
+                           SAME method on the SAME device, else device_deferred)
       -> keep ONLY if correct AND faster by >= 5% invention margin
       -> bank:  win  -> `invented` NKI_KERNEL lesson (keyed op+arch+shape-class)
                 loss -> `anti_pattern` lesson (correct-but-slow, or wrong, or
@@ -89,10 +90,19 @@ _SDK = "2.28.0"
 @dataclass
 class OfflineGate:
     passed: bool
-    parity_ok: bool
+    parity_ok: bool                # True ONLY when an INDEPENDENT re-derivation
+                                   # matched the reference — never set by a
+                                   # function-compared-to-itself tautology.
     parity_max_abs_err: float
     lint_violations: list[str] = field(default_factory=list)
     reason: str = ""
+    # Did the recipe supply a numpy_impl that is a genuinely DIFFERENT expression
+    # than spec.reference? When False (the recipe reuses spec.reference verbatim),
+    # the offline parity comparison is a tautology (f vs f) and validates nothing,
+    # so ``parity_ok`` is forced False and the math is left to the on-device gate.
+    # Kept as the LAST field with a default so existing positional constructions
+    # (incl. tests) are unaffected.
+    parity_independent: bool = True
 
 
 @dataclass
@@ -166,27 +176,57 @@ class InventEngine:
         if not author.nki_src or not author.entry:
             return OfflineGate(False, False, float("inf"),
                                reason="no authored kernel source (no recipe)")
-        # (1) numpy parity at 128x128.
+        # (1) numpy parity at 128x128 — but a parity check only MEANS something
+        # when the kernel's numpy_impl is an INDEPENDENT re-derivation of the
+        # reference. Most catalog recipes (all but rope_apply) reuse
+        # ``spec.reference`` verbatim as their numpy_impl, so ``numpy_impl(inp)``
+        # vs ``reference(inp)`` compares a function to ITSELF — a tautology that
+        # trivially passes and validates nothing. We detect that by identity and
+        # refuse to report it as a parity PASS. The op is NOT rejected: we still
+        # execute the impl once (a real smoke check — it runs, it produces the
+        # reference's shape) and defer the actual math check to the on-device
+        # gate (allclose vs the reference on the REAL shape), which is the true
+        # correctness test for these ops.
+        independent = author.numpy_impl is not spec.reference
         inp = spec.offline_inputs()
         try:
             got = np.asarray(author.numpy_impl(inp), dtype=np.float32)
             ref = np.asarray(spec.reference(inp), dtype=np.float32)
-            max_err = float(np.max(np.abs(got - ref))) if got.shape == ref.shape \
-                else float("inf")
-            parity_ok = (got.shape == ref.shape) and np.allclose(
-                got, ref, atol=_OFFLINE_ATOL, rtol=_OFFLINE_RTOL)
         except Exception as e:  # noqa: BLE001 — a math bug is a gate failure, not a crash
             return OfflineGate(False, False, float("inf"),
+                               parity_independent=independent,
                                reason=f"numpy_impl raised: {e!r}")
+        shape_ok = got.shape == ref.shape
+        if independent:
+            max_err = float(np.max(np.abs(got - ref))) if shape_ok else float("inf")
+            parity_ok = shape_ok and np.allclose(
+                got, ref, atol=_OFFLINE_ATOL, rtol=_OFFLINE_RTOL)
+        else:
+            # Tautological comparison — do NOT claim a verified parity pass. The
+            # smoke run above still guarantees the impl executes and is shaped
+            # like the reference; that is all the offline stage honestly checked.
+            max_err = 0.0 if shape_ok else float("inf")
+            parity_ok = False
         # (2) static lint.
         violations = static_lint(author.nki_src)
-        passed = parity_ok and not violations
+        # Device time is gated on: lint clean AND the impl ran with the right
+        # shape AND (only when an independent check exists) that check passed. A
+        # tautological-parity op still advances to the REAL on-device gate — we
+        # simply never pretend an offline parity pass occurred.
+        passed = (not violations) and shape_ok and (parity_ok if independent else True)
         reason = ""
-        if not parity_ok:
+        if not shape_ok:
+            reason = "numpy_impl shape != reference shape"
+        elif independent and not parity_ok:
             reason = f"numpy parity fail (max_abs_err={max_err:.3e})"
         elif violations:
             reason = f"lint: {'; '.join(violations)}"
-        return OfflineGate(passed, parity_ok, max_err, violations, reason)
+        elif not independent:
+            # Passing, but be explicit in the record about what was NOT verified.
+            reason = ("parity NOT independently verified: numpy_impl is "
+                      "spec.reference (tautology) — math deferred to on-device gate")
+        return OfflineGate(passed, parity_ok, max_err, violations, reason,
+                           parity_independent=independent)
 
     # -- on-device race ------------------------------------------------------
 
@@ -210,6 +250,19 @@ class InventEngine:
                 "kernel not built (off-device: no nki) — on-device race deferred"
                 if not nki_available() else
                 "kernel failed to build/trace on device"))
+        # A speed race is only meaningful when BOTH contenders are measured the
+        # SAME way on the SAME device. Establish the Neuron device handle up
+        # front: if we cannot (no torch_xla / not really on a device), then we
+        # can only wallclock the torch baseline on CPU while the kernel runs on
+        # device — a physically meaningless CPU-vs-device ratio biased toward the
+        # kernel. Rather than fabricate that "win", we DEFER (ran=False), exactly
+        # as we do when the kernel cannot build. Honesty over a banked artifact.
+        device = _neuron_device()
+        if device is None:
+            return RaceResult(False, reason=(
+                "kernel built but no Neuron device handle for a fair "
+                "same-device, same-method race — deferred (never a "
+                "CPU-baseline-vs-device-kernel speedup)"))
         try:
             import torch  # noqa: PLC0415 — device-only import
             import nki      # noqa: PLC0415
@@ -219,7 +272,10 @@ class InventEngine:
             ref = np.asarray(spec.reference(inp), dtype=np.float32)
 
             def _to_dev(a: np.ndarray):
-                return torch.from_numpy(np.ascontiguousarray(a)).to(torch.bfloat16)
+                # Move onto the SAME device the kernel runs on — the baseline is
+                # compared against the kernel there, not on the host.
+                return (torch.from_numpy(np.ascontiguousarray(a))
+                        .to(torch.bfloat16).to(device))
 
             # Positional args in the kernel's declared order (see _arg_order),
             # mirroring how the proven moe_fused kernels are invoked
@@ -239,9 +295,29 @@ class InventEngine:
             else:
                 corr_pct = 0.0
 
-            kernel_ms = _benchmark_kernel(fn, args)
-            baseline_ms = _benchmark_baseline(spec, inp)
-            speedup = (baseline_ms / kernel_ms) if kernel_ms > 0 else 0.0
+            # FAIR race: time BOTH the authored kernel AND the torch baseline
+            # with the SAME synchronized on-device wallclock, on tensors resident
+            # on the SAME device. (We use on-device wallclock for both rather
+            # than nki.benchmark, because nki.benchmark can only time an nki
+            # kernel — not the torch-eager baseline — so it cannot be applied
+            # symmetrically. Symmetry is the whole point.)
+            def _run_kernel():
+                _invoke_kernel(fn, args)
+
+            def _run_baseline():
+                with torch.no_grad():
+                    _torch_baseline(spec.name, inp, device=device)
+
+            kernel_ms = _device_timed_ms(_run_kernel, device)
+            baseline_ms = _device_timed_ms(_run_baseline, device)
+            speedup = _fair_speedup(kernel_ms, baseline_ms,
+                                    "wallclock@device", "wallclock@device")
+            if speedup is None:
+                # Timings were not comparable (non-positive / not same-method
+                # same-device) — defer instead of banking a meaningless ratio.
+                return RaceResult(False, reason=(
+                    f"fair on-device timing failed (kernel={kernel_ms:.3f}ms, "
+                    f"baseline={baseline_ms:.3f}ms) — deferred"))
             return RaceResult(True, correct, corr_pct, speedup,
                               kernel_ms, baseline_ms,
                               reason=f"correct={correct} speedup={speedup:.3f}x")
@@ -487,8 +563,13 @@ class InventEngine:
                     "op": r.op, "shape_class": r.shape_class, "origin": r.origin,
                     "status": r.status, "lesson_id": r.lesson_id,
                     "offline_passed": r.offline.passed,
+                    # Only report a parity error number when it was an INDEPENDENT
+                    # check; a tautological (numpy_impl is reference) comparison
+                    # verified no math, so its "0.0" would be misleading -> null.
+                    "offline_parity_independent": r.offline.parity_independent,
                     "offline_parity_max_abs_err": (
-                        None if r.offline.parity_max_abs_err == float("inf")
+                        None if (not r.offline.parity_independent
+                                 or r.offline.parity_max_abs_err == float("inf"))
                         else r.offline.parity_max_abs_err),
                     "offline_lint": r.offline.lint_violations,
                     "race_ran": r.race.ran,
@@ -606,47 +687,86 @@ def _try_tuple_callable(fn: Callable, args: list):
     return _NO_CALL
 
 
-def _benchmark_kernel(fn: Callable, args: list) -> float:
-    """Milliseconds/iter for the kernel via nki.benchmark (n_iterations=100).
+def _neuron_device():
+    """Return the torch_xla Neuron device handle, or None if unavailable.
 
-    Falls back to a wallclock of the real (direct-call) invocation if
-    nki.benchmark is unavailable or does not accept this call shape.
+    None is the honest "we are not really on a device" signal: without a device
+    handle we cannot place the torch baseline on the SAME device the kernel runs
+    on, so a fair race is impossible and the caller must defer rather than
+    compare a CPU wallclock to a device latency. Off-device this simply returns
+    None (no torch_xla); the CPU-mock harness never reaches here because
+    ``build()`` already returned None.
     """
     try:
-        import nki  # noqa: PLC0415
-        res = nki.benchmark(fn, args, n_iterations=100)
-        # nki.benchmark returns a profile-ish object; pull mean latency in ms.
-        for attr in ("latency_ms", "mean_ms", "p50_ms"):
-            v = getattr(res, attr, None)
-            if isinstance(v, (int, float)):
-                return float(v)
-        if isinstance(res, (int, float)):
-            return float(res)
-    except Exception:  # noqa: BLE001
-        pass
-    return _wallclock_ms(lambda: _invoke_kernel(fn, args))
+        import torch_xla.core.xla_model as xm  # noqa: PLC0415
+        return xm.xla_device()
+    except Exception:  # noqa: BLE001 — no torch_xla / no device is just "defer"
+        return None
 
 
-def _benchmark_baseline(spec: OpSpec, inp: dict) -> float:
-    """Milliseconds/iter for the torch-eager baseline on the real shape."""
+def _device_timed_ms(run: Callable, device, iters: int = 100,
+                      warmup: int = 5) -> float:
+    """Synchronized on-device wallclock, ms/iter — the SAME method used for BOTH
+    the authored kernel and the torch baseline so the ratio is apples-to-apples.
+
+    The per-batch ``mark_step`` + ``wait_device_ops`` is what turns an on-device
+    wallclock into a real device-latency measurement rather than async-dispatch
+    noise: without the barrier the enqueue returns immediately and we would be
+    timing Python dispatch, not the device. Returns 0.0 on any failure so the
+    caller's ``_fair_speedup`` guard turns a broken measurement into a defer.
+    """
     try:
-        import torch  # noqa: PLC0415
+        import torch_xla.core.xla_model as xm  # noqa: PLC0415
 
-        def run():
-            with torch.no_grad():
-                _torch_baseline(spec.name, inp)
-        return _wallclock_ms(run)
-    except Exception:  # noqa: BLE001
+        for _ in range(warmup):
+            run()
+        xm.mark_step()
+        xm.wait_device_ops()
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            run()
+        xm.mark_step()
+        xm.wait_device_ops()
+        return (time.perf_counter() - t0) / iters * 1000.0
+    except Exception:  # noqa: BLE001 — a failed measurement must not fabricate a number
         return 0.0
 
 
-def _torch_baseline(op: str, inp: dict):
-    """Torch-eager reference the kernel must beat. Mirrors the numpy reference."""
+def _fair_speedup(kernel_ms: float, baseline_ms: float,
+                  kernel_timing: str, baseline_timing: str) -> float | None:
+    """Speedup = baseline/kernel, but ONLY when the two measurements are
+    comparable. Returns None otherwise, forcing the caller to device_deferred.
+
+    Comparable means: measured by the SAME method AND both taken ON the device
+    (label convention ``"<method>@device"``). This is the guard against the
+    exact pre-fix bug — kernel timed by ``nki.benchmark`` DEVICE latency while
+    the baseline was a CPU (``@cpu``) wallclock — which produced a physically
+    meaningless ratio biased toward the kernel and could bank a FALSE win. A
+    non-positive timing is likewise not a real measurement and yields None.
+    """
+    if kernel_timing != baseline_timing:
+        return None
+    if not kernel_timing.endswith("@device"):
+        return None
+    if kernel_ms <= 0.0 or baseline_ms <= 0.0:
+        return None
+    return baseline_ms / kernel_ms
+
+
+def _torch_baseline(op: str, inp: dict, device=None):
+    """Torch-eager reference the kernel must beat. Mirrors the numpy reference.
+
+    ``device`` (a torch_xla Neuron device) is REQUIRED for a fair race: the
+    baseline tensors are placed on the same device the kernel runs on so both
+    sides are timed on-device. It defaults to None only for callers that want
+    the pure host computation.
+    """
     import torch  # noqa: PLC0415
     import torch.nn.functional as F  # noqa: PLC0415
 
     def t(name):
-        return torch.from_numpy(np.ascontiguousarray(inp[name])).to(torch.bfloat16)
+        x = torch.from_numpy(np.ascontiguousarray(inp[name])).to(torch.bfloat16)
+        return x.to(device) if device is not None else x
 
     if op == "rope_apply":
         x, cos, sin = t("x"), t("cos"), t("sin")
@@ -685,15 +805,6 @@ def _torch_baseline(op: str, inp: dict):
     if op == "softmax":
         return torch.softmax(t("x"), dim=-1)
     raise KeyError(op)
-
-
-def _wallclock_ms(fn: Callable, iters: int = 100, warmup: int = 5) -> float:
-    for _ in range(warmup):
-        fn()
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        fn()
-    return (time.perf_counter() - t0) / iters * 1000.0
 
 
 def _minor_glob(sdk: str) -> str:
