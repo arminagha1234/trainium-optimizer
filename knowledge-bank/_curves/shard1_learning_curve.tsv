@@ -6,3 +6,4 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	microsoft-phi-3-5-mini-instruct	microsoft/Phi-3.5-mini-instruct	dense_causal_lm	26	0.000	447	ok
 1	huggingfacetb-smollm2-1-7b-instruct	HuggingFaceTB/SmolLM2-1.7B-Instruct	dense_causal_lm	87	12.697	4757	ok
 1	qwen-qwen3-32b	Qwen/Qwen3-32B	dense_causal_lm	35	-	5400	TIMEOUT
+1	google-gemma-2-9b	google/gemma-2-9b	dense_causal_lm	41	-	5400	TIMEOUT
