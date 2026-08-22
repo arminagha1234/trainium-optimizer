@@ -40,6 +40,18 @@ from ledger import (
 from proposer import BeamProposer, Candidate
 
 
+class NoBaselineError(RuntimeError):
+    """Raised when Stage 0 cannot establish a baseline (the worker crashed or
+    produced 0 throughput). The optimization run is void: there is no incumbent
+    and no equivalence reference, so every later stage would be meaningless.
+
+    optimize_one_model() catches this and reports the model as FAILED (never as
+    a benign "ok, 0.000" row). The distinct type lets callers that legitimately
+    tolerate a missing baseline (e.g. bank_hygiene's canary re-measure) classify
+    it as a transient crash instead of a demotion signal.
+    """
+
+
 @dataclass
 class ModelSpec:
     """What the optimizer needs to know about the target model."""
@@ -106,11 +118,30 @@ class Orchestrator:
         artifact = self.backend.build_baseline(spec.model_id)
         neff = self.backend.compile(artifact)
         m = self.backend.measure(neff, spec.probe_shape, spec.probe_batch)
+        base = Candidate(config=artifact.config, provenance="baseline",
+                         layer=Layer.NONE, metric=m.metric)
+
+        # HONESTY GATE: a baseline whose worker CRASHED (no result file) or
+        # produced 0 throughput is NOT a valid incumbent — it never ran. Record
+        # it as FAIL_NO_BASELINE (not KEEP with a benign 0) and abort the run, so
+        # a crash surfaces as FAILED rather than "ok, 0.000". This is what makes
+        # a crashed MoE baseline honest: the int64-topk crash used to slip
+        # through here as metric=0/status=keep. (See ledger.Status.FAIL_NO_BASELINE.)
+        if m.metric <= 0.0:
+            self._record(base, Stage.BASELINE, Origin.NONE, Layer.NONE, source="",
+                         metric=0.0, correctness=0.0,
+                         compile_s=neff.compile_seconds,
+                         status=Status.FAIL_NO_BASELINE,
+                         desc="FAIL_NO_BASELINE: baseline worker produced no "
+                              "throughput (crash / 0 tok/s) — run is void")
+            raise NoBaselineError(
+                f"FAIL_NO_BASELINE: {spec.model_id} baseline produced no "
+                f"throughput (metric={m.metric}); the worker crashed or "
+                f"returned 0 tok/s, so there is no incumbent to optimize.")
+
         # Capture the baseline's top-1 token signature — this IS the correctness
         # reference every later candidate is gated against.
         self._baseline_tokens = list(getattr(m, "top1_tokens", []) or [])
-        base = Candidate(config=artifact.config, provenance="baseline",
-                         layer=Layer.NONE, metric=m.metric)
         self._record(base, Stage.BASELINE, Origin.NONE, Layer.NONE, source="",
                      metric=m.metric, correctness=100.0,
                      compile_s=neff.compile_seconds, status=Status.KEEP,

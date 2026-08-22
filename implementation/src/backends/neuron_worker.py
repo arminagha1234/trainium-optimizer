@@ -374,6 +374,28 @@ def main() -> None:
         per_rank_gb = (params * dtb / a.tp) / 1e9
         if per_rank_gb > 10.0:
             _shard_vocab(model, mesh, _log)
+    # BASELINE UNBLOCK (MoE family): HF's generic MoE routing groups routed
+    # token/expert pairs with `torch.sort(expert_ids)` (int64) — which lowers to
+    # the AwsNeuronTopK custom-op and CRASHES ("does not support 32/64-bit
+    # integer types", moe.py:393). Install a dtype-safe torch.{topk,sort,argsort}
+    # so integer inputs route through float32 (order-preserving for expert ids)
+    # and never reach AwsNeuronTopK as integers. Gated to MoE arches so dense
+    # models are untouched; runs for the BASELINE too (independent of the
+    # Stage-3 --moe-kernel borrow). See backends/moe_router_patch.py.
+    try:
+        try:
+            from kernels.moe_fused import is_moe_arch
+            from backends.moe_router_patch import install_neuron_safe_moe_topk
+        except Exception:  # noqa: BLE001
+            import os as _os, sys as _sys
+            _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+            from kernels.moe_fused import is_moe_arch
+            from backends.moe_router_patch import install_neuron_safe_moe_topk
+        if is_moe_arch(tcfg):
+            install_neuron_safe_moe_topk(_log)
+    except Exception as e:  # noqa: BLE001 — never let the unblock crash a run
+        _log(f"moe-router-patch: skipped ({e!r})")
+
     # Stage-3 BORROW: optionally swap the HF MoE block forward with the vendored
     # fused NKI megakernel. The adapter runs a full precondition gauntlet (arch,
     # exact A3B/TP4 dims, nkilib availability) and NEVER raises — on any unmet
