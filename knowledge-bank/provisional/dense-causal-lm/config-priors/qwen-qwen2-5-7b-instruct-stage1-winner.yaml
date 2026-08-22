@@ -28,14 +28,12 @@ intervention:
     attn_implementation: eager
     compile_mode: eager
     batch: 8
-    track: latency
+    cp_degree: 1
     dp_degree: 1
-    cp_degree: 2
-    batching: static
     kv_replication: 1
-    cores_used: 8
+    cores_used: 4
     cores_available: 4
 last_reverified_sdk: 2.28.0
 evidence:
 - model: Qwen/Qwen2.5-7B-Instruct
-  metric: 9890.882347116192
+  metric: 9869.594084862496
