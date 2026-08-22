@@ -1,0 +1,144 @@
+"""kernel_rewrites.py — a SYMPTOM-indexed catalog of known compiler-hostile ops
+and the cheap graph rewrite that fixes each. Tried BEFORE writing an NKI kernel.
+
+Philosophy (Harvest -> Borrow -> Invent): most "unsupported on Neuron" failures
+are ONE hostile op away from compiling. neuronx-cc rejects a specific ISA
+instruction — a runtime affine-select emitted by ``torch.tril()``, an int64
+top-k, a dynamic slice — and the fix is a pure GRAPH REWRITE, not a kernel. This
+catalog maps a compiler ERROR SIGNATURE (and/or the offending op) to that
+rewrite, so the invent/repair loop can:
+
+    1. read a real compile-error log,
+    2. look up the known fix BY SYMPTOM,
+    3. apply/suggest it before spending a compile on an authored kernel.
+
+Indexing by SYMPTOM (the error), not just by intervention, is the ADIAS lesson:
+the same fix is reused across every model that trips the same instruction, and a
+new failure with a matching signature is fixed instantly the next time.
+
+The seed entries are grounded in REAL, on-device-captured failures (not guesses):
+  * ``tril-to-const-mask`` — TensorScalarAffineSelect (s2d2_ts_as_valid_elem_count)
+    from ``torch.tril()``/``.triu()`` at Qwen3-Next GatedDeltaNet scale. Compiler-
+    only repro on trn2 (neuronx-cc 2.27.5334) went from exit-70 ISA-fail to
+    "Compiler status PASS" after this rewrite — NO NKI kernel required.
+  * ``int64-topk-to-float-view`` — AwsNeuronTopK rejecting an int64 top-k/sort in
+    MoE routing. Route the integer key through a float32 view.
+
+Every rewrite is a hypothesis with EVIDENCE and a confidence; the repair loop
+still verifies by re-compiling. A catalog entry is a lead, not a guarantee.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class Rewrite:
+    """One known compiler-hostile pattern and the graph rewrite that fixes it."""
+
+    name: str
+    summary: str                          # one line: what to do
+    # Substrings that identify THIS failure in a neuronx-cc log. Specific on
+    # purpose — a generic instruction name shared by several failures is NOT a
+    # good signature (it would mis-route). Case-sensitive (compiler tokens are).
+    error_signatures: tuple[str, ...]
+    hostile_ops: tuple[str, ...]          # aten/HLO op names that emit the pattern
+    fix: str                              # the concrete transform (guidance/snippet)
+    applies_at: str = "model-graph"       # "model-graph" | "nki-kernel"
+    confidence: str = "medium"            # "high" once re-compile-verified in the wild
+    evidence: str = ""                    # where it was observed
+
+
+# The catalog. Ordered most-specific first. Extend as new hostile ops are hit —
+# each production failure that a rewrite fixes should land here so the class is
+# fixed instantly next time (the compounding the framework is built on).
+REWRITES: tuple[Rewrite, ...] = (
+    Rewrite(
+        name="tril-to-const-mask",
+        summary="Replace a runtime .tril()/.triu() with a host-materialized "
+                "constant triangular mask + elementwise multiply.",
+        error_signatures=(
+            "s2d2_ts_as_valid_elem_count",   # the exact ISA assertion that fails
+            "aten__tril_select",
+            "aten__triu",
+        ),
+        hostile_ops=("aten::tril", "aten::triu", "tril", "triu"),
+        fix=(
+            "tri = torch.tril(torch.ones(C, C, device=dev))      # folds to a literal\n"
+            "masked = x * tri                                     # was x.tril()\n"
+            "strict_lower = x * torch.tril(torch.ones(C, C), -1)  # was masked_fill(triu(0),0)\n"
+            "# A runtime .tril lowers to TensorScalarAffineSelect, which fails ISA\n"
+            "# validation once num_heads*num_chunks pushes the partition count up.\n"
+            "# A constant mask constant-folds to a plain TensorTensor multiply."
+        ),
+        applies_at="model-graph",
+        confidence="high",
+        evidence="Qwen3-Next GatedDeltaNet modeling_qwen3_next.py:418 (seq>=512, "
+                 "num_v_heads=32); trn2 neuronx-cc 2.27.5334 exit-70 -> PASS after fix.",
+    ),
+    Rewrite(
+        name="int64-topk-to-float-view",
+        summary="Route an integer top-k/sort/argsort through a float32 view "
+                "(AwsNeuronTopK rejects int64 keys).",
+        error_signatures=("AwsNeuronTopK",),
+        hostile_ops=("aten::topk", "aten::sort", "aten::argsort", "topk", "sort"),
+        fix=(
+            "# The reject is dtype, not algorithm: sort/topk keys arrive int64.\n"
+            "idx = torch.topk(scores.float(), k).indices   # view keys as fp32\n"
+            "# For expert routing, cast the routing ids through float32 before the\n"
+            "# grouped topk/sort, then back to long for the gather."
+        ),
+        applies_at="model-graph",
+        confidence="medium",
+        evidence="HF transformers/integrations/moe.py grouped-experts torch.sort "
+                 "on int64 expert_ids -> AwsNeuronTopK reject (MoE routing).",
+    ),
+    Rewrite(
+        name="dynamic-slice-to-static-bucket",
+        summary="Replace a data-dependent (dynamic) slice length with a static, "
+                "bucketed shape padded on the host.",
+        error_signatures=("dynamic-update-slice", "DynamicUpdateSlice",
+                          "dynamic_slice", "non-constant"),
+        hostile_ops=("aten::slice_scatter", "dynamic_slice", "dynamic_update_slice"),
+        fix=(
+            "# Neuron wants static shapes (C8: host dispatch, single-shape kernel).\n"
+            "# Pad the sequence/KV to a fixed BUCKET on the host, run the static\n"
+            "# shape, drop the padded tail. (Same contract mamba2_ssd_prefill uses.)\n"
+            "# NOTE: dynamic-update-slice OFTEN compiles fine on trn2; only reach\n"
+            "# for this when the log actually names it as the reject."
+        ),
+        applies_at="model-graph",
+        confidence="low",
+        evidence="General static-shape guardrail; unverified against a specific "
+                 "captured reject (kept low-confidence until re-compile-verified).",
+    ),
+)
+
+
+def match_error(error_log: str) -> list[Rewrite]:
+    """Rewrites whose error signature appears in a neuronx-cc log. Most-specific
+    (catalog-order) first. Signatures are case-sensitive on purpose — compiler
+    instruction/assertion tokens are exact — so a generic word never mis-routes."""
+    if not error_log:
+        return []
+    return [r for r in REWRITES
+            if any(sig in error_log for sig in r.error_signatures)]
+
+
+def match_ops(op_names) -> list[Rewrite]:
+    """Rewrites whose hostile op appears in a set/list of op names (from a graph
+    inspection). A cheaper, pre-compile lead than a full error log."""
+    names = list(op_names or [])
+    hits: list[Rewrite] = []
+    for r in REWRITES:
+        if any(op == n or op in n for op in r.hostile_ops for n in names):
+            hits.append(r)
+    return hits
+
+
+def describe(rewrites: list[Rewrite]) -> str:
+    """A compact, actionable summary for a ledger row / lesson / author feedback."""
+    if not rewrites:
+        return "no known rewrite matched this failure"
+    return "; ".join(f"{r.name}: {r.summary}" for r in rewrites)
