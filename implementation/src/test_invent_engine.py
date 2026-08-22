@@ -70,16 +70,54 @@ def test_author_kernel_all_write_new_have_source():
         assert a.origin == "invented"
 
 
-def test_offline_parity_passes_for_every_catalog_op(tmp_path):
+def test_offline_gate_passes_for_every_catalog_op(tmp_path):
+    # Every catalog op must clear the offline gate (lint clean + impl runs at the
+    # right shape) so it is eligible for the on-device race. NOTE (BUG #4 fix):
+    # ``parity_ok`` is NOT asserted for every op anymore — it is only a MEANINGFUL
+    # pass when the recipe supplies an INDEPENDENT numpy_impl. All catalog ops but
+    # rope_apply reuse spec.reference as their numpy_impl, so their offline
+    # "parity" was a function-compared-to-itself tautology; the gate now reports
+    # those as parity_independent=False / parity_ok=False (verified nothing) while
+    # still passing them through to the real device gate. See the dedicated
+    # tautology test below.
     eng = InventEngine(out_dir=tmp_path)
     for name, spec in catalog().items():
         author = author_kernel(spec)
         gate = eng.offline_gate(author, spec)
-        assert gate.parity_ok, (
-            f"{name} numpy_impl disagrees with reference "
-            f"(max_abs_err={gate.parity_max_abs_err:.3e})")
         assert not gate.lint_violations, f"{name} lint: {gate.lint_violations}"
-        assert gate.passed
+        assert gate.passed, f"{name} should be eligible for the device race"
+        if gate.parity_independent:
+            # rope_apply — the one op with a genuine re-derivation — must match.
+            assert gate.parity_ok, (
+                f"{name} numpy_impl disagrees with reference "
+                f"(max_abs_err={gate.parity_max_abs_err:.3e})")
+        else:
+            # Tautological comparison: must NOT be counted as a parity pass.
+            assert not gate.parity_ok, (
+                f"{name} numpy_impl is spec.reference — a tautology must not be "
+                f"reported as a parity pass")
+
+
+def test_tautological_numpy_impl_is_not_counted_as_parity_pass(tmp_path):
+    # BUG #4 regression. For the ops whose recipe reuses spec.reference as
+    # numpy_impl, the offline "parity" compared a function to ITSELF: always
+    # passing, validating nothing. The gate must now report those as NOT
+    # independently verified (parity_independent False, parity_ok False) while
+    # still letting the op through to the REAL on-device gate (passed True).
+    # Only rope_apply carries a genuinely independent re-derivation.
+    eng = InventEngine(out_dir=tmp_path)
+    cat = catalog()
+
+    g_soft = eng.offline_gate(author_kernel(cat["softcap"]), cat["softcap"])
+    assert g_soft.parity_independent is False
+    assert g_soft.parity_ok is False        # tautology is NOT a claimed pass
+    assert g_soft.passed is True            # still eligible for the device gate
+    assert "tautology" in g_soft.reason
+
+    g_rope = eng.offline_gate(author_kernel(cat["rope_apply"]), cat["rope_apply"])
+    assert g_rope.parity_independent is True
+    assert g_rope.parity_ok is True         # genuine independent check passed
+    assert g_rope.passed is True
 
 
 def test_rope_impl_is_scatter_free_but_matches_reference():
@@ -223,6 +261,42 @@ def test_device_deferred_on_cpu(tmp_path):
     assert res.status == "device_deferred"
     assert res.offline.passed
     assert res.lesson_id == ""
+
+
+# -- BUG #3 regression: the on-device speed race must be FAIR ----------------
+def test_fair_speedup_rejects_mismatched_timing():
+    # The core of BUG #3: a speedup may only be computed from two measurements
+    # taken by the SAME method on the SAME device. Anything else must return None
+    # so the race defers instead of banking a physically meaningless ratio.
+    from invent_engine import _fair_speedup
+
+    # The exact pre-fix bug: kernel timed by nki.benchmark DEVICE latency vs a
+    # baseline timed by a CPU wallclock -> not comparable.
+    assert _fair_speedup(0.70, 0.91, "nki.benchmark@device", "wallclock@cpu") is None
+    # Same method but the baseline is still on CPU -> not comparable.
+    assert _fair_speedup(0.70, 0.91, "wallclock@device", "wallclock@cpu") is None
+    # A non-positive timing is not a real measurement.
+    assert _fair_speedup(0.0, 0.91, "wallclock@device", "wallclock@device") is None
+    # ONLY a same-method, same-(on-)device pair yields a real speedup.
+    s = _fair_speedup(0.70, 0.91, "wallclock@device", "wallclock@device")
+    assert s is not None and abs(s - 0.91 / 0.70) < 1e-9
+
+
+def test_unfair_race_defers_and_cannot_bank_a_win(tmp_path):
+    # End-to-end honesty (BUG #3): when a fair on-device comparison cannot be
+    # established the race defers (ran=False) and run_op records device_deferred
+    # — never a banked NKI_KERNEL win. This is what _device_race now does when it
+    # has no Neuron device handle to run the baseline on the same device.
+    def _unfair_defers(_a, _s):
+        return RaceResult(False, reason="fair same-device timing unavailable")
+
+    eng = InventEngine(out_dir=tmp_path)
+    res = eng.run_op(catalog()["softcap"], race_fn=_unfair_defers)
+    assert res.status == "device_deferred"
+    assert res.lesson_id == ""
+    lessons = KnowledgeBank(tmp_path / "knowledge-bank").load_all(Tier.PROVISIONAL)
+    assert not [l for l in lessons if l.type is LessonType.NKI_KERNEL], (
+        "a deferred (unfair) race must never bank an NKI_KERNEL win")
 
 
 def test_full_run_writes_ledger_and_summary(tmp_path):
