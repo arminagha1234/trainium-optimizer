@@ -25,7 +25,7 @@ intervention:
   spec:
     tp_degree: 4
     weights_dtype: bf16
-    attn_implementation: eager
+    attn_implementation: sdpa
     compile_mode: compile-default
     batch: 8
     cp_degree: 1
@@ -36,4 +36,4 @@ intervention:
 last_reverified_sdk: 2.28.0
 evidence:
 - model: Qwen/Qwen3-0.6B
-  metric: 85251.0119739382
+  metric: 87017.30069062278

@@ -26,9 +26,14 @@ intervention:
     tp_degree: 1
     weights_dtype: bf16
     attn_implementation: eager
-    compile_mode: eager
+    compile_mode: compile-default
     batch: 1
+    cp_degree: 1
+    dp_degree: 4
+    kv_replication: 1
+    cores_used: 4
+    cores_available: 4
 last_reverified_sdk: 2.28.0
 evidence:
 - model: allenai/OLMoE-1B-7B-0924
-  metric: 0.0
+  metric: 3083.1991259297224
