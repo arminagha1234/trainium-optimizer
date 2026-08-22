@@ -24,7 +24,7 @@ one paragraph:
 Live and running on **two `trn2.3xlarge` boxes in parallel**, pooling one knowledge bank.
 
 - **Verified wins on real hardware** (native-pytorch-beta3, correctness-gated): Qwen3-0.6B **~28×**, Qwen2.5-0.5B **15.4×**, Qwen3-4B **~13×**, Qwen2.5-3B **12.4×** (see leaderboard). Dominant lever: Stage-1 config search — `torch.compile(backend="neuron")`, TP=4, bf16, batching.
-- **Full pipeline runs per model**: Stage 0 baseline → 1 config → 2 known-kernel → 3 borrow → 5 graph-rewrite → 6 profile-loop.
+- **Full pipeline runs per model**: Stage 0 baseline → 1 config → 2–3 compiler-flag rewrites (+ a fused-MoE NKI kernel *borrow* for MoE models) → 5 graph-rewrite (an `--optlevel 1/2/3` + auto-cast sweep) → 6 profile-loop. On native PyTorch the neuronx-cc compiler already does kernel selection/fusion when `torch.compile` runs, so beyond config the real lever is **compiler flags** — stages 2/3/5 race flagsets (spellings on-device-verified against neuronx-cc), each gated by the same equivalence + guardrails as config. The one genuine kernel *swap* is the MoE-family fused-NKI-megakernel borrow in Stage 3.
 - **Two-box parallel**: shard 0 + shard 1 over a **40-model × 10-pass** rolling queue across diverse architectures (Qwen, Gemma-2, Phi, Mistral, OPT, Pythia, GPT-NeoX, StableLM, OLMo, Falcon, StarCoder, Granite, BLOOM…), with bidirectional bank-sync.
 - **Knowledge bank compounding**: **25 lessons (10 verified / 15 provisional).** Priors promote provisional→verified once ≥2 models agree, then seed the beam. Early signal that it's *improving* not just growing: configs-to-win trending down (Qwen3-4B 88→83).
 - **Durable**: near-continuous (2-min) snapshots to the [`bank-snapshots`](../../tree/bank-snapshots) branch via a repo-scoped deploy key — accumulated learning survives box loss (a fresh box restores with `git fetch origin bank-snapshots`).
@@ -32,7 +32,7 @@ Live and running on **two `trn2.3xlarge` boxes in parallel**, pooling one knowle
 - **Learns from failure too**: losses banked as anti-patterns; a pre-flight arch-gate skips known-doomed architectures (e.g. linear-attention / GatedDeltaNet, which ISA-fail on neuronx-cc) *before* wasting a compile.
 
 **Honest edges (not overclaiming):**
-- **Stage 4 (author *new* NKI kernels)**: the engine is built and it authors, gates, and banks novel kernels — but on-device *execution* of authored kernels is still blocked by an NKI invocation-registration issue (parked). Most auto-authored kernels are expected to lose to the compiler anyway; the value is the occasional win + the anti-pattern lessons.
+- **Stage 4 (author *new* NKI kernels)** is **not integrated into the live pipeline.** A standalone `invent_engine` module exists (author → offline parity gate → on-device race → bank), but it is *not wired into the orchestrator* and its on-device execution path is unvalidated — so in production Stage 4 is entered and honestly recorded as **not run** (needs the NKI-writer agent + a validated execution path). Most auto-authored kernels are expected to lose to the compiler anyway; the value is the occasional win + the anti-pattern lessons.
 - The learning curve is bending, but **weakly so far** — the compounding is early and gated on more architecture diversity cross-validating.
 
 ## 🏆 Trainium Optimizer Leaderboard
