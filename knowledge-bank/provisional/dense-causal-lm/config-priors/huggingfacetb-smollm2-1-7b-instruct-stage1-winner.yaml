@@ -1,4 +1,4 @@
-lesson_id: qwen-qwen3-0-6b-stage1-winner
+lesson_id: huggingfacetb-smollm2-1-7b-instruct-stage1-winner
 type: config_prior
 layer: config
 migration_risk: medium
@@ -6,8 +6,8 @@ origin: ''
 applicability:
   architecture_family: dense_causal_lm
   param_count_range:
-  - 420000000.0
-  - 780000000.0
+  - 1190000000.0
+  - 2210000000.0
   seq_len_range:
   - 0
   - 10000000
@@ -35,5 +35,5 @@ intervention:
     cores_available: 4
 last_reverified_sdk: 2.28.0
 evidence:
-- model: Qwen/Qwen3-0.6B
-  metric: 85251.0119739382
+- model: HuggingFaceTB/SmolLM2-1.7B-Instruct
+  metric: 50967.11938352456
