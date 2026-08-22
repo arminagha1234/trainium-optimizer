@@ -76,3 +76,4 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	stabilityai-stable-diffusion-xl-base-1-0	stabilityai/stable-diffusion-xl-base-1.0	diffusion	1	-	126	ok
 1	pixart-alpha-pixart-sigma-xl-2-512-ms	PixArt-alpha/PixArt-Sigma-XL-2-512-MS	diffusion	1	-	8	ok
 1	black-forest-labs-flux-1-schnell	black-forest-labs/FLUX.1-schnell	diffusion	1	0.000	8	ok
+1	openai-community-gpt2	openai-community/gpt2	dense_causal_lm	83	12.794	1955	ok
