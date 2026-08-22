@@ -70,3 +70,9 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	microsoft-phi-4	microsoft/phi-4	dense_causal_lm	1	0.000	23	ok
 1	meta-llama-llama-3-2-1b	meta-llama/Llama-3.2-1B	dense_causal_lm	0	-	4	FAIL_NO_BASELINE
 1	meta-llama-llama-3-2-3b	meta-llama/Llama-3.2-3B	dense_causal_lm	0	-	4	FAIL_NO_BASELINE
+1	katuni4ka-tiny-random-qwen3moe	katuni4ka/tiny-random-qwen3moe	moe_causal_lm	1	-	11	ok
+1	stabilityai-sd-turbo	stabilityai/sd-turbo	diffusion	1	-	58	ok
+1	stabilityai-sdxl-turbo	stabilityai/sdxl-turbo	diffusion	1	0.000	116	ok
+1	stabilityai-stable-diffusion-xl-base-1-0	stabilityai/stable-diffusion-xl-base-1.0	diffusion	1	-	126	ok
+1	pixart-alpha-pixart-sigma-xl-2-512-ms	PixArt-alpha/PixArt-Sigma-XL-2-512-MS	diffusion	1	-	8	ok
+1	black-forest-labs-flux-1-schnell	black-forest-labs/FLUX.1-schnell	diffusion	1	0.000	8	ok
