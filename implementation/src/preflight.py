@@ -37,6 +37,7 @@ See ../../optimization-stages.md (Rule 4) and ../../guardrails.md.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -166,6 +167,75 @@ def arch_signature(spec: ModelSpec, config: dict[str, Any] | None = None) -> str
 
 
 # ---------------------------------------------------------------------------
+# kernel routing — "not a blocker, a named kernel need"
+# ---------------------------------------------------------------------------
+#
+# The static linear-attention detection above used to be a DEAD END: skip, emit
+# an anti-pattern, never look at the model again. That is the wrong mental model
+# (and the reason our leaderboard listed Qwen3.5 as permanently "⛔ skipped").
+# The naive graph really does ISA-fail neuronx-cc — but the *cure* is a kernel,
+# not abandonment. This turns the skip into a ROUTED, named work item:
+# "linear_attention -> needs the DeltaNet kernel; is one registered here?"
+# mirroring the AutoFixer PRIMITIVE_TO_KERNEL routing. The actual kernel is
+# proprietary and external (see kernel_registry's IP boundary); this layer only
+# names the need and reports availability.
+
+
+@dataclass
+class KernelNeed:
+    """A novel primitive routed to the kernel that implements it."""
+
+    primitive: str              # descriptor, e.g. "linear_attention"
+    kernel_name: str | None     # canonical kernel, e.g. "DeltaNet" (None if unmapped)
+    available: bool             # a numerically-correct kernel is registered here
+    hw_ready: bool              # ...and validated on a real NeuronCore
+    reason: str                 # human/ledger-facing routing message
+
+
+def kernel_route(
+    spec: ModelSpec,
+    config: dict[str, Any] | None = None,
+    *,
+    config_loader: ConfigLoader | None = None,
+    registry: Any = None,
+) -> KernelNeed | None:
+    """If this model uses a primitive the compiler can't auto-lower, name the
+    kernel it needs and report whether one is available on this install.
+
+    Returns None for a model that needs no kernel route (a plain dense model).
+    `registry` is a kernel_registry.KernelRegistry; when omitted an empty one is
+    used (nothing registered), so this still answers "which kernel is needed"
+    even on an install with no external kernel dir configured.
+    """
+    cfg = config if config is not None else load_hf_config(spec.model_id, config_loader)
+    if not is_linear_attention_arch(cfg):
+        return None
+
+    from kernel_registry import KernelRegistry, kernel_for_primitive
+
+    primitive = "linear_attention"
+    kname = kernel_for_primitive(primitive)             # -> "DeltaNet"
+    reg = registry if registry is not None else KernelRegistry()
+    kspec = reg.lookup(kname) if kname else None
+    available = bool(kspec and kspec.usable)
+    hw_ready = bool(kspec and kspec.hw_ready)
+
+    if kname and available:
+        tier = "on-device-validated" if hw_ready else "simulate-validated"
+        reason = (f"linear-attention/GatedDeltaNet -> route to the {kname} kernel "
+                  f"({tier}); the naive graph ISA-fails neuronx-cc, the kernel is "
+                  f"the supported path")
+    elif kname:
+        reason = (f"linear-attention/GatedDeltaNet -> needs the {kname} kernel "
+                  f"(none registered on this install; the naive graph ISA-fails "
+                  f"neuronx-cc). Point $TRN_OPT_KERNEL_DIR at a {kname} kernel to "
+                  f"optimize this model.")
+    else:
+        reason = LINEAR_ATTN_REASON
+    return KernelNeed(primitive, kname, available, hw_ready, reason)
+
+
+# ---------------------------------------------------------------------------
 # the gate
 # ---------------------------------------------------------------------------
 
@@ -191,6 +261,8 @@ def preflight_check(
     *,
     config_loader: ConfigLoader | None = None,
     config: dict[str, Any] | None = None,
+    registry: Any = None,
+    kernels_wired: bool = False,
 ) -> tuple[bool, str | None]:
     """Cheap, no-compile gate run before `establish_baseline`.
 
@@ -202,12 +274,28 @@ def preflight_check(
 
     Never compiles and never loads weights: it reads the HF config (config only)
     and queries the bank's pre-flight anti-patterns.
+
+    Kernel routing (opt-in): pass a `registry` (kernel_registry.KernelRegistry)
+    to turn a linear-attention skip into a NAMED kernel route in the reason
+    ("needs the DeltaNet kernel; available: yes/no") instead of the generic
+    unsupported message. If `kernels_wired=True` AND a usable kernel is
+    registered, the model is allowed to PROCEED — the kernel, not the naive
+    graph, is the supported path. Defaults (no registry, kernels_wired=False)
+    are byte-for-byte the previous behaviour, so callers/tests are unchanged.
     """
     cfg = config if config is not None else load_hf_config(spec.model_id, config_loader)
 
     # 1. Static detection — fires on the FIRST encounter, from config alone.
     if is_linear_attention_arch(cfg):
-        return False, LINEAR_ATTN_REASON
+        # Default (no registry, kernels not wired): unchanged skip + reason.
+        if registry is None and not kernels_wired:
+            return False, LINEAR_ATTN_REASON
+        need = kernel_route(spec, cfg, registry=registry)
+        # A validated kernel is registered AND wired into the backend -> the
+        # model is optimizable via the kernel path; let it through.
+        if need and need.available and kernels_wired:
+            return True, None
+        return False, (need.reason if need else LINEAR_ATTN_REASON)
 
     # 2. Bank consultation — a class that already failed the expensive way.
     if bank is not None and hasattr(bank, "preflight_antipatterns"):
