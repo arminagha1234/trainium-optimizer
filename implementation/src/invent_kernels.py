@@ -105,6 +105,12 @@ class OpSpec:
     baseline: str = "torch-eager"
     origin: str = "invented"          # "invented" (write-new) | "seed" (regression)
     notes: str = ""
+    # Kernel-corpus primitive this op belongs to (e.g. "linear_attention" for a
+    # GatedDeltaNet op), used by the engine's prior-art / Harvest step to reuse
+    # an already-authored kernel instead of re-inventing. Empty -> no prior-art
+    # lookup (author from scratch). Last field with a default so existing
+    # positional/keyword constructions (incl. every recipe + test) are unchanged.
+    primitive: str = ""
 
 
 @dataclass
