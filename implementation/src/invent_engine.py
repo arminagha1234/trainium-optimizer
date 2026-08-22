@@ -48,7 +48,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 
@@ -127,8 +127,8 @@ class InventResult:
     op: str
     shape_class: str
     origin: str
-    status: str                    # win | anti_pattern | offline_reject |
-                                   # device_deferred | no_author
+    status: str                    # harvested | win | anti_pattern |
+                                   # offline_reject | device_deferred | no_author
     offline: OfflineGate
     race: RaceResult
     lesson_id: str = ""
@@ -152,6 +152,7 @@ class InventEngine:
         bank_root: Path | str | None = None,
         guards: Guardrails | None = None,
         sdk_version: str = _SDK,
+        registry: "Any" = None,
     ) -> None:
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -163,6 +164,32 @@ class InventEngine:
         self.sdk_version = sdk_version
         self.ledger = Ledger(self.out_dir)
         self.ledger.init()
+        # Prior-art / Harvest: consult a kernel registry BEFORE authoring, so a
+        # primitive that already has an authored kernel (e.g. DeltaNet for a
+        # GatedDeltaNet op) is REUSED, not re-invented. Defaults to an empty
+        # registry (nothing available), so behaviour is unchanged unless the
+        # caller passes one or $TRN_OPT_KERNEL_DIR is set. Import is local so the
+        # engine has no hard dependency on the routing layer.
+        if registry is None:
+            from kernel_registry import KernelRegistry
+            registry = KernelRegistry()
+        self.registry = registry
+
+    # -- prior-art / Harvest (search before authoring) -----------------------
+
+    def _prior_art(self, spec: OpSpec):
+        """Return a usable, already-authored KernelSpec for this op's primitive,
+        or None. This is the Harvest step of Harvest -> Borrow -> Invent, and the
+        AutoFixer 'search prior art before authoring' rule: never re-invent a
+        kernel the corpus already has. Only kernels at >= simulate-correct rank
+        are returned (a failed-compile attempt is not prior art to reuse)."""
+        if not getattr(spec, "primitive", ""):
+            return None
+        try:
+            kspec = self.registry.for_primitive(spec.primitive)
+        except Exception:  # noqa: BLE001 — a broken registry must not stop authoring
+            return None
+        return kspec if (kspec and kspec.usable) else None
 
     # -- offline gate --------------------------------------------------------
 
@@ -434,7 +461,26 @@ class InventEngine:
     # -- the loop ------------------------------------------------------------
 
     def run_op(self, spec: OpSpec, race_fn: RaceFn | None = None) -> InventResult:
-        """Author -> offline gate -> on-device race -> keep/discard -> bank."""
+        """Prior-art (Harvest) -> author -> offline gate -> on-device race ->
+        keep/discard -> bank."""
+        # HARVEST FIRST (Harvest -> Borrow -> Invent): if the corpus already has
+        # a usable kernel for this op's primitive, REUSE it — do not spend a
+        # compile re-inventing what exists. Recorded as a HARVESTED keep so the
+        # ledger shows the reuse (and its HW-readiness tier) honestly.
+        prior = self._prior_art(spec)
+        if prior is not None:
+            tier = "on-device" if prior.hw_ready else "simulate"
+            self._record(spec, Status.KEEP, 0.0, 100.0,
+                         f"harvested existing {prior.name} kernel "
+                         f"({prior.status}, {tier}-validated) -> reuse, no authoring",
+                         origin=Origin.HARVESTED)
+            return InventResult(spec.name, spec.shape_class, "harvested",
+                                "harvested",
+                                OfflineGate(True, False, 0.0,
+                                            reason=f"prior art: {prior.name}"),
+                                RaceResult(False, reason="harvested (not raced)"),
+                                detail=f"reused {prior.name} [{prior.status}]")
+
         author = author_kernel(spec)
 
         if not author.nki_src:
