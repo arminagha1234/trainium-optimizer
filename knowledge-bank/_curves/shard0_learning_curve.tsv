@@ -40,3 +40,4 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	qwen-qwen2-5-0-5b-instruct	Qwen/Qwen2.5-0.5B-Instruct	dense_causal_lm	42	15.171	1018	TIMEOUT
 1	qwen-qwen3-8b	Qwen/Qwen3-8B	dense_causal_lm	38	-	1476	TIMEOUT
 1	qwen-qwen3-8b	Qwen/Qwen3-8B	dense_causal_lm	82	8.870	5886	ok
+1	mistralai-mistral-7b-instruct-v0-3	mistralai/Mistral-7B-Instruct-v0.3	dense_causal_lm	85	9.108	4995	ok
