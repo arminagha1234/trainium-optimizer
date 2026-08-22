@@ -1,4 +1,4 @@
-lesson_id: qwen-qwen2-5-3b-instruct-stage1-winner
+lesson_id: 01-ai-yi-1-5-9b-stage1-winner
 type: config_prior
 layer: config
 migration_risk: medium
@@ -6,8 +6,8 @@ origin: ''
 applicability:
   architecture_family: dense_causal_lm
   param_count_range:
-  - 2099999999.9999998
-  - 3900000000.0
+  - 6300000000.0
+  - 11700000000.0
   seq_len_range:
   - 0
   - 10000000
@@ -27,14 +27,13 @@ intervention:
     weights_dtype: bf16
     attn_implementation: eager
     compile_mode: compile-default
-    batch: 8
+    batch: 32
     cp_degree: 1
     dp_degree: 1
     kv_replication: 1
     cores_used: 4
     cores_available: 4
-    cc_flags: --optlevel 3
 last_reverified_sdk: 2.28.0
 evidence:
-- model: Qwen/Qwen2.5-3B-Instruct
-  metric: 35055.52033562141
+- model: 01-ai/Yi-1.5-9B
+  metric: 16785.3095025067

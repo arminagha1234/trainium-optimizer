@@ -52,3 +52,13 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	allenai-olmoe-1b-7b-0924	allenai/OLMoE-1B-7B-0924	moe_causal_lm	1	0.000	120	ok
 1	qwen-qwen1-5-moe-a2-7b	Qwen/Qwen1.5-MoE-A2.7B	moe_causal_lm	1	0.000	230	ok
 1	deepseek-ai-deepseek-moe-16b-base	deepseek-ai/deepseek-moe-16b-base	moe_causal_lm	1	0.000	18	ok
+1	01-ai-yi-1-5-9b	01-ai/Yi-1.5-9B	dense_causal_lm	72	7.819	5838	ok
+1	huggingfacetb-smollm3-3b	HuggingFaceTB/SmolLM3-3B	dense_causal_lm	1	-	11	ok
+1	qwen-qwen3-0-6b	Qwen/Qwen3-0.6B	dense_causal_lm	1	26.587	10	ok
+1	qwen-qwen3-1-7b	Qwen/Qwen3-1.7B	dense_causal_lm	1	17.239	10	ok
+1	qwen-qwen3-4b	Qwen/Qwen3-4B	dense_causal_lm	1	14.104	10	ok
+1	qwen-qwen2-5-0-5b-instruct	Qwen/Qwen2.5-0.5B-Instruct	dense_causal_lm	1	15.171	10	ok
+1	qwen-qwen2-5-1-5b-instruct	Qwen/Qwen2.5-1.5B-Instruct	dense_causal_lm	1	-	11	ok
+1	qwen-qwen2-5-3b-instruct	Qwen/Qwen2.5-3B-Instruct	dense_causal_lm	1	12.196	10	ok
+1	google-gemma-2-2b	google/gemma-2-2b	dense_causal_lm	0	-	4	FAIL_NO_BASELINE
+1	microsoft-phi-3-5-mini-instruct	microsoft/Phi-3.5-mini-instruct	dense_causal_lm	1	-	11	ok
