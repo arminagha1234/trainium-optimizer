@@ -91,6 +91,15 @@ class Measurements:
     batch: int = 1
     warmup_iters: int = 0
     measured_iters: int = 0
+    # Real compile time observed during this measurement. For lazy/eager
+    # backends (native PyTorch) the compile happens on the first forward INSIDE
+    # the worker, so it is only known after measure() runs — not at compile().
+    # The worker reports it (compile_s in its JSON); measure() threads it here so
+    # the orchestrator can enforce the compile-timeout guardrail on the REAL
+    # value and record a non-zero compile_s in the ledger. 0.0 means "unknown /
+    # not a compiled run" (e.g. eager). Backends that know compile time upfront
+    # still set Neff.compile_seconds; the orchestrator uses whichever is > 0.
+    compile_seconds: float = 0.0
     # Instance occupancy. cores_used = tp*cp*dp for this deployment;
     # cores_available = the whole instance. A model pinned to its TP group on a
     # bigger box reports low device_utilization here — the signal that made
