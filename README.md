@@ -29,10 +29,19 @@ Live and running on **two `trn2.3xlarge` boxes in parallel**, pooling one knowle
 - **Knowledge bank compounding**: **25 lessons (10 verified / 15 provisional).** Priors promote provisional→verified once ≥2 models agree, then seed the beam. Early signal that it's *improving* not just growing: configs-to-win trending down (Qwen3-4B 88→83).
 - **Durable**: near-continuous (2-min) snapshots to the [`bank-snapshots`](../../tree/bank-snapshots) branch via a repo-scoped deploy key — accumulated learning survives box loss (a fresh box restores with `git fetch origin bank-snapshots`).
 - **Three backends behind one loop**: native-pytorch (throughput), diffusion (text-to-image; SD-Turbo validated), vllm-serve (latency-SLA).
-- **Learns from failure too**: losses banked as anti-patterns; a pre-flight arch-gate skips known-doomed architectures (e.g. linear-attention / GatedDeltaNet, which ISA-fail on neuronx-cc) *before* wasting a compile.
+- **Learns from failure too**: losses banked as anti-patterns. Novel primitives the compiler can't auto-lower (linear-attention / GatedDeltaNet) are **no longer dead-skipped** — the pre-flight gate now *routes* them to a named kernel need (Qwen3.5 → the `DeltaNet` kernel) via `kernel_registry`, turning "⛔ unsupported" into an actionable work item.
+
+## The kernel stage (Stage 4) — how we get a model the compiler can't lower
+
+Being built out in honest layers (see [`docs/linear-attention-kernel-pattern.md`](./docs/linear-attention-kernel-pattern.md)):
+
+1. **Route, don't skip** — `kernel_registry` maps a primitive to its kernel (`linear_attention`→`DeltaNet`, `mamba/ssm`→`Mamba2`, `mla`→`MLA`, …); `preflight.kernel_route` turns a linear-attn skip into "needs the `DeltaNet` kernel (available: yes/no)". Proprietary NKI source stays external (`$TRN_OPT_KERNEL_DIR`); only the routing + interface are public.
+2. **Cheapest fix first** — a symptom-indexed **rewrite catalog** (`kernel_rewrites`) tries a graph rewrite before any kernel. Grounded example: the Qwen3-Next `.tril()` → `TensorScalarAffineSelect` ISA reject is fixed by a **host-materialized constant mask — no kernel** (compiler-verified on trn2: exit-70 → PASS).
+3. **Harvest before invent** — `invent_engine._prior_art` reuses an already-authored, usable kernel (recorded `Origin.HARVESTED`) instead of re-authoring.
+4. **A repair loop that learns** — `kernel_repair.KernelRepairLoop` feeds the exact `neuronx-cc` error back to the next authoring attempt (bounded rounds; honest `compiled`/`exhausted`/`stalled` stops, never a fake success). The on-device gate is real — a `nki.simulate` pass is **not** trusted as hardware-ready (a Mamba scan simulated to 2e-7 ran 67 off on real Trn2).
 
 **Honest edges (not overclaiming):**
-- **Stage 4 (author *new* NKI kernels)** is **not integrated into the live pipeline.** A standalone `invent_engine` module exists (author → offline parity gate → on-device race → bank), but it is *not wired into the orchestrator* and its on-device execution path is unvalidated — so in production Stage 4 is entered and honestly recorded as **not run** (needs the NKI-writer agent + a validated execution path). Most auto-authored kernels are expected to lose to the compiler anyway; the value is the occasional win + the anti-pattern lessons.
+- **The kernel stage is parts, not yet a whole.** Routing, harvest, the repair loop, and the rewrite catalog exist and are tested — but the repair loop is not yet wired into `invent_engine.run_op`, `author_kernel` is still a recipe table (not an LLM author), and there is **no backend hook yet** to inject an authored kernel into a *served* model, so a kernel win isn't measured end-to-end today. The on-device execution path for authored kernels remains unvalidated. Most auto-authored kernels are expected to lose to the compiler anyway; the value is the occasional win + the accumulated lessons.
 - The learning curve is bending, but **weakly so far** — the compounding is early and gated on more architecture diversity cross-validating.
 
 ## 🏆 Trainium Optimizer Leaderboard
