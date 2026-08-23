@@ -93,7 +93,7 @@ _NKI_PREAMBLE = """\
 You are authoring a single NKI (Neuron Kernel Interface) kernel for a Trainium2
 device. Follow these MANDATORY rules (each is enforced by a static lint before
 any compile):
-  * top-level `import nki`, `import nki.isa as nisa`, `import nki.language as nl`;
+  * top-level `import neuronxcc.nki as nki`, `import neuronxcc.nki.isa as nisa`, `import neuronxcc.nki.language as nl`;
     decorate the entry with `@nki.jit`.
   * partition (first) dim is ALWAYS 128; tile the free axis at 128/512.
   * NEVER use `nl.arange` (deprecated) — use `nl.mgrid` for indexing/masking.

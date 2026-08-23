@@ -539,7 +539,7 @@ def _softmax_inputs(T: int, N: int, seed: int) -> Inputs:
 # authored NKI source (pipeline steps 3-6), as text.
 # ===========================================================================
 # These are authored to be lint-clean and to follow the moe_fused house style:
-# top-level `import nki`, `nki.isa as nisa`, `nki.language as nl`, @nki.jit,
+# top-level `import neuronxcc.nki as nki`, `neuronxcc.nki.isa as nisa`, `neuronxcc.nki.language as nl`, @nki.jit,
 # partition dim 128, `nl.mgrid` for masking, tiling in 128/512, one
 # multi-partition DMA per operand (no per-index DMA on a packed axis). They are
 # the on-device candidate; correctness + speed are decided by the engine's
@@ -548,9 +548,9 @@ _HEADER = '''# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved
 # SPDX-License-Identifier: Apache-2.0
 # AUTHORED by the Stage-4 invent engine (invent_kernels.author_kernel).
 from __future__ import annotations
-import nki
-import nki.isa as nisa
-import nki.language as nl
+import neuronxcc.nki as nki
+import neuronxcc.nki.isa as nisa
+import neuronxcc.nki.language as nl
 
 _PMAX = 128        # partition dim is always 128
 _PSUM_FREE = 512   # PSUM free-dim max on trn2

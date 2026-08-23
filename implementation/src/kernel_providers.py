@@ -116,9 +116,9 @@ def echo_complete_fn(prompt: str) -> str:
     entry = m.group(1) if m else "echo_kernel"
     return (
         "```python\n"
-        "import nki\n"
-        "import nki.isa as nisa\n"
-        "import nki.language as nl\n"
+        "import neuronxcc.nki as nki\n"
+        "import neuronxcc.nki.isa as nisa\n"
+        "import neuronxcc.nki.language as nl\n"
         "\n"
         "@nki.jit\n"
         f"def {entry}(*args):\n"
