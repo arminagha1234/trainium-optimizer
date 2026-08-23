@@ -96,3 +96,5 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	openai-community-gpt2-large	openai-community/gpt2-large	dense_causal_lm	81	6.104	3090	ok
 1	eleutherai-pythia-6-9b	EleutherAI/pythia-6.9b	dense_causal_lm	1	-	164	ok
 1	mosaicml-mpt-7b	mosaicml/mpt-7b	dense_causal_lm	0	-	4	FAIL_NO_BASELINE
+1	stabilityai-stablelm-3b-4e1t	stabilityai/stablelm-3b-4e1t	dense_causal_lm	74	2.275	4883	ok
+1	allenai-olmo-2-1124-13b	allenai/OLMo-2-1124-13B	dense_causal_lm	1	-	724	ok
