@@ -92,3 +92,4 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	deepseek-ai-deepseek-llm-7b-base	deepseek-ai/deepseek-llm-7b-base	dense_causal_lm	82	7.443	5950	ok
 1	bigscience-bloom-1b7	bigscience/bloom-1b7	dense_causal_lm	53	8.395	2714	ok
 1	microsoft-phi-3-mini-4k-instruct	microsoft/Phi-3-mini-4k-instruct	dense_causal_lm	1	-	95	ok
+1	tinyllama-tinyllama-1-1b-chat-v1-0	TinyLlama/TinyLlama-1.1B-Chat-v1.0	dense_causal_lm	85	11.048	5652	ok
