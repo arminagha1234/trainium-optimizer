@@ -82,3 +82,6 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	eleutherai-pythia-1-4b	EleutherAI/pythia-1.4b	dense_causal_lm	61	2.438	2406	ok
 1	eleutherai-pythia-2-8b	EleutherAI/pythia-2.8b	dense_causal_lm	65	2.076	5900	ok
 1	eleutherai-gpt-neo-1-3b	EleutherAI/gpt-neo-1.3B	dense_causal_lm	1	-	17	ok
+1	stabilityai-stablelm-2-1-6b	stabilityai/stablelm-2-1_6b	dense_causal_lm	63	2.846	3559	ok
+1	allenai-olmo-2-1124-7b	allenai/OLMo-2-1124-7B	dense_causal_lm	1	-	266	ok
+1	tiiuae-falcon-7b	tiiuae/falcon-7b	dense_causal_lm	1	-	152	ok
