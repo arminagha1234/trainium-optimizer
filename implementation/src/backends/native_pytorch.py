@@ -330,6 +330,11 @@ class NativePyTorchBackend:
             # when --compile is on. This is what makes the orchestrator's
             # compile-timeout guardrail live and the ledger's compile_s honest.
             compile_seconds=float(data.get("compile_s", 0.0)),
+            # Stage-3 MoE borrow status from the worker: "swapped: ..." (kernel
+            # ran), "eager-fallback: ..." (precondition unmet), or "not-requested".
+            # Surfaced in the ledger so the borrow row is honest about whether the
+            # fused NKI megakernel actually executed.
+            moe_kernel_swap=data.get("moe_kernel_swap", ""),
         )
 
     # -- Stages 2-5 ----------------------------------------------------------

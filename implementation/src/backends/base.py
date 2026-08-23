@@ -122,6 +122,12 @@ class Measurements:
     tpot_ms_p50: float = 0.0
     e2e_seconds: float = 0.0
     hits_sla: bool = False
+    # Stage-3 MoE borrow audit trail. The worker records whether the fused NKI
+    # megakernel actually swapped in ("swapped: ...") or silently fell back to
+    # eager because a precondition was unmet ("eager-fallback: ..."); "" / the
+    # default means no swap was attempted (dense model, or non-borrow candidate).
+    # Threaded to the ledger so a reader can tell "kernel ran" from "fell back".
+    moe_kernel_swap: str = ""
 
     @property
     def hbm_utilization(self) -> float:

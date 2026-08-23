@@ -150,10 +150,54 @@ def test_fast_but_wrong_moe_kernel_is_discarded(tmp_path: Path):
     assert orch.incumbent.config.get(MOE_KERNEL_KEY) != FUSED_NKI
 
 
+# -- ledger honesty: swapped vs fell-back-to-eager ---------------------------
+
+class _EagerFallbackMoEMock(_MoEMock):
+    """Like native_pytorch when the borrow's precondition is unmet: the run is
+    correct (unchanged, eager) and the worker reports the fallback. measure()
+    surfaces that via Measurements.moe_kernel_swap, exactly as the real worker's
+    JSON does."""
+
+    def measure(self, neff, shape, batch):
+        import dataclasses
+        m = super().measure(neff, shape, batch)
+        if neff.artifact.config.get(MOE_KERNEL_KEY) == FUSED_NKI:
+            return dataclasses.replace(
+                m, moe_kernel_swap="eager-fallback: off-contract dims")
+        return m
+
+
+def test_moe_borrow_ledger_notes_eager_fallback(tmp_path: Path):
+    """When the fused MoE kernel silently falls back to eager, the borrow row
+    must SAY so — a reader can tell 'kernel ran' from 'fell back to eager'."""
+    orch = _orch(tmp_path, _EagerFallbackMoEMock(seed=1))
+    orch.establish_baseline(MOE_SPEC)
+    orch.run_stage1_config(MOE_SPEC)
+    orch.run_deep_stages(MOE_SPEC)
+
+    rows = _moe_rows(orch)
+    assert rows, "expected the fused-MoE borrow candidate to be evaluated"
+    assert any("[moe-kernel: eager-fallback" in r.description for r in rows), \
+        "borrow row must disclose the eager fallback, not just the provenance"
+
+
 # -- dependency-light adapter precheck ---------------------------------------
 
 def _fake_cfg(**kw):
     return SimpleNamespace(**kw)
+
+
+def test_fused_moe_kernel_uses_broadcast_to_not_broadcast():
+    """nki 0.6.0 renamed the tile method .broadcast(dim, n) -> .broadcast_to(shape);
+    the old form raises AttributeError on-device. The vendored fused-MoE kernel
+    source must use the new API. (Text check: importing needs nkilib, absent in
+    the unit-test env.)"""
+    src = (Path(__file__).parent / "kernels" / "moe_fused"
+           / "moe_fused_nki.py").read_text()
+    assert ".broadcast_to((" in src, "kernel should use the nki 0.6.0 broadcast_to API"
+    # No bare .broadcast(dim=... / .broadcast( call survives (comments describing
+    # the rename mention it, so match the call form specifically).
+    assert ".broadcast(dim" not in src, "old .broadcast(dim, n) form must be gone"
 
 
 def test_is_moe_arch_detection():
