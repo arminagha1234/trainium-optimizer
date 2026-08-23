@@ -80,3 +80,5 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	facebook-opt-1-3b	facebook/opt-1.3b	dense_causal_lm	67	2.900	2406	ok
 1	facebook-opt-2-7b	facebook/opt-2.7b	dense_causal_lm	63	2.422	2545	ok
 1	eleutherai-pythia-1-4b	EleutherAI/pythia-1.4b	dense_causal_lm	61	2.438	2406	ok
+1	eleutherai-pythia-2-8b	EleutherAI/pythia-2.8b	dense_causal_lm	65	2.076	5900	ok
+1	eleutherai-gpt-neo-1-3b	EleutherAI/gpt-neo-1.3B	dense_causal_lm	1	-	17	ok
