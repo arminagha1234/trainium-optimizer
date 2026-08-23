@@ -31,6 +31,10 @@ from invent_engine import (
     _BF16_RIDGE_FLOPS_PER_BYTE,
     _BF16_ATOL,
     _BF16_RTOL,
+    _CORRECT_FAIL_FACTOR,
+    _CORRECT_PPM_FLOOR,
+    _CORRECT_MAG_FACTOR,
+    _CORRECT_MAG_FLOOR,
 )
 from invent_kernels import (
     AuthoredKernel,
@@ -854,6 +858,82 @@ def test_bf16_oracle_is_bf16_not_the_fp32_reference():
     # bf16 rounding makes the incumbent miss the fp32 ideal on >= 1 element —
     # the very reason the fp32 gate is unfair to a bf16 kernel.
     assert not np.allclose(oracle, ref, atol=_BF16_ATOL, rtol=_BF16_RTOL)
+
+
+# ===========================================================================
+# magnitude guard — the count budget alone lets a few catastrophic elements
+# (NaN/Inf/1e6) slip through; the magnitude guard closes that hole.
+# ===========================================================================
+def _count_budget(size, o_fail):
+    return max(int(_CORRECT_FAIL_FACTOR * o_fail),
+               int(_CORRECT_PPM_FLOOR * size) + 1)
+
+
+def test_mag_guard_add_rmsnorm_like_benign_near_miss_still_passes():
+    # The real add_rmsnorm shape: the kernel misses the fp32 ideal on a FEW
+    # elements by a BENIGN bf16-boundary amount (~0.055), while the incumbent
+    # bf16 op misses MORE elements by a similar amount. Must stay a WIN.
+    rng = np.random.default_rng(11)
+    ref = rng.standard_normal((512, 4096)).astype(np.float32)
+    flat = rng.choice(ref.size, size=47 + 8, replace=False)
+    oracle = ref.copy().ravel(); oracle[flat[:47]] += 0.050   # incumbent: 47 misses
+    got = ref.copy().ravel();    got[flat[47:]] += 0.055      # kernel: 8 benign misses
+    oracle = oracle.reshape(ref.shape); got = got.reshape(ref.shape)
+    correct, pct, note = _bf16_correct(got, ref, oracle, "torch-bf16@cpu")
+    assert correct and pct > 99.0
+    assert "k_fail=8" in note and "o_fail=47" in note
+    # the guard's magnitude bar is surfaced and the benign miss clears it wide.
+    assert "k_max_miss_err=" in note and "mag_bar=" in note and "nonfinite=False" in note
+
+
+def test_mag_guard_rejects_nan_on_few_elements_under_count_budget():
+    # Kernel is bit-identical to the fp32 ideal EXCEPT k <= count-budget elements
+    # set to NaN. It PASSES the count budget (few misses) but the NaN reject fails
+    # it — this is exactly the hole the magnitude guard closes.
+    rng = np.random.default_rng(12)
+    ref = rng.standard_normal((512, 4096)).astype(np.float32)
+    oracle = ref + rng.uniform(-1e-3, 1e-3, ref.shape).astype(np.float32)  # ~=ref
+    o_fail = int((~np.isclose(oracle, ref, atol=_BF16_ATOL, rtol=_BF16_RTOL)).sum())
+    k = 50
+    assert k <= _count_budget(ref.size, o_fail)          # under the count budget
+    got = ref.copy().ravel(); got[:k] = np.nan; got = got.reshape(ref.shape)
+    correct, _, note = _bf16_correct(got, ref, oracle, "torch-bf16@cpu")
+    assert not correct and "nonfinite=True" in note
+
+
+def test_mag_guard_rejects_1e6_on_few_elements_under_count_budget():
+    # Same shape but the poisoned elements hold a finite-but-catastrophic 1e6.
+    # Count budget passes; the magnitude bar (tied to the incumbent's benign
+    # worst miss) rejects it.
+    rng = np.random.default_rng(13)
+    ref = rng.standard_normal((512, 4096)).astype(np.float32)
+    oracle = ref + rng.uniform(-1e-3, 1e-3, ref.shape).astype(np.float32)  # ~=ref
+    o_fail = int((~np.isclose(oracle, ref, atol=_BF16_ATOL, rtol=_BF16_RTOL)).sum())
+    k = 50
+    assert k <= _count_budget(ref.size, o_fail)          # under the count budget
+    got = ref.copy().ravel(); got[:k] = 1e6; got = got.reshape(ref.shape)
+    correct, _, note = _bf16_correct(got, ref, oracle, "torch-bf16@cpu")
+    assert not correct and "nonfinite=False" in note     # finite, caught on magnitude
+    # the kernel's worst miss dwarfs the magnitude bar.
+    assert "kernel_no_worse_than_incumbent=False" in note
+
+
+def test_mag_guard_still_rejects_rope_and_gelu_style_mass_failure():
+    # rope-style: a genuinely broken kernel misses a HUGE fraction of elements
+    # -> fails the count budget (unchanged behaviour, guard does not rescue it).
+    rng = np.random.default_rng(14)
+    ref = rng.standard_normal((512, 4096)).astype(np.float32)
+    oracle = ref + rng.uniform(-1e-3, 1e-3, ref.shape).astype(np.float32)  # ~=ref
+    got = ref.copy()
+    got[:, :2500] += 0.5                                  # ~61% grossly wrong
+    correct, _, note = _bf16_correct(got, ref, oracle, "torch-bf16@cpu")
+    assert not correct and "kernel_no_worse_than_incumbent=False" in note
+
+    # gelu-style: wrong SHAPE (e.g. tanh-approx emitting a different layout) ->
+    # shape mismatch, strict-fp32 fallback, never a silent pass.
+    got_wrong_shape = rng.standard_normal((512, 2048)).astype(np.float32)
+    correct2, _, note2 = _bf16_correct(got_wrong_shape, ref, oracle, "torch-bf16@cpu")
+    assert not correct2
 
 
 # ===========================================================================

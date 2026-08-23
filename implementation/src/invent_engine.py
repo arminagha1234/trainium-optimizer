@@ -118,6 +118,26 @@ _BF16_RTOL = 1e-2
 _CORRECT_FAIL_FACTOR = 2.0
 _CORRECT_PPM_FLOOR = 5e-5      # 50 ppm absolute bf16-boundary budget
 
+# --- Magnitude guard (companion to the miss-COUNT budget above) ------------
+# The count budget above bounds HOW MANY elements miss the fp32 ideal, not HOW
+# FAR each one misses. On count alone a kernel that is perfect everywhere except
+# a handful of elements it fills with NaN/Inf or a catastrophically wrong value
+# (e.g. 1e6) would still PASS, as long as those few stay under the count budget.
+# So we ALSO bound the MAGNITUDE of the kernel's misses, judged — like the count
+# — against the incumbent bf16 op, which defines what a tolerable bf16 error is:
+#   * ANY NaN/Inf in the kernel where the fp32 ideal is finite is an instant
+#     reject (a correct op never manufactures a non-finite value the ideal lacks).
+#   * the kernel's WORST missed-element abs error may exceed the incumbent's OWN
+#     worst missed-element abs error by at most ``_CORRECT_MAG_FACTOR`` (device/
+#     host + summation-order bf16 tie-breaking can inflate a benign miss a few x),
+#     OR ``_CORRECT_MAG_FLOOR`` x the bf16 tolerance band at the data's peak
+#     magnitude when the incumbent is exact (softmax/layernorm) — whichever is
+#     larger. add_rmsnorm's benign bf16-boundary misses top out ~0.055 and clear
+#     this with wide margin; a 1e6 / NaN excursion is rejected. BOTH this and the
+#     count budget must pass. This only ever TIGHTENS the gate, never loosens it.
+_CORRECT_MAG_FACTOR = 8.0
+_CORRECT_MAG_FLOOR = 8.0       # x (atol + rtol*peak|ref|) tol band, oracle-exact case
+
 _SDK = "2.28.0"
 
 
@@ -1521,26 +1541,48 @@ def _bf16_correct(got: np.ndarray, ref: np.ndarray,
     kernel misses orders of magnitude more and fails. With no oracle we fall back
     to strict ``allclose`` vs fp32 (old behaviour), never a silent pass."""
     shp_ref = got.shape == ref.shape
+    # NaN/Inf reject (magnitude guard, part 1): a correct op never introduces a
+    # non-finite value where the fp32 ideal is finite. Instant fail, independent
+    # of the count/magnitude budgets below.
+    nonfinite_bad = (shp_ref and
+                     bool((np.isfinite(ref) & ~np.isfinite(got)).any()))
     k_close = (np.isclose(got, ref, atol=_BF16_ATOL, rtol=_BF16_RTOL)
                if shp_ref else None)
     k_fail = int((~k_close).sum()) if shp_ref else int(got.size)
     corr_pct = 100.0 * float(k_close.mean()) if shp_ref else 0.0
+    # worst abs error over the elements the KERNEL misses (0.0 if it misses none;
+    # NaN/Inf here propagates to a failing comparison below, and is also caught by
+    # nonfinite_bad — belt and braces).
+    k_max_miss_err = (float(np.abs(got[~k_close] - ref[~k_close]).max())
+                      if shp_ref and (~k_close).any() else 0.0)
     have_oracle = oracle is not None and oracle.shape == ref.shape
     if have_oracle and shp_ref:
-        o_fail = int((~np.isclose(oracle, ref, atol=_BF16_ATOL,
-                                  rtol=_BF16_RTOL)).sum())
+        o_close = np.isclose(oracle, ref, atol=_BF16_ATOL, rtol=_BF16_RTOL)
+        o_fail = int((~o_close).sum())
         budget = max(int(_CORRECT_FAIL_FACTOR * o_fail),
                      int(_CORRECT_PPM_FLOOR * got.size) + 1)
-        correct = k_fail <= budget
+        count_ok = k_fail <= budget
+        # Magnitude guard, part 2: the incumbent's OWN worst miss defines a
+        # tolerable bf16 error; when it is exact (no miss) fall back to a
+        # data-scaled bf16 tol band so the floor tracks the magnitude of the data.
+        o_max_miss_err = (float(np.abs(oracle[~o_close] - ref[~o_close]).max())
+                          if (~o_close).any() else 0.0)
+        peak = float(np.abs(ref).max()) if ref.size else 0.0
+        mag_floor = _CORRECT_MAG_FLOOR * (_BF16_ATOL + _BF16_RTOL * peak)
+        mag_bar = max(_CORRECT_MAG_FACTOR * o_max_miss_err, mag_floor)
+        mag_ok = (not nonfinite_bad) and (k_max_miss_err <= mag_bar)
+        correct = count_ok and mag_ok
         note = (f"oracle={oracle_src}; kernel_no_worse_than_incumbent={correct} "
-                f"(k_fail={k_fail} vs incumbent o_fail={o_fail}, budget={budget})")
+                f"(k_fail={k_fail} vs incumbent o_fail={o_fail}, budget={budget}; "
+                f"k_max_miss_err={k_max_miss_err:.4g} vs mag_bar={mag_bar:.4g} "
+                f"[o_max_miss_err={o_max_miss_err:.4g}], nonfinite={nonfinite_bad})")
     else:
         # No incumbent bf16 op to compare against -> strict fp32 gate (old
-        # behaviour). Never a silent pass.
-        correct = shp_ref and bool(np.allclose(got, ref, atol=_BF16_ATOL,
-                                               rtol=_BF16_RTOL))
+        # behaviour) PLUS the NaN/Inf reject. Never a silent pass.
+        correct = (shp_ref and not nonfinite_bad and
+                   bool(np.allclose(got, ref, atol=_BF16_ATOL, rtol=_BF16_RTOL)))
         note = (f"oracle={oracle_src}(none); strict-fp32 fallback; "
-                f"k_fail={k_fail}")
+                f"k_fail={k_fail}; nonfinite={nonfinite_bad}")
     return correct, corr_pct, note
 
 
