@@ -45,6 +45,7 @@ from typing import Callable, Protocol, runtime_checkable
 from invent_kernels import AuthoredKernel, OpSpec, author_kernel
 from kernel_repair import Feedback
 from kernel_rewrites import match_error
+from repair_hints import format_hints, match_hints
 
 
 # ---------------------------------------------------------------------------
@@ -123,22 +124,28 @@ reject turned into a DO/DON'T):
     max 512 for nc_version=gen3`. DO tile any larger free dim into <=512 chunks
     and loop, accumulating in PSUM. Also stationary free (M) <= 128 and the
     contraction (partition) dim <= 128.
-  * nc_matmul call signature (0.6.0) — it RETURNS the result tile; there is NO
-    `dst=`/`out=` parameter, and `moving` is required (omitting it or passing a
-    dst errors "nc_matmul() missing moving/dst args"). Exact signature:
-      nisa.nc_matmul(stationary, moving, *, is_stationary_onezero=False,
-        is_moving_onezero=False, is_transpose=False, tile_position=(),
-        tile_size=(), mask=None) -> tile
-    DO call it as `psum = nisa.nc_matmul(stat_tile, mov_tile)` — stationary
-    [K,M], moving [K,N], contraction K on the partition axis — and assign the
-    RETURNED tile (do not write into a passed-in dst).
-  * nc_transpose call signature (0.6.0) — like nc_matmul it RETURNS the result
-    and `data` is REQUIRED (positional-only calls that omit it error
-    "nc_transpose() missing value for required argument 'data'"). DO call it as
-    `t = nisa.nc_transpose(data=src_tile)` (or `nisa.nc_transpose(src_tile)`) and
-    assign the RETURNED tile; there is NO `dst=`/`out=` param. `data` [P,F] ->
-    returns [F,P] (P,F each <= 128). For attention-style kernels prefer feeding
-    an already-[K,N] moving operand into nc_matmul over transposing on the fly.
+  * nc_matmul call signature (0.6.0) — it WRITES INTO a `dst` tile and returns
+    NOTHING. Exact signature (dst is the FIRST, required arg):
+      nisa.nc_matmul(dst, stationary, moving, *, is_stationary_onezero=False,
+        is_moving_onezero=False, is_transpose=False, accumulate=None,
+        tile_position=(), tile_size=(), ...)
+    It computes `dst = stationary.T @ moving` IN PLACE. DO NOT assign its result
+    (it is None). Allocate a PSUM dst and pass all three by keyword:
+      psum = nl.ndarray((M, N), dtype=nl.float32, buffer=nl.psum)
+      nisa.nc_matmul(dst=psum, stationary=stat_tile, moving=mov_tile)  # -> psum
+    then use `psum`. stationary [K,M], moving [K,N] -> dst [M,N]; contraction K
+    on the partition axis (K, M <= 128; moving free dim N <= 512). Passing only
+    two args binds (dst, stationary) and errors "missing required argument
+    'moving'".
+  * nc_transpose call signature (0.6.0) — like nc_matmul it WRITES INTO a `dst`
+    and returns NOTHING. Exact signature (dst first, both required):
+      nisa.nc_transpose(dst, data, engine=..., name=None)
+    DO call it as:
+      dst = nl.ndarray((F, P), dtype=data.dtype, buffer=nl.sbuf)
+      nisa.nc_transpose(dst=dst, data=src_tile)   # data [P,F] -> dst [F,P]
+    then use `dst`; do NOT assign the return value. P, F each <= 128. For
+    attention-style kernels prefer feeding an already-[K,N] moving operand into
+    nc_matmul over transposing on the fly.
   * Reductions MUST stay 2-D: `nl.sum(axis=1)` that collapses to a 1-D tensor
     fails — SBUF/PSUM tiles need >= 2 dims. DO keep a [P,1]-shaped result
     (`nl.sum(x, axis=1, keepdims=True)`); DON'T let a tile collapse to 1-D. Same
@@ -169,14 +176,19 @@ kernel is a loss):
   1. FUSE the whole op into ONE kernel. Intermediates stay in SBUF; do ONE load
      per input and ONE store of the output — never round-trip a temporary
      through HBM (there is no HW cache; a spilled intermediate is pure loss).
-  2. FUSE instructions onto the Scalar engine via `nisa.activation(op=, bias=,
-     scale=, reduce_op=nl.add)`: it computes `op(scale*x + bias)` AND a free-axis
-     reduce in ONE instruction. Use it —
-       * rmsnorm: `op=nl.square, reduce_op=nl.add` gets mean-square in one pass;
-         do NOT materialize a squared tile then sum it separately.
-       * softmax: `op=nl.exp` with the (negated) row-max as `bias` and
-         `reduce_op=nl.add` gives `exp(x-max)` + the running denominator at once.
-       * softcap: `tanh(x/cap)*cap` via `scale=1/cap` (op=tanh) then one multiply.
+  2. FUSE instructions onto the Scalar engine via `nisa.activation`. REAL
+     signature: `nisa.activation(dst, op, data, bias=None, scale=1.0,
+     reduce_op=None, ...)` — dst is FIRST, data (the input tile) is THIRD; it
+     WRITES `op(scale*data + bias)` INTO dst and RETURNS NOTHING, and there is NO
+     `dtype=` kwarg. With `reduce_op=` it also does a free-axis reduce in the SAME
+     instruction. Allocate dst, pass by keyword, then use dst —
+       * rmsnorm: `nisa.activation(dst=ms, op=nl.square, data=x,
+         reduce_op=nl.add)` gets mean-square in one pass; do NOT materialize a
+         squared tile then sum it separately.
+       * softmax: `nisa.activation(dst=e, op=nl.exp, data=x, bias=neg_rowmax,
+         reduce_op=nl.add)` gives `exp(x-max)` + the running denominator at once.
+       * softcap: `nisa.activation(dst=t, op=nl.tanh, data=x, scale=1/cap)` then
+         one multiply by cap.
   3. HOIST loop-invariant loads (gamma / beta / cap / row-max operands) OUT of
      the tile loop — there is no HW cache, so a per-tile re-DMA of an invariant
      is wasted bandwidth. Load once, keep resident in SBUF, reuse every tile.
@@ -226,8 +238,17 @@ def _fmt_feedback(feedback: list[Feedback] | None) -> str:
         # ALWAYS surfaced when the error signature is known.
         rewrites = fb.rewrites or match_error(fb.error_log or "")
         err = (fb.error_log or "").strip()
-        block = [f"--- Round {fb.round} compiler error (verbatim) ---",
-                 err or "(empty error log)"]
+        block = [f"--- Round {fb.round} compiler error (verbatim) ---"]
+        # TARGETED SDK-API repair hints: when the error matches a KNOWN
+        # signature (e.g. nc_matmul missing `moving`), PREPEND a loud, imperative
+        # correction ("COMPILER SAID X — DO THIS:") ABOVE the raw error so the
+        # model acts on the exact fix instead of re-emitting the same broken call
+        # under repair pressure. Injected IN ADDITION to the verbatim error and
+        # the catalog rewrites below — see repair_hints.py.
+        hint_text = format_hints(match_hints(fb.error_log or ""))
+        if hint_text:
+            block.append(hint_text)
+        block.append(err or "(empty error log)")
         if rewrites:
             block.append("Matched rewrite(s) from the catalog — APPLY before "
                          "re-authoring:")

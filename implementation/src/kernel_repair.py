@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from kernel_rewrites import Rewrite, describe, match_error
+from repair_hints import format_hints, match_hints
 
 
 @dataclass
@@ -56,7 +57,12 @@ class Feedback:
         """The actionable message the author consumes on the next round."""
         tail = self.error_log.strip().splitlines()[-6:]
         fix = describe(self.rewrites)
-        lead = (f"Round {self.round} failed to compile.\n"
+        # Loud, imperative SDK-API correction when the error matches a known
+        # signature (nc_matmul/nc_transpose signature misuse, etc.). Prepended
+        # so it is the first thing the author reads. See repair_hints.py.
+        hint_text = format_hints(match_hints(self.error_log or ""))
+        lead = ((hint_text + "\n\n" if hint_text else "")
+                + f"Round {self.round} failed to compile.\n"
                 f"Compiler error (tail):\n  " + "\n  ".join(tail) + "\n"
                 f"Known fix for this symptom: {fix}")
         if self.rewrites:
@@ -92,10 +98,18 @@ CompileFn = Callable[[Any], CompileResult]
 class KernelRepairLoop:
     """Bounded author -> compile -> diagnose -> re-author loop."""
 
-    def __init__(self, max_rounds: int = 6, stall_patience: int = 2) -> None:
+    def __init__(self, max_rounds: int = 6, stall_patience: int = 2,
+                 hint_bonus: int = 2) -> None:
         # stall_patience consecutive IDENTICAL errors -> bail (no progress).
         self.max_rounds = max_rounds
         self.stall_patience = stall_patience
+        # When a NEW targeted repair hint (repair_hints.match_hints) first enters
+        # the trail, the NEXT author round's prompt materially changes (it now
+        # carries a loud, imperative fix it never saw). That is progress, not a
+        # stall, so grant this many extra identical-error rounds before bailing —
+        # give the injected fix a real chance to land. Still bounded by
+        # max_rounds; a stall with no new hint bails at stall_patience as before.
+        self.hint_bonus = hint_bonus
 
     def diagnose(self, error_log: str) -> list[Rewrite]:
         """Symptom -> known rewrites. The retrieval that turns an opaque compiler
@@ -106,6 +120,8 @@ class KernelRepairLoop:
         trail: list[Feedback] = []
         last_error: str | None = None
         stall = 0
+        seen_hint_keys: set[str] = set()   # targeted hints already surfaced
+        extra_patience = 0                 # granted when a NEW hint is injected
         for rnd in range(1, self.max_rounds + 1):
             kernel = author_fn(trail)              # author sees ALL prior feedback
             result = compile_fn(kernel)
@@ -125,7 +141,19 @@ class KernelRepairLoop:
             trail.append(Feedback(rnd, result.error_log,
                                   self.diagnose(result.error_log)))
 
-            if stall + 1 >= self.stall_patience:
+            # Targeted-hint progress: if THIS error matches a known SDK-API
+            # signature we have NOT surfaced before, the next author round's
+            # prompt gains a loud imperative fix it never saw. That is material
+            # progress, so extend the stall budget by ``hint_bonus`` to give the
+            # injected fix a chance to land (bounded by max_rounds). A repeated
+            # error with NO new hint still bails at ``stall_patience``.
+            new_hints = [h for h in match_hints(result.error_log)
+                         if h.key not in seen_hint_keys]
+            if new_hints:
+                extra_patience += self.hint_bonus
+                seen_hint_keys.update(h.key for h in new_hints)
+
+            if stall + 1 >= self.stall_patience + extra_patience:
                 return RepairOutcome(
                     False, rnd, "stalled: repeated identical error, no progress",
                     None, "", trail)
