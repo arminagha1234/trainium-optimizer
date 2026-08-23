@@ -48,11 +48,13 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import linecache
 import os
 import re
 import sys
 import tempfile
+import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -245,8 +247,64 @@ _ALLOC_FIRST_DIM = re.compile(
 )
 
 
+def _scrub_comments_and_strings(nki_src: str) -> str:
+    """Blank the CONTENTS of comments and string/docstring literals, keeping the
+    line/column layout of everything else intact.
+
+    BUG #1 fix — the lint rules below are raw substring/regex scans. Before this,
+    a HELPFUL comment or docstring that merely *names* a forbidden construct
+    ("# indexing via nl.mgrid only (no nl.arange)", "# no int(...) / no .tile(")
+    tripped the lint as a false positive; the repair loop fed the same lint error
+    back, the model kept explaining what it had already avoided, and the round
+    stalled on an identical error. Blanking comment/string bodies to spaces
+    (preserving newlines so line numbers stay aligned, and every other column so
+    the indentation-based DMA scan is unaffected) makes the lint see only REAL
+    code: the forbidden tokens still flag when they appear in code, and are
+    ignored when they appear only in prose.
+
+    Uses ``tokenize`` to identify COMMENT / STRING (and, on 3.12+, FSTRING literal
+    text) tokens. Falls back to the raw source if tokenize raises — a partial /
+    not-yet-valid kernel the model is mid-authoring must still be lint-checkable
+    (better a spurious flag than a crash), and only exact code tokens are blanked
+    so a tokenize failure cannot hide a real violation.
+    """
+    if not nki_src:
+        return nki_src
+    # FSTRING_MIDDLE (the literal text spans of an f-string) only exists on
+    # Python 3.12+; guard so this stays importable on older interpreters.
+    blank_types = {tokenize.COMMENT, tokenize.STRING}
+    fstring_middle = getattr(tokenize, "FSTRING_MIDDLE", None)
+    if fstring_middle is not None:
+        blank_types.add(fstring_middle)
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(nki_src).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
+        return nki_src
+    buf = [list(line) for line in nki_src.splitlines(keepends=True)]
+    for tok in toks:
+        if tok.type not in blank_types:
+            continue
+        (srow, scol), (erow, ecol) = tok.start, tok.end
+        for row in range(srow, erow + 1):
+            idx = row - 1
+            if idx < 0 or idx >= len(buf):
+                continue
+            line = buf[idx]
+            c0 = scol if row == srow else 0
+            c1 = ecol if row == erow else len(line)
+            for c in range(c0, min(c1, len(line))):
+                if line[c] != "\n":
+                    line[c] = " "
+    return "".join("".join(line) for line in buf)
+
+
 def static_lint(nki_src: str) -> list[str]:
     """Return a list of rule violations (empty == clean).
+
+    The checks run against a COMMENT/STRING-scrubbed copy of the source (see
+    ``_scrub_comments_and_strings``) so a construct named only in a comment or
+    docstring never false-positives, while the same construct in real code still
+    flags — the BUG #1 fix that unblocks the LLM author's repair loop.
 
     Rules (all from CLAUDE.md's NKI section):
       1. no ``nl.arange`` — deprecated; use ``nl.mgrid`` for indexing/masking.
@@ -261,22 +319,26 @@ def static_lint(nki_src: str) -> list[str]:
     """
     violations: list[str] = []
 
-    if "nl.arange" in nki_src:
+    # Comment/string-blind scan target: forbidden tokens in prose are ignored,
+    # in code are still caught. See _scrub_comments_and_strings for the why.
+    code = _scrub_comments_and_strings(nki_src)
+
+    if "nl.arange" in code:
         violations.append("uses nl.arange (deprecated) — use nl.mgrid")
 
-    if re.search(r"(?<![\w.])int\s*\(", nki_src):
+    if re.search(r"(?<![\w.])int\s*\(", code):
         violations.append("uses int() cast in kernel body — beta-3 gotcha, use *1.0/n")
-    if ".tile(" in nki_src or re.search(r"(?<![\w.])tile\s*\(", nki_src):
+    if ".tile(" in code or re.search(r"(?<![\w.])tile\s*\(", code):
         violations.append("uses tile() in kernel body — beta-3 gotcha, avoid")
 
-    for m in _ALLOC_FIRST_DIM.finditer(nki_src):
+    for m in _ALLOC_FIRST_DIM.finditer(code):
         first = int(m.group(1))
         if first > 128:
             violations.append(
                 f"partition (first) dim {first} > 128 — partition dim must be 128"
             )
 
-    violations.extend(_lint_dma_rule(nki_src))
+    violations.extend(_lint_dma_rule(code))
     return violations
 
 
