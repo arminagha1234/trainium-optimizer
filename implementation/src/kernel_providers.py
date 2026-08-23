@@ -48,7 +48,14 @@ KERNEL_AUTHORING_PREAMBLE = (
     "You write NKI kernels for AWS Trainium. Output ONLY a fenced python code "
     "block with an @nki.jit kernel. Contract: static shapes, output tensors as "
     "kernel args, contraction on the partition axis via nisa.nc_matmul, "
-    "bf16-in/fp32-accumulate. Apply the compiler-error fix provided."
+    "bf16-in/fp32-accumulate. Apply the compiler-error fix provided. "
+    "NKI 0.6.0 gen3/trn2 (from on-device compiler errors): nc_matmul RETURNS "
+    "the result tile (no dst=/out= param) — call `psum = nisa.nc_matmul("
+    "stationary, moving)`; the moving free dim must be <=512 (tile larger dims "
+    "and accumulate in PSUM), stationary M<=128, contraction<=128; keep "
+    "reductions 2-D (`nl.sum(x, axis=1, keepdims=True)`, never 1-D); use "
+    "`nl.broadcast_to(tile, shape)` not the tensor method; multiply by scalars "
+    "with a matching-dtype tile via nl.multiply, not a bare python float."
 )
 
 # Bedrock's InvokeModel path pins the Anthropic schema by version string.

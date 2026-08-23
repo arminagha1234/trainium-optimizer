@@ -166,6 +166,28 @@ def test_preamble_carries_nki_pitfalls():
     assert "tuple-unpack" in lower or "for (a, b)" in lower
 
 
+def test_preamble_carries_nki06_compile_rules():
+    # The concrete gen3/trn2 compile rules learned on real silicon must reach
+    # the model via the authoring prompt (build_author_prompt embeds _NKI_PREAMBLE).
+    spec = catalog()["softcap"]
+    prompt = build_author_prompt(spec, lessons=None, feedback=None)
+    lower = prompt.lower()
+    # (1) nc_matmul moving free-dim <= 512 tiling rule.
+    assert "512" in prompt
+    assert "moving free dim" in lower or "moving free dimension" in lower
+    assert "psum" in lower  # accumulate-in-PSUM tiling guidance
+    # (2) reductions must stay >= 2-D (keepdims), never collapse to 1-D.
+    assert "keepdims" in lower
+    assert "1-d" in lower and "2-d" in lower
+    # (3) the exact nc_matmul 0.6.0 signature string — returns the tile, no dst=.
+    assert "nisa.nc_matmul(stationary, moving" in prompt
+    assert "is_transpose" in prompt and "tile_position" in prompt
+    assert "`dst=`/`out=`" in prompt and "returns the result tile" in lower
+    # (4) correct broadcast + scalar-dtype forms.
+    assert "nl.broadcast_to(tile, shape)" in prompt
+    assert "nl.multiply" in prompt
+
+
 # ---------------------------------------------------------------------------
 # extraction helpers
 # ---------------------------------------------------------------------------
