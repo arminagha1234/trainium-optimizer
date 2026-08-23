@@ -61,7 +61,8 @@ class KernelAuthor(Protocol):
     """
 
     def author(self, spec: OpSpec, lessons: list | None,
-               feedback: list[Feedback] | None) -> AuthoredKernel:
+               feedback: list[Feedback] | None,
+               perf_feedback: list | None = None) -> AuthoredKernel:
         ...
 
 
@@ -75,7 +76,10 @@ class RecipeAuthor:
     """
 
     def author(self, spec: OpSpec, lessons: list | None = None,
-               feedback: list[Feedback] | None = None) -> AuthoredKernel:
+               feedback: list[Feedback] | None = None,
+               perf_feedback: list | None = None) -> AuthoredKernel:
+        # Recipe is fixed — it cannot iterate on perf feedback either; accept
+        # and ignore so the KernelPerfLoop can drive it without a TypeError.
         return author_kernel(spec, lessons=lessons)
 
 
@@ -292,7 +296,8 @@ def _op_input_order(spec: OpSpec) -> list[str] | None:
 
 
 def build_author_prompt(spec: OpSpec, lessons: list | None,
-                        feedback: list[Feedback] | None) -> str:
+                        feedback: list[Feedback] | None,
+                        perf_feedback: list | None = None) -> str:
     """Assemble the authoring prompt from the NKI preamble, the op spec, the
     retrieved bank lessons, and the prior-round compiler errors + matched
     rewrites. Deterministic and side-effect free (given the spec), so it is
@@ -326,6 +331,23 @@ def build_author_prompt(spec: OpSpec, lessons: list | None,
         f"## Prior compile attempts — ALL rounds, learn from EVERY error "
         f"(do not repeat a fix that already failed a prior round)\n"
         f"{_fmt_feedback(feedback)}\n"
+        f"{_fmt_perf_feedback(perf_feedback)}"
+    )
+
+
+def _fmt_perf_feedback(perf_feedback: list | None) -> str:
+    """Render prior perf-optimization rounds (measured latency vs baseline + the
+    dominant bottleneck + the targeted fix) so the author can make the CORRECT
+    kernel FASTER. Empty string when there is none (correctness rounds only)."""
+    if not perf_feedback:
+        return ""
+    body = "\n".join(
+        pf.as_prompt() if hasattr(pf, "as_prompt") else str(pf)
+        for pf in perf_feedback
+    )
+    return (
+        f"\n## Prior perf rounds — the kernel is CORRECT but too slow; make it "
+        f"FASTER (keep it correct)\n{body}\n"
     )
 
 
@@ -387,8 +409,9 @@ class LLMAuthor:
         self._build_prompt = build_prompt
 
     def author(self, spec: OpSpec, lessons: list | None = None,
-               feedback: list[Feedback] | None = None) -> AuthoredKernel:
-        prompt = self._build_prompt(spec, lessons, feedback)
+               feedback: list[Feedback] | None = None,
+               perf_feedback: list | None = None) -> AuthoredKernel:
+        prompt = self._build_prompt(spec, lessons, feedback, perf_feedback)
         completion = self._complete(prompt)
         nki_src = extract_nki_source(completion)
         entry = extract_entry(nki_src)
