@@ -152,6 +152,16 @@ def test_bedrock_complete_fn_extracts_text_and_llm_author_parses(monkeypatch):
     assert sink["modelId"] == "anthropic.claude-opus-5"
 
 
+def test_system_preamble_carries_nki06_compile_rules():
+    # The gen3/trn2 compile rules (from on-device errors) ride the system prompt.
+    lower = KERNEL_AUTHORING_PREAMBLE.lower()
+    assert "nisa.nc_matmul(stationary, moving)" in KERNEL_AUTHORING_PREAMBLE
+    assert "no dst=/out= param" in lower or "returns" in lower
+    assert "<=512" in KERNEL_AUTHORING_PREAMBLE
+    assert "keepdims" in lower
+    assert "nl.broadcast_to(tile, shape)" in KERNEL_AUTHORING_PREAMBLE
+
+
 def test_bedrock_request_carries_system_preamble_and_prompt(monkeypatch):
     sink: dict = {}
     _install_fake_boto3(monkeypatch, sink)

@@ -114,6 +114,37 @@ Known NKI-0.6.0 pitfalls (observed on real silicon — do not repeat these):
     "expecting simple variable" — iterate a single simple loop variable instead.
   * Mind tile/partition bounds: the partition (first) dim must be <= 128, and
     never index the output past its declared dim size.
+
+NKI 0.6.0 — rules that make kernels COMPILE on gen3/trn2 (from real-silicon
+neuronx-cc errors during LLM authoring — each bullet is a verbatim compiler
+reject turned into a DO/DON'T):
+  * nc_matmul moving free-dim <= 512 (one PSUM bank): DON'T pass a `moving`
+    operand whose free dim > 512 — `nc_matmul moving free dimension 4096 exceeds
+    max 512 for nc_version=gen3`. DO tile any larger free dim into <=512 chunks
+    and loop, accumulating in PSUM. Also stationary free (M) <= 128 and the
+    contraction (partition) dim <= 128.
+  * nc_matmul call signature (0.6.0) — it RETURNS the result tile; there is NO
+    `dst=`/`out=` parameter, and `moving` is required (omitting it or passing a
+    dst errors "nc_matmul() missing moving/dst args"). Exact signature:
+      nisa.nc_matmul(stationary, moving, *, is_stationary_onezero=False,
+        is_moving_onezero=False, is_transpose=False, tile_position=(),
+        tile_size=(), mask=None) -> tile
+    DO call it as `psum = nisa.nc_matmul(stat_tile, mov_tile)` — stationary
+    [K,M], moving [K,N], contraction K on the partition axis — and assign the
+    RETURNED tile (do not write into a passed-in dst).
+  * Reductions MUST stay 2-D: `nl.sum(axis=1)` that collapses to a 1-D tensor
+    fails — SBUF/PSUM tiles need >= 2 dims. DO keep a [P,1]-shaped result
+    (`nl.sum(x, axis=1, keepdims=True)`); DON'T let a tile collapse to 1-D. Same
+    for `nl.max`.
+  * Broadcast: DO use the free-function form `nl.broadcast_to(tile, shape)`; the
+    tensor-method `tile.broadcast_to(...)` does not resolve in 0.6.0.
+  * Scalar literals must match the tile dtype: `cap * 1.0` (tile x bare python
+    float) is an object x float type error. DO multiply via
+    `nl.multiply(tile, s)` where `s` is a matching-dtype scalar tile, not a bare
+    python float.
+  * NO Python control-flow tricks in the NKI body: no `try`/`except`, no inner
+    (nested) function definitions or calls, and no tuple-unpacking — keep
+    straight-line, traceable code.
 Return ONLY the kernel source in a single ```python code block.
 """
 
