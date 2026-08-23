@@ -441,7 +441,14 @@ class InventEngine:
             args = [_to_dev(inp[k]) for k in _arg_order(spec.name, inp)]
 
             out = _invoke_kernel(fn, args)
-            got = out.to(torch.float32).cpu().numpy()
+            # Copy to host FIRST, then cast on the host. Casting the still-on-device
+            # tensor (out.to(fp32).cpu()) fuses a `convert` op into the SAME XLA graph
+            # as the NKI custom-call, which trips a neuronx-cc Simplifier crash
+            # (NCC_ISMP902 "is_subset()") on the kernel module — isolated on real
+            # silicon: out.to(fp32).cpu() -> compiler crash; out.cpu().to(fp32) -> PASS
+            # + correct. No NEURON_CC_FLAG works around it; the fix is graph structure
+            # (keep the custom-call compiling alone; do the dtype cast on the host).
+            got = out.cpu().to(torch.float32).numpy()
             correct = bool(np.allclose(got, ref, atol=_BF16_ATOL, rtol=_BF16_RTOL)) \
                 if got.shape == ref.shape else False
             # correctness pct: fraction of elements within tolerance.
@@ -805,7 +812,14 @@ class InventEngine:
                         .to(torch.bfloat16).to(device))
 
             args = [_to_dev(inp[k]) for k in _arg_order(spec.name, inp)]
-            _invoke_kernel(fn, args)   # forces neuronx-cc lowering (the compile)
+            out = _invoke_kernel(fn, args)
+            # Force the lazy neuronx-cc lowering to actually FIRE here, in the repair
+            # window, by materializing the output to host — a BARE .cpu() with NO dtype
+            # cast. (A dtype cast on-device would re-trip the NCC_ISMP902 Simplifier
+            # crash; see _device_race.) Without this materialization the lowering stays
+            # lazy and a real compile error escapes the probe, only surfacing later at
+            # the race readback instead of being fed back to the author this round.
+            out.cpu()
         except Exception as e:  # noqa: BLE001 — compiler errors are the teacher
             return repr(e)
         return None
