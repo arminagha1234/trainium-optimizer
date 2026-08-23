@@ -318,6 +318,37 @@ def test_default_engine_uses_recipe_author_single_shot(tmp_path):
     assert res.lesson_id == "invented-softcap-softcap-cap30"
 
 
+# ---------------------------------------------------------------------------
+# FIX A: the author prompt carries the PERFORMANCE rules (not only correctness)
+# ---------------------------------------------------------------------------
+def test_author_prompt_contains_performance_rules():
+    # The old preamble was ALL correctness rules and zero perf, so authored
+    # kernels came out serialized/slow. The prompt must now surface the ranked
+    # perf levers so the model writes for speed on the first draft.
+    prompt = build_author_prompt(catalog()["rmsnorm"], lessons=None, feedback=None)
+    low = prompt.lower()
+    assert "performance rules" in low
+    assert "correct-but-slow" in low                 # the framing: slow == a loss
+    assert "fuse" in low                             # (1) fuse into one kernel
+    assert "nisa.activation" in low                  # (2) scalar-engine fused reduce
+    assert "reduce_op" in low
+    assert "hoist" in low                            # (3) hoist loop-invariant loads
+    assert "keep the pe busy" in low                 # (4) engine overlap
+    assert "bf16-in" in low and "fp32-accumulate" in low  # (5) accumulate policy
+    assert "double-buffer" in low                    # (7) pipeline DMA behind compute
+    assert "reciprocal" in low                       # (8) delayed division
+
+
+def test_perf_preamble_is_ordered_after_correctness_preamble():
+    # Correctness rules first (they gate compile), perf rules second — both must
+    # be present and the perf block must not have displaced the NKI contract.
+    from kernel_author import _NKI_PREAMBLE, _PERF_PREAMBLE
+    prompt = build_author_prompt(catalog()["softcap"], lessons=None, feedback=None)
+    assert _NKI_PREAMBLE.strip() in prompt
+    assert _PERF_PREAMBLE.strip() in prompt
+    assert prompt.index(_NKI_PREAMBLE[:40]) < prompt.index(_PERF_PREAMBLE[:40])
+
+
 # ===========================================================================
 # standalone runner (no pytest required)
 # ===========================================================================

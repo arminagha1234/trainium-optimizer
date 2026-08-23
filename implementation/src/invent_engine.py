@@ -67,6 +67,7 @@ from bank import (
 )
 from guardrails import Guardrails
 import kernel_rewrites
+from kernel_anticheat import require_reproducible, run_candidate_before_reference
 from kernel_author import KernelAuthor, RecipeAuthor
 from kernel_repair import CompileResult, Feedback, KernelRepairLoop
 from ledger import Layer, Ledger, Origin, Row, Stage, Status, current_commit
@@ -125,6 +126,16 @@ class RaceResult:
     kernel_ms: float = 0.0
     baseline_ms: float = 0.0
     reason: str = ""
+    # ANALYTIC roofline signal (no profiler — derived from spec shapes+dtype by
+    # ``_analytic_roofline``). These tell the author WHY a kernel is slow, which a
+    # bare speedup ratio cannot: a memory-bound op that spills is a fusion/traffic
+    # problem, a compute-bound op that under-fills the PE is a tiling problem.
+    # Trailing + defaulted so every existing positional/keyword RaceResult
+    # construction (incl. tests + the deferred paths) is unchanged.
+    arithmetic_intensity: float = 0.0   # Flops per byte moved (HBM traffic)
+    bottleneck: str = ""                # "memory_bound" | "compute_bound" | ""
+    roofline_ratio: float = 0.0         # arithmetic_intensity / bf16 ridge point
+    mfu: float = -1.0                   # best-effort model-FLOPs-utilization ceiling; -1 == unknown
 
 
 @dataclass
@@ -153,6 +164,158 @@ RaceFn = Callable[[AuthoredKernel, OpSpec], RaceResult]
 # a CompileResult (ok + error_log). On device the engine's own ``_compile`` is
 # used; tests inject a deterministic stand-in compiler.
 CompileFnT = Callable[[AuthoredKernel], CompileResult]
+
+
+# ---------------------------------------------------------------------------
+# analytic roofline — the PERF signal, computed from shapes (no profiler)
+# ---------------------------------------------------------------------------
+# bf16 TensorE ridge point on NC-v3/trn2: ~222 Flops/Byte (playbook §10 — below
+# this arithmetic intensity the op is memory-bound, above it compute-bound). We
+# stay device-independent on purpose: this classifies a kernel from its SPEC
+# (shapes + dtype), so it is a pure, unit-testable function and needs no run.
+_BF16_RIDGE_FLOPS_PER_BYTE = 222.0
+
+# Bytes per element by dtype string (best-effort; defaults to bf16=2 — the
+# engine's on-device dtype). Substring match keeps it robust to prefixes like
+# "torch." / "np.".
+_DTYPE_BYTES = {
+    "fp8": 1, "float8": 1, "int8": 1, "e4m3": 1, "e5m2": 1,
+    "bf16": 2, "bfloat16": 2, "fp16": 2, "float16": 2, "half": 2, "int16": 2,
+    "fp32": 4, "float32": 4, "float": 4, "int32": 4,
+    "fp64": 8, "float64": 8, "int64": 8,
+}
+
+# Flops per input element for the non-matmul ops (elementwise + norm/reduction).
+# These are the small-constant "a few ops per element" shapes: an activation, a
+# norm, a reduction all move O(N) bytes and do O(N) flops, so their arithmetic
+# intensity is O(1) << ridge — memory-bound by construction. The exact constant
+# does not change the classification (all are << 222); it only makes the reported
+# AI plausible. Matched by op-name substring; default 4.0.
+_FLOPS_PER_ELEM = {
+    "rmsnorm": 5.0, "layernorm": 7.0, "softmax": 5.0, "gelu": 8.0,
+    "silu": 4.0, "softcap": 5.0, "rope": 6.0, "add": 2.0,
+}
+
+# Op-name / family tokens that mean "the work is a matmul" — arithmetic intensity
+# can be high (compute-bound), so we estimate MACs from the contracting shapes
+# rather than the elementwise per-element constant.
+_MATMUL_TOKENS = ("matmul", "mm", "linear", "attn", "attention", "gemm")
+
+
+def _dtype_bytes(dtype: str) -> int:
+    """Bytes-per-element for a dtype string; defaults to 2 (bf16, the on-device
+    dtype the engine casts inputs to for the race)."""
+    d = (dtype or "").lower()
+    for token, nbytes in _DTYPE_BYTES.items():
+        if token in d:
+            return nbytes
+    return 2
+
+
+def _flops_per_elem(name: str) -> float:
+    """Per-input-element flop count for a non-matmul op, by name substring."""
+    n = (name or "").lower()
+    for token, f in _FLOPS_PER_ELEM.items():
+        if token in n:
+            return f
+    return 4.0
+
+
+def _analytic_roofline(spec: OpSpec) -> tuple[float, str, float]:
+    """Classify an op against the bf16 roofline from its SPEC alone.
+
+    Returns ``(arithmetic_intensity, bottleneck, roofline_ratio)`` where
+    ``arithmetic_intensity`` is Flops per byte moved, ``bottleneck`` is
+    ``"memory_bound"`` (below the ~222 Flops/Byte bf16 ridge) or
+    ``"compute_bound"`` (at/above it), and ``roofline_ratio`` is
+    ``arithmetic_intensity / ridge`` (<1 memory-bound, >=1 compute-bound).
+
+    Pure and device-free: it reads the input shapes (``spec.real_inputs`` with an
+    ``offline_inputs`` fallback) and the output shape (``spec.reference``), counts
+    ONE load per input + ONE store of the output (the fused ideal — playbook §11),
+    and estimates flops. For an elementwise/norm/reduction op that is O(1) flops
+    per byte (well under the ridge -> memory-bound, which is why fusion is the
+    #1 lever for them); for a matmul-family op it estimates MACs from the two
+    largest 2-D operands (M*N*K) so a genuine GEMM can land compute-bound. Never
+    raises — any shape/reference failure degrades to a memory-bound default with
+    a zero AI rather than crashing the race.
+    """
+    nbytes = _dtype_bytes(spec.dtype)
+    try:
+        inp = spec.real_inputs()
+        if not isinstance(inp, dict):
+            inp = {}
+    except Exception:  # noqa: BLE001 — a shape-gen failure must not crash the race
+        inp = {}
+    arrays = [np.asarray(v) for v in inp.values()]
+    in_elems = int(sum(a.size for a in arrays))
+    try:
+        out = np.asarray(spec.reference(inp))
+        out_elems = int(out.size)
+    except Exception:  # noqa: BLE001 — fall back to the largest input as the store size
+        out_elems = max((a.size for a in arrays), default=0)
+
+    bytes_moved = float((in_elems + out_elems) * nbytes)
+    if bytes_moved <= 0:
+        return 0.0, "memory_bound", 0.0
+
+    name = (spec.name or "").lower()
+    if any(tok in name for tok in _MATMUL_TOKENS):
+        # MACs ~= M*N*K from the two largest 2-D operands (2 flops/MAC). This is a
+        # coarse estimate — enough to let a real GEMM cross the ridge; decode-shape
+        # "attn" ops with a thin operand stay low (correctly memory-bound).
+        twod = sorted((a for a in arrays if a.ndim >= 2),
+                      key=lambda a: a.size, reverse=True)
+        if twod:
+            m, k = twod[0].shape[0], twod[0].shape[-1]
+            n = twod[1].shape[-1] if len(twod) > 1 else 1
+            flops = 2.0 * float(m) * float(n) * float(k)
+        else:
+            flops = _flops_per_elem(name) * float(in_elems)
+    else:
+        flops = _flops_per_elem(name) * float(in_elems)
+
+    ai = flops / bytes_moved
+    ratio = ai / _BF16_RIDGE_FLOPS_PER_BYTE
+    bottleneck = "memory_bound" if ai < _BF16_RIDGE_FLOPS_PER_BYTE else "compute_bound"
+    return ai, bottleneck, ratio
+
+
+# ---------------------------------------------------------------------------
+# adversarial measure-path protocol — anti-reward-hacking (FIX C)
+# ---------------------------------------------------------------------------
+def _measure_candidate(candidate_fn: Callable[[], Any],
+                       reference_fn: Callable[[], Any],
+                       *, scrub_fn: Callable[[], None] | None = None,
+                       repro_runs: int = 2) -> tuple[Any, Any, bool, str]:
+    """Run the correctness measurement under the two anti-reward-hack protocols
+    from ``kernel_anticheat``, so a kernel cannot pass by gaming the harness.
+
+    1. **Candidate before reference** (``run_candidate_before_reference``): the
+       candidate is run FIRST, so no reference-produced output exists for a
+       do-nothing kernel to alias/return (Kevin-32B's recycled-output exploit).
+    2. **Run twice, require identical** (``require_reproducible``): the candidate
+       must produce the SAME result across repeats — a candidate that reads a
+       racy/uninitialized/aliased buffer drifts and is rejected (Sakana's
+       "it's really the reference" measurement). ``scrub_fn`` is called between
+       runs to zero/scrub any reusable output/scratch buffer so a stale value
+       cannot be recycled and masquerade as deterministic.
+
+    Returns ``(candidate_out, reference_out, reproducible, repro_reason)``. This
+    is pure sequencing of INJECTED callables — no device — so the whole protocol
+    is unit-testable on CPU mocks, which is the point (the real device wiring in
+    ``_device_race`` supplies the concrete run/scrub callables).
+    """
+    candidate_out, reference_out = run_candidate_before_reference(
+        candidate_fn, reference_fn)
+
+    def _repeat() -> Any:
+        if scrub_fn is not None:
+            scrub_fn()           # scrub reusable buffers BEFORE each repeat run
+        return candidate_fn()
+
+    reproducible, repro_reason = require_reproducible(_repeat, n=repro_runs)
+    return candidate_out, reference_out, reproducible, repro_reason
 
 
 # ---------------------------------------------------------------------------
@@ -394,12 +557,20 @@ class InventEngine:
         # off in-process too (build() also sets this; belt-and-suspenders in case
         # the caller imported nki before build() ran).
         os.environ["NKI_ENABLE_TRACE_CACHE"] = "0"
+        # ANALYTIC roofline signal — shape-derived and device-independent, so we
+        # compute it up front and attach it to EVERY RaceResult below (including
+        # the deferred / errored ones): the perf classification is a property of
+        # the op, not of whether this particular box could run it.
+        ai, bottleneck, ratio = _analytic_roofline(spec)
+        mfu = min(1.0, ratio) if ratio > 0 else -1.0
+        _perf = dict(arithmetic_intensity=ai, bottleneck=bottleneck,
+                     roofline_ratio=ratio, mfu=mfu)
         fn = author.build()
         if fn is None:
             return RaceResult(False, reason=(
                 "kernel not built (off-device: no nki) — on-device race deferred"
                 if not nki_available() else
-                "kernel failed to build/trace on device"))
+                "kernel failed to build/trace on device"), **_perf)
         # A speed race is only meaningful when BOTH contenders are measured the
         # SAME way on the SAME device. Establish the Neuron device handle up
         # front: if we cannot (no torch_xla / not really on a device), then we
@@ -412,7 +583,7 @@ class InventEngine:
             return RaceResult(False, reason=(
                 "kernel built but no Neuron device handle for a fair "
                 "same-device, same-method race — deferred (never a "
-                "CPU-baseline-vs-device-kernel speedup)"))
+                "CPU-baseline-vs-device-kernel speedup)"), **_perf)
         try:
             import torch  # noqa: PLC0415 — device-only import
             import nki      # noqa: PLC0415
@@ -425,7 +596,6 @@ class InventEngine:
             # still touches it is a LABELLED fallback, guarded there.
 
             inp = spec.real_inputs()
-            ref = np.asarray(spec.reference(inp), dtype=np.float32)
 
             def _to_dev(a: np.ndarray):
                 # Move onto the SAME device the kernel runs on — the baseline is
@@ -440,15 +610,39 @@ class InventEngine:
             # jit'd fn directly instead of wrap_nki(kernel)[1](**kwargs).
             args = [_to_dev(inp[k]) for k in _arg_order(spec.name, inp)]
 
-            out = _invoke_kernel(fn, args)
-            # Copy to host FIRST, then cast on the host. Casting the still-on-device
-            # tensor (out.to(fp32).cpu()) fuses a `convert` op into the SAME XLA graph
-            # as the NKI custom-call, which trips a neuronx-cc Simplifier crash
-            # (NCC_ISMP902 "is_subset()") on the kernel module — isolated on real
-            # silicon: out.to(fp32).cpu() -> compiler crash; out.cpu().to(fp32) -> PASS
-            # + correct. No NEURON_CC_FLAG works around it; the fix is graph structure
-            # (keep the custom-call compiling alone; do the dtype cast on the host).
-            got = out.cpu().to(torch.float32).numpy()
+            def _candidate():
+                out = _invoke_kernel(fn, args)
+                # Copy to host FIRST, then cast on the host. Casting the still-on-
+                # device tensor (out.to(fp32).cpu()) fuses a `convert` op into the
+                # SAME XLA graph as the NKI custom-call, which trips a neuronx-cc
+                # Simplifier crash (NCC_ISMP902 "is_subset()") on the kernel module
+                # — isolated on real silicon: out.to(fp32).cpu() -> compiler crash;
+                # out.cpu().to(fp32) -> PASS + correct. No NEURON_CC_FLAG works
+                # around it; the fix is graph structure (keep the custom-call
+                # compiling alone; do the dtype cast on the host).
+                return out.cpu().to(torch.float32).numpy()
+
+            def _reference():
+                return np.asarray(spec.reference(inp), dtype=np.float32)
+
+            # ADVERSARIAL correctness (FIX C, anti-reward-hacking): run the
+            # CANDIDATE before the REFERENCE — so a do-nothing kernel has no
+            # reference output to alias (Kevin-32B) — and require the candidate to
+            # be REPRODUCIBLE across repeats (a racy/aliased/uninitialized read
+            # drifts; Sakana). In this direct-call contract the kernel RETURNS a
+            # fresh output tensor each invocation (there is no passed-in out=
+            # buffer to recycle), so each repeat already produces a fresh buffer
+            # and there is no persistent output to scrub between runs — the
+            # candidate-before-reference ordering + the run-twice check are the
+            # load-bearing protections here.
+            got, ref, reproducible, repro_reason = _measure_candidate(
+                _candidate, _reference, scrub_fn=None)
+            if not reproducible:
+                # Nondeterministic / gamed output is NOT correct, regardless of
+                # whether a single run happened to match the reference.
+                return RaceResult(True, correct=False, correctness_pct=0.0,
+                                  reason=f"non-reproducible candidate — {repro_reason}",
+                                  **_perf)
             correct = bool(np.allclose(got, ref, atol=_BF16_ATOL, rtol=_BF16_RTOL)) \
                 if got.shape == ref.shape else False
             # correctness pct: fraction of elements within tolerance.
@@ -480,13 +674,14 @@ class InventEngine:
                 # same-device) — defer instead of banking a meaningless ratio.
                 return RaceResult(False, reason=(
                     f"fair on-device timing failed (kernel={kernel_ms:.3f}ms, "
-                    f"baseline={baseline_ms:.3f}ms) — deferred"))
+                    f"baseline={baseline_ms:.3f}ms) — deferred"), **_perf)
             return RaceResult(True, correct, corr_pct, speedup,
                               kernel_ms, baseline_ms,
-                              reason=f"correct={correct} speedup={speedup:.3f}x")
+                              reason=f"correct={correct} speedup={speedup:.3f}x",
+                              **_perf)
         except Exception as e:  # noqa: BLE001 — device errors are data
             return RaceResult(True, False, 0.0, 0.0,
-                              reason=f"device race error: {e!r}")
+                              reason=f"device race error: {e!r}", **_perf)
 
     # -- banking -------------------------------------------------------------
 

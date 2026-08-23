@@ -25,6 +25,9 @@ from invent_engine import (
     OfflineGate,
     RaceResult,
     load_specs_from_file,
+    _analytic_roofline,
+    _measure_candidate,
+    _BF16_RIDGE_FLOPS_PER_BYTE,
 )
 from invent_kernels import (
     AuthoredKernel,
@@ -662,6 +665,97 @@ def test_compile_gate_off_device_stays_offline_only(tmp_path):
     spec = catalog()["softcap"]
     r = eng._compile(author_kernel(spec), spec)
     assert r.ok and r.artifact.startswith("offline-only:")
+
+
+# ---------------------------------------------------------------------------
+# FIX B: analytic roofline signal (no profiler — classifies from shapes+dtype)
+# ---------------------------------------------------------------------------
+def test_analytic_roofline_classifies_rmsnorm_as_memory_bound():
+    # rmsnorm moves O(N) bytes and does O(N) flops -> arithmetic intensity is a
+    # small O(1), far below the ~222 Flops/Byte bf16 ridge -> memory-bound (which
+    # is WHY fusion is the #1 lever for it). Assert both the classification and a
+    # sane (small, positive, sub-ridge) arithmetic intensity.
+    ai, bottleneck, ratio = _analytic_roofline(catalog()["rmsnorm"])
+    assert bottleneck == "memory_bound"
+    assert 0.0 < ai < _BF16_RIDGE_FLOPS_PER_BYTE
+    assert ai < 10.0                       # a norm is single-digit Flops/Byte
+    assert ratio == ai / _BF16_RIDGE_FLOPS_PER_BYTE
+    assert ratio < 1.0                     # memory-bound => below the knee
+
+
+def test_analytic_roofline_marks_large_matmul_compute_bound():
+    # A big square GEMM crosses the ridge: AI = N/3 for an NxN bf16 matmul, so
+    # N=2048 gives ~683 Flops/Byte (the playbook's own number) -> compute-bound.
+    base = catalog()["rmsnorm"]
+    n = 2048
+    a = np.ones((n, n), dtype=np.float32)
+    mm = OpSpec(
+        name="matmul_big", family=base.family, shape_class="square", dtype="bf16",
+        reference=lambda inp: inp["a"] @ inp["b"],
+        offline_inputs=lambda: {"a": a, "b": a},
+        real_inputs=lambda: {"a": a, "b": a},
+    )
+    ai, bottleneck, ratio = _analytic_roofline(mm)
+    assert bottleneck == "compute_bound"
+    assert ai >= _BF16_RIDGE_FLOPS_PER_BYTE and ratio >= 1.0
+
+
+def test_analytic_roofline_never_raises_on_bad_spec():
+    # A spec whose reference/inputs blow up must degrade, not crash the race.
+    base = catalog()["rmsnorm"]
+    bad = OpSpec(
+        name="broken", family=base.family, shape_class="x", dtype="bf16",
+        reference=lambda inp: (_ for _ in ()).throw(RuntimeError("boom")),
+        offline_inputs=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        real_inputs=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    ai, bottleneck, ratio = _analytic_roofline(bad)
+    assert bottleneck == "memory_bound" and ai == 0.0 and ratio == 0.0
+
+
+def test_raceresult_perf_fields_default_and_construct():
+    # Trailing defaulted fields: existing positional construction is unchanged,
+    # and the perf signal round-trips when supplied.
+    assert RaceResult(True).mfu == -1.0
+    assert RaceResult(True).bottleneck == ""
+    rr = RaceResult(True, correct=True, arithmetic_intensity=1.25,
+                    bottleneck="memory_bound", roofline_ratio=0.006, mfu=0.006)
+    assert rr.arithmetic_intensity == 1.25 and rr.bottleneck == "memory_bound"
+
+
+# ---------------------------------------------------------------------------
+# FIX C: adversarial measure path (anti-reward-hacking) on CPU mocks
+# ---------------------------------------------------------------------------
+def test_measure_candidate_runs_candidate_before_reference():
+    # Kevin-32B recycled-output exploit: the candidate must run BEFORE the
+    # reference so no reference output exists for a do-nothing kernel to alias.
+    order: list[str] = []
+    got, ref, ok, why = _measure_candidate(
+        lambda: order.append("candidate") or 3,
+        lambda: order.append("reference") or 3,
+    )
+    assert order[0] == "candidate"          # candidate first, always
+    assert "reference" in order
+    assert got == 3 and ref == 3 and ok
+
+
+def test_measure_candidate_rejects_nondeterministic_candidate():
+    # Sakana "it's really the reference" hack: a candidate that drifts between
+    # runs (racy/uninitialized/aliased read) is not reproducible -> rejected.
+    seq = iter([1, 2, 3])
+    _got, _ref, ok, why = _measure_candidate(lambda: next(seq), lambda: 1)
+    assert not ok and "non-reproducible" in why
+
+
+def test_measure_candidate_scrubs_between_repro_runs():
+    # The scrub_fn (zero/scrub reusable output buffers) is invoked between the
+    # reproducibility repeats so a stale value cannot be recycled as "stable".
+    scrubs = {"n": 0}
+    def _scrub():
+        scrubs["n"] += 1
+    _got, _ref, ok, _why = _measure_candidate(
+        lambda: 42, lambda: 42, scrub_fn=_scrub, repro_runs=3)
+    assert ok and scrubs["n"] >= 1          # scrub ran between repeats
 
 
 # ===========================================================================

@@ -149,6 +149,50 @@ Return ONLY the kernel source in a single ```python code block.
 """
 
 
+# The PERFORMANCE half of the standing contract. The rules above make a kernel
+# COMPILE and be CORRECT; these make it FAST — and on this engine a correct-but-
+# slow kernel is banked as an anti_pattern (a loss), so speed is not a follow-up
+# pass, it is a first-draft requirement. Ranked by ROI, distilled from
+# ../../docs/nki-optimization-playbook.md (§11 fusion, §5 engine routing, §3/§4
+# HBM traffic, §6 pipelining, §8 numerics, §10 roofline). Kept to terse bullets
+# so it is cheap in-prompt and the model can act on it directly.
+_PERF_PREAMBLE = """\
+PERFORMANCE RULES (write for speed from the first draft — a correct-but-slow
+kernel is a loss):
+  1. FUSE the whole op into ONE kernel. Intermediates stay in SBUF; do ONE load
+     per input and ONE store of the output — never round-trip a temporary
+     through HBM (there is no HW cache; a spilled intermediate is pure loss).
+  2. FUSE instructions onto the Scalar engine via `nisa.activation(op=, bias=,
+     scale=, reduce_op=nl.add)`: it computes `op(scale*x + bias)` AND a free-axis
+     reduce in ONE instruction. Use it —
+       * rmsnorm: `op=nl.square, reduce_op=nl.add` gets mean-square in one pass;
+         do NOT materialize a squared tile then sum it separately.
+       * softmax: `op=nl.exp` with the (negated) row-max as `bias` and
+         `reduce_op=nl.add` gives `exp(x-max)` + the running denominator at once.
+       * softcap: `tanh(x/cap)*cap` via `scale=1/cap` (op=tanh) then one multiply.
+  3. HOIST loop-invariant loads (gamma / beta / cap / row-max operands) OUT of
+     the tile loop — there is no HW cache, so a per-tile re-DMA of an invariant
+     is wasted bandwidth. Load once, keep resident in SBUF, reuse every tile.
+  4. KEEP THE PE BUSY — overlap the engines instead of serializing one. Route the
+     reduce to the Scalar engine and the elementwise apply to the Vector engine
+     so they run concurrently, and broadcast gamma via a TensorE matmul-against-
+     ones so the otherwise-idle PE does the broadcast (a 3-engine pipeline, not
+     one serial engine doing everything).
+  5. bf16-in / fp32-accumulate. Read bf16, accumulate in fp32 (PSUM/Scalar are
+     fp32), and cast back to bf16 only at the FINAL store (the Scalar engine's
+     embedded cast pipelines it for free).
+  6. WIDE, ALIGNED tiles: partition dim = 128; free dim >= 512 (bf16 >= 1024) so
+     each DMA moves >= 2 KiB/partition and all 16 DMA engines stay busy — small
+     tiles are packet-rate bound, not bandwidth bound.
+  7. DOUBLE-BUFFER: structure the loop so tile n+1's DMA overlaps tile n's
+     compute (buffer rotation), driving latency toward `max(compute, dma)` rather
+     than `compute + dma`.
+  8. Keep reductions 2-D with keepdims and DELAY the division: reduce to a [P,1]
+     tile and apply `1/sum` to the FINAL result via `nisa.reciprocal` (one op on
+     the small output), never divide every element mid-stream.
+"""
+
+
 def _fmt_lessons(lessons: list | None) -> str:
     if not lessons:
         return "(none retrieved)"
@@ -238,6 +282,7 @@ def build_author_prompt(spec: OpSpec, lessons: list | None,
         sig_hint = f"{spec.name}_kernel(...)"
     return (
         f"{_NKI_PREAMBLE}\n"
+        f"{_PERF_PREAMBLE}\n"
         f"## Op to author\n"
         f"  name        : {spec.name}\n"
         f"  entry naming: define `@nki.jit def {sig_hint}`\n"

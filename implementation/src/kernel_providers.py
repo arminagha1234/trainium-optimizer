@@ -55,7 +55,26 @@ KERNEL_AUTHORING_PREAMBLE = (
     "and accumulate in PSUM), stationary M<=128, contraction<=128; keep "
     "reductions 2-D (`nl.sum(x, axis=1, keepdims=True)`, never 1-D); use "
     "`nl.broadcast_to(tile, shape)` not the tensor method; multiply by scalars "
-    "with a matching-dtype tile via nl.multiply, not a bare python float."
+    "with a matching-dtype tile via nl.multiply, not a bare python float. "
+    # PERFORMANCE RULES — mirror of kernel_author._PERF_PREAMBLE. A correct-but-
+    # slow kernel is banked as an anti_pattern (a loss), so write for speed from
+    # the first draft.
+    "PERFORMANCE RULES (write for speed from the first draft — a correct-but-slow "
+    "kernel is a loss): (1) FUSE the whole op into one kernel — intermediates "
+    "stay in SBUF, one load per input and one store, never round-trip HBM (no HW "
+    "cache). (2) FUSE onto the Scalar engine via nisa.activation(op=, bias=, "
+    "scale=, reduce_op=nl.add) = op(scale*x+bias)+free-axis-reduce in ONE "
+    "instruction (rmsnorm: op=square+reduce=add for mean-square in one pass, "
+    "don't materialize a squared tile then sum; softmax: op=exp with -row-max as "
+    "bias + reduce=add; softcap: tanh via scale=1/cap). (3) HOIST loop-invariant "
+    "loads (gamma/beta/cap) OUT of the tile loop — no HW cache, don't re-DMA per "
+    "tile. (4) KEEP THE PE BUSY — route reduce->Scalar and apply->Vector so they "
+    "overlap, broadcast gamma via a TensorE matmul-against-ones (3-engine "
+    "pipeline, not one serial engine). (5) bf16-in/fp32-accumulate, cast at the "
+    "final store. (6) wide aligned tiles (partition=128, free>=512, bf16>=1024). "
+    "(7) double-buffer so tile n+1's load overlaps tile n's compute (latency = "
+    "max(compute,dma)). (8) reductions stay 2-D keepdims, delay the division "
+    "(apply 1/sum via nisa.reciprocal to the final result)."
 )
 
 # Bedrock's InvokeModel path pins the Anthropic schema by version string.

@@ -382,6 +382,22 @@ def test_make_complete_fn_auto_raises_naming_both_remedies(monkeypatch):
         raise AssertionError("expected ProviderNotAvailable when nothing resolves")
 
 
+# ---------------------------------------------------------------------------
+# FIX A: the system preamble carries the PERFORMANCE rules too
+# ---------------------------------------------------------------------------
+def test_system_preamble_contains_performance_rules():
+    # The standing system contract sent on every request must now include the
+    # perf levers (mirrors kernel_author._PERF_PREAMBLE), not only the NKI
+    # correctness rules — a correct-but-slow kernel is banked as a loss.
+    low = KERNEL_AUTHORING_PREAMBLE.lower()
+    assert "performance rules" in low
+    assert "fuse" in low
+    assert "nisa.activation" in low and "reduce_op" in low
+    assert "hoist" in low
+    assert "double-buffer" in low
+    assert "reciprocal" in low
+
+
 # ===========================================================================
 # standalone runner (no pytest required)
 # ===========================================================================
