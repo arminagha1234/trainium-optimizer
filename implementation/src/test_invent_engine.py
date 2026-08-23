@@ -160,6 +160,71 @@ def test_lint_clean_on_authored_kernels():
         assert static_lint(a.nki_src) == [], f"{name} should lint clean"
 
 
+# -- BUG #1 regression: static_lint must be comment/string-blind -------------
+def test_lint_ignores_forbidden_tokens_in_comments_and_docstrings():
+    # The exact trap that stalled the LLM author: helpful comments/docstrings
+    # that NAME the forbidden constructs must NOT flag. Real code below uses only
+    # nl.mgrid / *1.0/n, so this kernel is genuinely clean.
+    src = (
+        "import nki.language as nl\n"
+        "@nki.jit\n"
+        "def k(x):\n"
+        '    """Index via nl.mgrid only (no nl.arange). No int(...) / no .tile(...)."""\n'
+        "    # indexing via nl.mgrid only (no nl.arange)\n"
+        "    # no int( cast, no .tile( in the body — use *1.0/n\n"
+        "    ix = nl.mgrid[0:128, 0:64]\n"
+        "    ms = nl.sum(x, axis=1) * (1.0 / 64)\n"
+        "    return ms\n"
+    )
+    assert static_lint(src) == [], static_lint(src)
+
+
+def test_lint_still_flags_forbidden_tokens_in_real_code():
+    # Same tokens, but now in EXECUTABLE code — every rule must still fire.
+    src = (
+        "import nki.language as nl\n"
+        "@nki.jit\n"
+        "def k(x):\n"
+        "    idx = nl.arange(0, 128)\n"          # rule 1
+        "    n = int(3.0)\n"                       # rule 2 (int cast)
+        "    y = x.tile((2, 2))\n"                 # rule 2 (tile)
+        "    a = nl.ndarray((256, 64), dtype=x.dtype)\n"  # rule 3 (partition > 128)
+        "    return a\n"
+    )
+    v = static_lint(src)
+    assert any("arange" in s for s in v), v
+    assert any("int()" in s for s in v), v
+    assert any("tile()" in s for s in v), v
+    assert any("partition" in s for s in v), v
+
+
+def test_lint_comment_only_dma_reference_does_not_flag_but_real_one_does():
+    # The DMA rule is a line/indentation scan — prove the comment-blind path
+    # keeps it working: a dma_copy mentioned only in a comment is clean; a real
+    # per-index dma_copy inside a loop still flags.
+    clean = (
+        "for k in nl.affine_range(8):\n"
+        "    # avoid a per-index dma_copy(dst=buf[k, 0:128]) here — use one DMA\n"
+        "    buf = nl.load(w[0:128, 0:128])\n"
+    )
+    assert static_lint(clean) == [], static_lint(clean)
+
+    dirty = (
+        "for k in nl.affine_range(8):\n"
+        "    nisa.dma_copy(dst=buf[k, 0:128], src=w[k, 0:128])\n"
+    )
+    assert any("per-index DMA" in s for s in static_lint(dirty))
+
+
+def test_lint_falls_back_gracefully_on_partial_source():
+    # A not-yet-valid kernel (tokenize will choke) must still be lint-checkable —
+    # the scrubber falls back to the raw source rather than crashing, so a real
+    # nl.arange in the partial code is still caught.
+    partial = "def k(:\n    idx = nl.arange(0, 128)\n"
+    v = static_lint(partial)
+    assert any("arange" in s for s in v), v
+
+
 # -- banking: win ------------------------------------------------------------
 def test_win_banks_invented_nki_kernel_lesson(tmp_path):
     eng = InventEngine(out_dir=tmp_path)

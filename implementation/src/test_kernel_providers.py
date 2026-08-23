@@ -25,8 +25,10 @@ from pathlib import Path
 from invent_kernels import catalog
 from kernel_author import LLMAuthor
 from kernel_providers import (
+    EmptyCompletion,
     KERNEL_AUTHORING_PREAMBLE,
     ProviderNotAvailable,
+    anthropic_complete_fn,
     author_from_provider,
     bedrock_complete_fn,
     echo_complete_fn,
@@ -155,6 +157,95 @@ def test_bedrock_omits_temperature_when_none_includes_when_set(monkeypatch):
     # explicit value -> sent (older models still accept it).
     bedrock_complete_fn(temperature=0.0)("hi def x_kernel(")
     assert sink["body"]["temperature"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# BUG #2: thinking-token budget — stop_reason=max_tokens + no text must NOT
+# silently return "" (empty authored source); it must raise EmptyCompletion.
+# ---------------------------------------------------------------------------
+class _MaxTokensBedrockClient:
+    """Fake bedrock client that returns a thinking-only response: the model
+    burned all of max_tokens on `thinking`, so stop_reason='max_tokens' and
+    there is NO text block."""
+
+    def __init__(self, sink: dict):
+        self._sink = sink
+
+    def invoke_model(self, *, modelId: str, body: str):  # noqa: N803
+        self._sink["body"] = json.loads(body)
+        payload = {
+            "stop_reason": "max_tokens",
+            "content": [{"type": "thinking", "thinking": "...long reasoning..."}],
+        }
+        return {"body": _FakeBody(json.dumps(payload).encode("utf-8"))}
+
+
+def _install_fake_boto3_maxtokens(monkeypatch, sink: dict):
+    fake = types.ModuleType("boto3")
+
+    def _client(service, region_name=None, **_):
+        return _MaxTokensBedrockClient(sink)
+
+    fake.client = _client
+    monkeypatch.setitem(sys.modules, "boto3", fake)
+
+
+def test_bedrock_raises_on_max_tokens_with_no_text(monkeypatch):
+    sink: dict = {}
+    _install_fake_boto3_maxtokens(monkeypatch, sink)
+    fn = bedrock_complete_fn(temperature=None)
+    try:
+        fn("author me a kernel: def softcap_kernel(")
+    except EmptyCompletion as exc:
+        # Diagnostic names the real cause and the fix (raise max_tokens).
+        assert "max_tokens" in str(exc)
+    else:
+        raise AssertionError("expected EmptyCompletion, not a silent empty string")
+
+
+def test_bedrock_default_max_tokens_raised_for_thinking_model():
+    # BUG #2: the default must be well above the old 4096 so a thinking model has
+    # room to emit an answer after its thinking block.
+    import inspect
+    default = inspect.signature(bedrock_complete_fn).parameters["max_tokens"].default
+    assert default >= 16000, default
+
+
+class _MaxTokensAnthropicResp:
+    stop_reason = "max_tokens"
+    content = [{"type": "thinking", "thinking": "...long reasoning..."}]
+
+
+def _install_fake_anthropic_maxtokens(monkeypatch):
+    fake = types.ModuleType("anthropic")
+
+    class _Messages:
+        def create(self, **_):
+            return _MaxTokensAnthropicResp()
+
+    class _Anthropic:
+        def __init__(self, *a, **k):
+            self.messages = _Messages()
+
+    fake.Anthropic = _Anthropic
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+
+
+def test_anthropic_raises_on_max_tokens_with_no_text(monkeypatch):
+    _install_fake_anthropic_maxtokens(monkeypatch)
+    fn = anthropic_complete_fn()
+    try:
+        fn("author me a kernel: def softcap_kernel(")
+    except EmptyCompletion as exc:
+        assert "max_tokens" in str(exc)
+    else:
+        raise AssertionError("expected EmptyCompletion, not a silent empty string")
+
+
+def test_anthropic_default_max_tokens_raised_for_thinking_model():
+    import inspect
+    default = inspect.signature(anthropic_complete_fn).parameters["max_tokens"].default
+    assert default >= 16000, default
 
 
 # ---------------------------------------------------------------------------

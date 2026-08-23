@@ -169,3 +169,78 @@ def test_catalog_signatures_are_nonempty():
     # it can never match and is dead weight.
     for r in REWRITES:
         assert r.error_signatures or r.hostile_ops, r.name
+
+
+# -- BUG #3: offline lint messages must reach the rewrite catalog ------------
+from invent_kernels import static_lint  # noqa: E402 — kept next to its tests
+
+
+def test_lint_messages_route_to_named_fixes():
+    # Each real static_lint message must route to exactly its lint rewrite, so
+    # the repair loop's "named fix" assist fires for a LINT symptom (not just a
+    # compile symptom) instead of feeding the raw lint string back and stalling.
+    cases = {
+        # crafted-bad kernel snippet        -> expected rewrite name
+        "x = nl.arange(0, 128)\n":                       "lint-arange-to-mgrid",
+        "y = int(3.0)\n":                                "lint-int-cast-to-float-recip",
+        "z = w.tile((2, 2))\n":                          "lint-tile-not-allowed",
+        "a = nl.ndarray((256, 64), dtype=x.dtype)\n":    "lint-partition-dim-over-128",
+    }
+    for snippet, expected in cases.items():
+        msgs = static_lint(snippet)
+        assert msgs, f"snippet should lint-fail: {snippet!r}"
+        for msg in msgs:
+            hits = [r.name for r in match_error(msg)]
+            assert expected in hits, (msg, hits)
+
+
+def test_per_index_dma_lint_message_routes():
+    dma = (
+        "for k in nl.affine_range(8):\n"
+        "    nisa.dma_copy(dst=buf[k, 0:128], src=w[k, 0:128])\n"
+    )
+    msgs = [m for m in static_lint(dma) if "per-index DMA" in m]
+    assert msgs, static_lint(dma)
+    hits = [r.name for r in match_error(msgs[0])]
+    assert hits == ["lint-per-index-dma-to-multipartition"], hits
+
+
+def test_lint_rewrites_apply_at_nki_kernel_and_describe():
+    # The lint fixes edit kernel source, not the model graph.
+    lint_names = {"lint-arange-to-mgrid", "lint-int-cast-to-float-recip",
+                  "lint-tile-not-allowed", "lint-partition-dim-over-128",
+                  "lint-per-index-dma-to-multipartition"}
+    by_name = {r.name: r for r in REWRITES}
+    assert lint_names <= set(by_name), lint_names - set(by_name)
+    for n in lint_names:
+        assert by_name[n].applies_at == "nki-kernel", n
+    # describe() renders the routed fix actionably.
+    text = describe(match_error("uses nl.arange (deprecated) — use nl.mgrid"))
+    assert "lint-arange-to-mgrid" in text and "nl.mgrid" in text
+
+
+def test_lint_entries_do_not_cross_match_compiler_logs():
+    # No regression: the new lint entries must NOT fire on the real compiler
+    # logs, and the existing compiler-log entries must still route as before.
+    assert [r.name for r in match_error(AFFINE_SELECT_LOG)] == ["tril-to-const-mask"]
+    assert [r.name for r in match_error(TOPK_LOG)] == ["int64-topk-to-float-view"]
+    assert [r.name for r in match_error(SORT_LOG)] == ["topk-sort-to-argmax"]
+    for log in (AFFINE_SELECT_LOG, TOPK_LOG, SORT_LOG, UNKNOWN_LOG):
+        names = [r.name for r in match_error(log)]
+        assert not any(n.startswith("lint-") for n in names), (log, names)
+
+
+def test_compiler_log_signatures_do_not_appear_in_lint_messages():
+    # The other direction: a real lint message must not accidentally trip any
+    # compiler-log entry (tril / int64-topk / sort / dynamic-slice).
+    lint_msgs = (
+        static_lint("x = nl.arange(0, 128)\n")
+        + static_lint("y = int(3.0)\n")
+        + static_lint("z = w.tile((2, 2))\n")
+        + static_lint("a = nl.ndarray((256, 64), dtype=x.dtype)\n")
+    )
+    graph_entries = {"tril-to-const-mask", "int64-topk-to-float-view",
+                     "topk-sort-to-argmax", "dynamic-slice-to-static-bucket"}
+    for msg in lint_msgs:
+        names = {r.name for r in match_error(msg)}
+        assert not (names & graph_entries), (msg, names)
