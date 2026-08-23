@@ -1,9 +1,9 @@
 # knowledge-bank snapshot manifest
-# generated: 2026-08-23T13:58:59Z  by: ip-172-31-38-152  publisher: .211/shard0
+# generated: 2026-08-23T14:59:07Z  by: ip-172-31-38-152  publisher: .211/shard0
 # layout: <tier>/<family>/<type>/<lesson_id>.yaml
 
-[provisional] total=47
-    dense-causal-lm: 38
+[provisional] total=48
+    dense-causal-lm: 39
     diffusion: 2
     encoder-only: 1
     hybrid-attention-causal-lm: 2
@@ -17,4 +17,4 @@
     moe-causal-lm: 1
     speech: 0
 
-TOTAL_LESSONS=57
+TOTAL_LESSONS=58
