@@ -155,6 +155,96 @@ REWRITES: tuple[Rewrite, ...] = (
         evidence="General static-shape guardrail; unverified against a specific "
                  "captured reject (kept low-confidence until re-compile-verified).",
     ),
+    # --- OFFLINE LINT symptoms (BUG #3) ------------------------------------
+    # The entries above route COMPILER errors. These route the OFFLINE static
+    # lint's own messages (``invent_kernels.static_lint``), so a lint failure —
+    # not just a compile failure — reaches ``match_error`` and the repair loop's
+    # "named fix" assist fires for the lint symptom instead of feeding the raw
+    # lint string back and stalling. ``applies_at="nki-kernel"``: the fix edits
+    # the authored kernel source, not the model graph. Each signature is the
+    # STABLE, interpolation-free slice of the exact message ``static_lint``
+    # emits; they are disjoint from every compiler-log signature above, so no
+    # cross-match with the tril / int64-topk / sort / dynamic-slice entries.
+    Rewrite(
+        name="lint-arange-to-mgrid",
+        summary="Replace nl.arange indexing with nl.mgrid.",
+        error_signatures=("nl.arange",),
+        hostile_ops=(),
+        fix=(
+            "# static_lint: 'uses nl.arange (deprecated) — use nl.mgrid'.\n"
+            "# Build indices/masks with nl.mgrid, not nl.arange:\n"
+            "ix = nl.mgrid[0:128, 0:H]     # was nl.arange(...)\n"
+            "rows = ix.p + t * 128         # partition index\n"
+            "m = rows < T                  # tail mask"
+        ),
+        applies_at="nki-kernel",
+        confidence="high",
+        evidence="invent_kernels.static_lint rule 1 (CLAUDE.md NKI section).",
+    ),
+    Rewrite(
+        name="lint-int-cast-to-float-recip",
+        summary="Drop the int() cast in the kernel body; use *1.0/n instead.",
+        error_signatures=("int() cast in kernel body",),
+        hostile_ops=(),
+        fix=(
+            "# static_lint: 'uses int() cast in kernel body — beta-3 gotcha'.\n"
+            "# The beta-3 eager path rejects integer casts in the body. Use a\n"
+            "# float reciprocal instead of an int op:\n"
+            "ms = nl.sum(sq, axis=1) * (1.0 / H)   # was int(...) / H"
+        ),
+        applies_at="nki-kernel",
+        confidence="high",
+        evidence="invent_kernels.static_lint rule 2 (int cast).",
+    ),
+    Rewrite(
+        name="lint-tile-not-allowed",
+        summary="Remove .tile() from the kernel body (beta-3 gotcha).",
+        error_signatures=("tile() in kernel body",),
+        hostile_ops=(),
+        fix=(
+            "# static_lint: 'uses tile() in kernel body — beta-3 gotcha, avoid'.\n"
+            "# Do not call .tile(...) in the body; tile explicitly with an\n"
+            "# affine_range loop over 128-row partitions + nl.mgrid masking."
+        ),
+        applies_at="nki-kernel",
+        confidence="high",
+        evidence="invent_kernels.static_lint rule 2 (tile).",
+    ),
+    Rewrite(
+        name="lint-partition-dim-over-128",
+        summary="Tile the partition axis to <=128 (partition dim must be 128).",
+        error_signatures=("partition dim must be 128",),
+        hostile_ops=(),
+        fix=(
+            "# static_lint: 'partition (first) dim N > 128 — partition dim must\n"
+            "# be 128'. Never allocate a first (partition) dim > 128; loop over\n"
+            "# 128-row tiles instead:\n"
+            "n_tiles = (T + 128 - 1) // 128\n"
+            "for t in nl.affine_range(n_tiles):\n"
+            "    xs = nl.load(x[t * 128:t * 128 + 128, 0:H], mask=rows < T)"
+        ),
+        applies_at="nki-kernel",
+        confidence="high",
+        evidence="invent_kernels.static_lint rule 3 (partition dim).",
+    ),
+    Rewrite(
+        name="lint-per-index-dma-to-multipartition",
+        summary="Replace a per-index DMA on the packed axis with one "
+                "multi-partition DMA + on-chip transpose.",
+        error_signatures=("per-index DMA",),
+        hostile_ops=(),
+        fix=(
+            "# static_lint: 'per-index DMA on packed axis: dma_copy subscripts\n"
+            "# [var, ...] inside a loop'. Do ONE multi-partition DMA of the whole\n"
+            "# [0:128, ...] tile, then transpose on-chip — never a dma_copy that\n"
+            "# indexes the first (partition) axis with the loop variable:\n"
+            "buf = nl.load(w[0:128, 0:K])      # one multi-partition DMA\n"
+            "wt = nl.transpose(buf)            # on-chip transpose, no per-index DMA"
+        ),
+        applies_at="nki-kernel",
+        confidence="high",
+        evidence="invent_kernels.static_lint rule 4 (CLAUDE.md DMA rule).",
+    ),
 )
 
 

@@ -60,6 +60,18 @@ class ProviderNotAvailable(RuntimeError):
     always names the concrete thing the caller must install or set."""
 
 
+class EmptyCompletion(RuntimeError):
+    """Raised when a model returns ``stop_reason == "max_tokens"`` with NO text
+    block — the response is all ``thinking`` and no answer.
+
+    BUG #2: Opus-5 is a thinking model. With ``max_tokens`` too small the model
+    can spend the ENTIRE budget on the ``thinking`` block and return zero
+    ``text`` blocks with ``stop_reason == "max_tokens"``. The old code silently
+    returned ``""`` from ``_text_from_content``, so ``LLMAuthor`` got an empty
+    authored source and the round failed with a misleading "no source" symptom
+    rather than the real cause. Surface it loudly and name the fix instead."""
+
+
 # ---------------------------------------------------------------------------
 # offline / test provider
 # ---------------------------------------------------------------------------
@@ -127,12 +139,30 @@ def _text_from_content(content: list) -> str:
     return "".join(parts)
 
 
+def _guard_empty_completion(text: str, stop_reason, max_tokens: int) -> str:
+    """Return ``text`` unless the model hit the token cap before emitting any —
+    then raise ``EmptyCompletion`` naming the fix (raise ``max_tokens``).
+
+    BUG #2 guard: ``stop_reason == "max_tokens"`` with an empty ``text`` means a
+    thinking model burned the whole budget on ``thinking`` and produced no
+    answer. Returning ``""`` here would hand ``LLMAuthor`` an empty source and
+    mask the cause; raising makes the real problem — and its remedy — explicit."""
+    if not text and stop_reason == "max_tokens":
+        raise EmptyCompletion(
+            f"model returned stop_reason='max_tokens' with no text block: the "
+            f"thinking budget consumed all {max_tokens} tokens before any answer "
+            f"was written. Raise max_tokens (thinking models spend tokens on the "
+            f"`thinking` block before the `text` block)."
+        )
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Bedrock (primary)
 # ---------------------------------------------------------------------------
 def bedrock_complete_fn(model_id: str = "anthropic.claude-opus-5",
                         region: str | None = None,
-                        max_tokens: int = 4096,
+                        max_tokens: int = 16000,
                         temperature: float | None = 0.0) -> CompleteFn:
     """Return a ``complete_fn`` backed by boto3 ``bedrock-runtime`` InvokeModel.
 
@@ -147,6 +177,12 @@ def bedrock_complete_fn(model_id: str = "anthropic.claude-opus-5",
     (400). Pass ``temperature=None`` when the resolved ``model_id`` is a
     current-generation model; the default ``0.0`` suits older models where a
     deterministic sample is still accepted.
+
+    ``max_tokens`` defaults to 16000 (BUG #2): Opus-5 is a thinking model and a
+    small cap (the old 4096) can be exhausted entirely by the ``thinking`` block,
+    leaving zero ``text`` blocks. A response that still comes back with
+    ``stop_reason == "max_tokens"`` and no text raises ``EmptyCompletion`` rather
+    than silently returning an empty authored source.
     """
     try:
         import boto3  # noqa: PLC0415 — lazy so the module imports without boto3
@@ -166,7 +202,8 @@ def bedrock_complete_fn(model_id: str = "anthropic.claude-opus-5",
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode("utf-8")
         payload = json.loads(raw)
-        return _text_from_content(payload.get("content", []))
+        text = _text_from_content(payload.get("content", []))
+        return _guard_empty_completion(text, payload.get("stop_reason"), max_tokens)
 
     return _complete
 
@@ -175,12 +212,17 @@ def bedrock_complete_fn(model_id: str = "anthropic.claude-opus-5",
 # Anthropic SDK (fallback)
 # ---------------------------------------------------------------------------
 def anthropic_complete_fn(model: str = "claude-opus-5",
-                          max_tokens: int = 4096) -> CompleteFn:
+                          max_tokens: int = 16000) -> CompleteFn:
     """Return a ``complete_fn`` backed by the ``anthropic`` SDK.
 
     Reads ``ANTHROPIC_API_KEY`` from the environment (the SDK's default client
     resolution). Lazy-imported so this module loads without the SDK; a missing
-    dependency surfaces as a clear ``ProviderNotAvailable``."""
+    dependency surfaces as a clear ``ProviderNotAvailable``.
+
+    ``max_tokens`` defaults to 16000 for the same reason as ``bedrock_complete_fn``
+    (BUG #2): a thinking model can spend a small cap entirely on ``thinking``.
+    A response with ``stop_reason == "max_tokens"`` and no text raises
+    ``EmptyCompletion`` instead of returning an empty authored source."""
     try:
         import anthropic  # noqa: PLC0415 — lazy so the module imports without anthropic
     except ImportError as exc:  # pragma: no cover - exercised via make_complete_fn test
@@ -199,7 +241,8 @@ def anthropic_complete_fn(model: str = "claude-opus-5",
             system=KERNEL_AUTHORING_PREAMBLE,
             messages=[{"role": "user", "content": prompt}],
         )
-        return _text_from_content(resp.content)
+        text = _text_from_content(resp.content)
+        return _guard_empty_completion(text, getattr(resp, "stop_reason", None), max_tokens)
 
     return _complete
 
