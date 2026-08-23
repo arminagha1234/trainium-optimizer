@@ -63,6 +63,151 @@ def _vllm_bin() -> str:
     return shutil.which("vllm") or "vllm"
 
 
+# ── Tied-embedding lm_head fix ────────────────────────────────────────────────
+# vLLM-Neuron's dense checkpoint loader (utils/checkpoints.py
+# load_sharded_pipelined) is STRICT: the model always registers a separate
+# `lm_head.weight` parameter and unconditionally maps it to the checkpoint key
+# "lm_head.weight" (model/qwen3/model.py builds `mappings["lm_head.weight"] =
+# "lm_head.weight"` with no tie branch). When a model TIES its embeddings
+# (tie_word_embeddings=True) *and* the exported checkpoint does NOT materialize
+# `lm_head.weight` (it shares model.embed_tokens.weight), the loader hits
+#   RuntimeError: Checkpoint key(s) not found for parameter 'lm_head.weight' ...
+# EngineCore init dies -> 0 tok/s -> the orchestrator reports FAIL_NO_BASELINE.
+#
+# NOTE the real differentiator (verified on-box): it is NOT tp / shard count.
+# Qwen3-0.6B (tied, 1 file), Qwen3-1.7B (tied, 2 files) and Qwen3-8B (untied,
+# 5 files) all PHYSICALLY contain lm_head.weight in their safetensors, so they
+# load at any tp. Qwen3-4B is the one model that is tied AND ships no
+# lm_head.weight (only embed_tokens.weight) -> it is the only one that fails,
+# and it fails at EVERY tp. So constraining tp would not fix it.
+#
+# Fix (general, config-driven, additive): when the HF config says the model
+# ties its embeddings and the resolved checkpoint has no materialized
+# lm_head.weight, serve from a PATCHED LOCAL checkpoint directory — symlinks to
+# every original file plus one extra safetensors carrying
+#   lm_head.weight := model.embed_tokens.weight
+# (exactly what "tied" means; identical [vocab, hidden] shape, so the
+# ColumnParallelLinear lm_head shards it the same way at any tp). vLLM-Neuron's
+# _LocalCheckpointSource enumerates *.safetensors in the dir and reads keys
+# directly (no index.json dependency), so the added key is discovered and the
+# strict loader is satisfied. Untied models, and tied models whose checkpoint
+# already materializes lm_head (0.6B/1.7B/8B), are returned UNCHANGED. Every
+# step is fail-open: any error falls back to serving the original model id, i.e.
+# today's behavior.
+_LMHEAD_KEY = "lm_head.weight"
+_EMBED_KEY = "model.embed_tokens.weight"
+
+
+def _hf_config_dict(model: str) -> dict:
+    """The model's HF config as a dict. Empty (-> treated as untied) on any
+    failure, so a config we cannot read never triggers the patch path."""
+    try:
+        from transformers import AutoConfig
+        return AutoConfig.from_pretrained(model, trust_remote_code=True).to_dict()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        p = os.path.join(model, "config.json")
+        if os.path.isfile(p):
+            with open(p) as f:
+                return json.load(f)
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+def _resolve_snapshot_dir(model: str) -> str | None:
+    """Local directory holding the model's checkpoint files. A dir path is
+    returned as-is; an HF id is resolved to its cached snapshot (fetched if the
+    cache is cold). None on failure."""
+    if os.path.isdir(model):
+        return model
+    try:
+        from huggingface_hub import snapshot_download
+        try:
+            return snapshot_download(model, local_files_only=True)
+        except Exception:  # noqa: BLE001 — not cached yet; allow a fetch
+            return snapshot_download(model)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _checkpoint_has_lm_head(snapshot_dir: str) -> bool:
+    """True if lm_head.weight is materialized in the checkpoint. Fail-SAFE True
+    (assume present -> do NOT patch -> unchanged behavior) if we cannot tell."""
+    try:
+        import glob
+        idx = glob.glob(os.path.join(snapshot_dir, "*.safetensors.index.json"))
+        if idx:
+            with open(idx[0]) as f:
+                return _LMHEAD_KEY in json.load(f).get("weight_map", {})
+        from safetensors import safe_open
+        for fp in glob.glob(os.path.join(snapshot_dir, "*.safetensors")):
+            with safe_open(fp, framework="pt") as sf:
+                if _LMHEAD_KEY in sf.keys():
+                    return True
+        return False
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _materialize_tied_lm_head(model: str, snapshot_dir: str) -> str | None:
+    """Build a patched local checkpoint dir: symlinks to every file in
+    snapshot_dir PLUS an added safetensors whose lm_head.weight aliases the tied
+    model.embed_tokens.weight. Returns the patched dir, or None on failure."""
+    try:
+        import glob
+        import hashlib
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+        emb = None
+        for fp in glob.glob(os.path.join(snapshot_dir, "*.safetensors")):
+            with safe_open(fp, framework="pt", device="cpu") as sf:
+                if _EMBED_KEY in sf.keys():
+                    emb = sf.get_tensor(_EMBED_KEY)
+                    break
+        if emb is None:
+            return None
+        tag = hashlib.sha1(os.path.abspath(snapshot_dir).encode()).hexdigest()[:12]
+        patched = os.path.join(tempfile.gettempdir(), f"tied_lmhead_{tag}")
+        os.makedirs(patched, exist_ok=True)
+        for name in os.listdir(snapshot_dir):
+            dst = os.path.join(patched, name)
+            if not os.path.lexists(dst):
+                try:
+                    os.symlink(os.path.realpath(os.path.join(snapshot_dir, name)), dst)
+                except FileExistsError:
+                    pass
+        lm_path = os.path.join(patched, "model-lmhead-tied.safetensors")
+        if not os.path.exists(lm_path):
+            save_file({_LMHEAD_KEY: emb.contiguous()}, lm_path)
+        return patched
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _resolve_served_model(model: str) -> str:
+    """Return the path/id to hand `vllm serve`. For a tied-embedding model whose
+    checkpoint has no materialized lm_head.weight, return a patched local
+    checkpoint (see module note above) so the strict loader finds the key;
+    otherwise return `model` unchanged. Fail-open on any error."""
+    try:
+        if not bool(_hf_config_dict(model).get("tie_word_embeddings", False)):
+            return model
+        snap = _resolve_snapshot_dir(model)
+        if not snap or _checkpoint_has_lm_head(snap):
+            return model
+        patched = _materialize_tied_lm_head(model, snap)
+        if patched:
+            _log(f"tied-embedding model '{model}' ships no lm_head.weight; "
+                 f"serving patched checkpoint {patched} "
+                 f"(lm_head.weight := {_EMBED_KEY})")
+            return patched
+        return model
+    except Exception:  # noqa: BLE001
+        return model
+
+
 def _build_serve_cmd(a) -> tuple[list[str], dict]:
     """Assemble the `vllm serve` argv + env, mirroring the proven recipe.
 
@@ -100,8 +245,12 @@ def _build_serve_cmd(a) -> tuple[list[str], dict]:
         neuron_config["on_device_sampling_config"] = {"all_greedy": True}
     additional = {"neuron_config": neuron_config}
 
+    # Tied-embedding models with no materialized lm_head.weight (e.g. Qwen3-4B)
+    # are served from a patched local checkpoint so vLLM-Neuron's strict loader
+    # finds lm_head.weight; every other model resolves to itself unchanged.
+    served_model = _resolve_served_model(a.model)
     cmd = [
-        _vllm_bin(), "serve", a.model,
+        _vllm_bin(), "serve", served_model,
         "--served-model-name", "opt-target",
         "--tensor-parallel-size", str(a.tp),
         "--max-model-len", str(max_model_len),
