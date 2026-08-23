@@ -148,7 +148,11 @@ def _rmsnorm_sbuf_in_sbuf_out_hoisted(
         bias=eps_sb[0:_PMAX, :],
     )
 
-    norm_factor_bcast = TensorView(norm_factor_sb).expand_dim(dim=2).broadcast(dim=2, size=H_free)
+    # nki 0.6.0 renamed the tile broadcast(dim, n) method to broadcast_to(shape);
+    # the old dim/size form raises AttributeError on 0.6.0. Keep the
+    # expand_dim(dim=2) that inserts the size-1 free axis, then broadcast that
+    # axis to H_free via the new shape-based API. Result shape: (_PMAX, T, H_free).
+    norm_factor_bcast = TensorView(norm_factor_sb).expand_dim(dim=2).broadcast_to((_PMAX, T, H_free))
     nisa.tensor_tensor(rmsnorm_normed[...], gamma_mult[...], norm_factor_bcast.get_view(), nl.multiply)
 
     nisa.activation(rmsnorm_normed_bf16[...], op=nl.copy, data=rmsnorm_normed[...])
