@@ -43,7 +43,6 @@ import re
 from typing import Callable, Protocol, runtime_checkable
 
 from invent_kernels import AuthoredKernel, OpSpec, author_kernel
-from kernel_perf import PerfFeedback
 from kernel_repair import Feedback
 from kernel_rewrites import match_error
 
@@ -61,8 +60,7 @@ class KernelAuthor(Protocol):
     """
 
     def author(self, spec: OpSpec, lessons: list | None,
-               feedback: list[Feedback] | None,
-               perf_feedback: list[PerfFeedback] | None = None) -> AuthoredKernel:
+               feedback: list[Feedback] | None) -> AuthoredKernel:
         ...
 
 
@@ -76,14 +74,7 @@ class RecipeAuthor:
     """
 
     def author(self, spec: OpSpec, lessons: list | None = None,
-               feedback: list[Feedback] | None = None,
-               perf_feedback: list[PerfFeedback] | None = None) -> AuthoredKernel:
-        # The recipe table is fixed: it cannot iterate on a compiler error OR a
-        # measured latency, so BOTH feedback channels are ignored. Forwards
-        # ``lessons`` to ``author_kernel`` exactly as today (single-shot behaviour
-        # unchanged). A perf loop driven by this author will therefore see no
-        # improvement and stop honestly at ``no_gain`` — the correct outcome for a
-        # non-iterating author.
+               feedback: list[Feedback] | None = None) -> AuthoredKernel:
         return author_kernel(spec, lessons=lessons)
 
 
@@ -141,6 +132,13 @@ reject turned into a DO/DON'T):
     DO call it as `psum = nisa.nc_matmul(stat_tile, mov_tile)` — stationary
     [K,M], moving [K,N], contraction K on the partition axis — and assign the
     RETURNED tile (do not write into a passed-in dst).
+  * nc_transpose call signature (0.6.0) — like nc_matmul it RETURNS the result
+    and `data` is REQUIRED (positional-only calls that omit it error
+    "nc_transpose() missing value for required argument 'data'"). DO call it as
+    `t = nisa.nc_transpose(data=src_tile)` (or `nisa.nc_transpose(src_tile)`) and
+    assign the RETURNED tile; there is NO `dst=`/`out=` param. `data` [P,F] ->
+    returns [F,P] (P,F each <= 128). For attention-style kernels prefer feeding
+    an already-[K,N] moving operand into nc_matmul over transposing on the fly.
   * Reductions MUST stay 2-D: `nl.sum(axis=1)` that collapses to a 1-D tensor
     fails — SBUF/PSUM tiles need >= 2 dims. DO keep a [P,1]-shaped result
     (`nl.sum(x, axis=1, keepdims=True)`); DON'T let a tile collapse to 1-D. Same
@@ -274,28 +272,14 @@ def _op_input_order(spec: OpSpec) -> list[str] | None:
     return list(inp.keys()) or None
 
 
-def _fmt_perf_feedback(perf_feedback: list[PerfFeedback] | None) -> str:
-    """One block per prior PERF round: the measured latency vs baseline + the ONE
-    dominant bottleneck + the single targeted fix. The perf analogue of
-    ``_fmt_feedback`` — a named, actionable lever keyed off the real measurement,
-    not an opaque 'make it faster'."""
-    if not perf_feedback:
-        return "(no prior perf rounds — the kernel is correct; make it FAST)"
-    return "\n\n".join(fb.as_prompt() for fb in perf_feedback)
-
-
 def build_author_prompt(spec: OpSpec, lessons: list | None,
-                        feedback: list[Feedback] | None,
-                        perf_feedback: list[PerfFeedback] | None = None) -> str:
+                        feedback: list[Feedback] | None) -> str:
     """Assemble the authoring prompt from the NKI preamble, the op spec, the
-    retrieved bank lessons, the prior-round compiler errors + matched rewrites,
-    and (when the kernel is already correct but slow) the prior-round measured
-    latencies + dominant bottleneck + targeted perf fix. Deterministic and
-    side-effect free (given the spec), so it is directly unit-testable (the tests
-    assert the compiler error and the matched rewrite NAME both appear in the
-    returned string, the FULL multi-round error history is present, and — when
-    perf feedback is supplied — the measured latency and the dominant bottleneck
-    fix are surfaced)."""
+    retrieved bank lessons, and the prior-round compiler errors + matched
+    rewrites. Deterministic and side-effect free (given the spec), so it is
+    directly unit-testable (the tests assert the compiler error and the matched
+    rewrite NAME both appear in the returned string, and that the FULL multi-round
+    error history is present)."""
     inputs = _op_input_order(spec)
     if inputs:
         inputs_line = ", ".join(inputs)
@@ -322,10 +306,7 @@ def build_author_prompt(spec: OpSpec, lessons: list | None,
         f"{_fmt_lessons(lessons)}\n\n"
         f"## Prior compile attempts — ALL rounds, learn from EVERY error "
         f"(do not repeat a fix that already failed a prior round)\n"
-        f"{_fmt_feedback(feedback)}\n\n"
-        f"## Prior perf rounds — the kernel is CORRECT but must be made FAST "
-        f"(apply the ONE dominant fix per round; a correct-but-slow kernel is a loss)\n"
-        f"{_fmt_perf_feedback(perf_feedback)}\n"
+        f"{_fmt_feedback(feedback)}\n"
     )
 
 
@@ -387,18 +368,14 @@ class LLMAuthor:
         self._build_prompt = build_prompt
 
     def author(self, spec: OpSpec, lessons: list | None = None,
-               feedback: list[Feedback] | None = None,
-               perf_feedback: list[PerfFeedback] | None = None) -> AuthoredKernel:
-        prompt = self._build_prompt(spec, lessons, feedback,
-                                    perf_feedback=perf_feedback)
+               feedback: list[Feedback] | None = None) -> AuthoredKernel:
+        prompt = self._build_prompt(spec, lessons, feedback)
         completion = self._complete(prompt)
         nki_src = extract_nki_source(completion)
         entry = extract_entry(nki_src)
         rounds = len(feedback or [])
-        perf_rounds = len(perf_feedback or [])
         notes = (f"LLM-authored via injected complete_fn "
                  f"(provider-agnostic); repair round {rounds + 1}, "
-                 f"perf round {perf_rounds + 1}, "
                  f"{len(lessons or [])} lesson(s) consulted")
         return AuthoredKernel(
             op=spec.name,
