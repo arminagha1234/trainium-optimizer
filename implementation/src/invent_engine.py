@@ -69,6 +69,7 @@ from guardrails import Guardrails
 import kernel_rewrites
 from kernel_anticheat import require_reproducible, run_candidate_before_reference
 from kernel_author import KernelAuthor, RecipeAuthor
+from kernel_perf import KernelPerfLoop, PerfFeedback, PerfOutcome
 from kernel_repair import CompileResult, Feedback, KernelRepairLoop
 from ledger import Layer, Ledger, Origin, Row, Stage, Status, current_commit
 from invent_kernels import (
@@ -333,6 +334,7 @@ class InventEngine:
         registry: "Any" = None,
         author: KernelAuthor | None = None,
         max_repair_rounds: int = 1,
+        max_perf_rounds: int = 1,
     ) -> None:
         # The pluggable authoring seam. Defaults to the recipe table
         # (``RecipeAuthor`` wraps ``invent_kernels.author_kernel``) so behaviour
@@ -343,6 +345,14 @@ class InventEngine:
         # tests are byte-for-byte unchanged. >1 activates the real repair loop.
         self.author: KernelAuthor = author or RecipeAuthor()
         self.max_repair_rounds = max_repair_rounds
+        # Bound on the author -> measure -> read-latency -> re-author PERF loop
+        # (see ``kernel_perf.KernelPerfLoop``). The DEFAULT of 1 is today's
+        # behaviour: a correct kernel is raced ONCE and gated on the 5% margin
+        # (a correct-but-slow kernel dead-ends as an anti-pattern) — existing runs
+        # and tests are byte-for-byte unchanged. >1 activates the optimize loop:
+        # a correct-but-slow kernel is re-authored with measured PerfFeedback
+        # until it is fast, converges, or the loop honestly gives up.
+        self.max_perf_rounds = max_perf_rounds
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         # Default the bank under the run dir so an experiment never pollutes the
@@ -846,10 +856,11 @@ class InventEngine:
         # SINGLE-SHOT (default): author once through the seam with no feedback.
         # RecipeAuthor forwards ``lessons`` to ``author_kernel`` exactly as before.
         author = self.author.author(spec, lessons, [])
-        return self._finish(spec, author, n, race_fn)
+        return self._finish(spec, author, n, race_fn, lessons=lessons)
 
     def _finish(self, spec: OpSpec, author: AuthoredKernel, n: int,
-                race_fn: RaceFn | None) -> InventResult:
+                race_fn: RaceFn | None,
+                lessons: list | None = None) -> InventResult:
         """Shared tail: offline gate -> on-device race -> keep/discard -> bank.
 
         Extracted verbatim from the original single-shot ``run_op`` so BOTH the
@@ -909,25 +920,83 @@ class InventEngine:
                                 lesson_id=lid, detail=f"incorrect on device{desc_sfx}",
                                 lessons_consulted=n)
 
+        # PERF LOOP (only when asked): a kernel can be CORRECT but slow (the 0.08x
+        # rmsnorm case, which otherwise dead-ends here as an anti-pattern). When
+        # ``max_perf_rounds > 1`` we try to make it FAST *before* the invention
+        # margin gate: re-author with measured PerfFeedback (latency vs baseline +
+        # the ONE dominant bottleneck + a targeted fix), re-measuring each round,
+        # keeping the running-best correct kernel. The loop's BEST result then
+        # flows into the SAME win/anti-pattern gate below (5% margin unchanged).
+        # With the default max_perf_rounds=1 this branch is skipped entirely and
+        # behaviour is byte-for-byte today's single race.
+        perf_note = ""
+        if self.max_perf_rounds and self.max_perf_rounds > 1:
+            author, race, perf_note = self._optimize_perf(
+                spec, author, race, lessons, race_fn)
+
         # Correct — now the speed race with the 5% invention margin.
         is_win = self.guards.is_improvement(race.speedup, 1.0, is_invention=True)
         if is_win:
             lid = self._bank_win(spec, race)
             self._record(spec, Status.KEEP, race.speedup, race.correctness_pct,
                          f"WIN: {race.speedup:.3f}x vs {spec.baseline} "
-                         f"(>= 5% margin)", n_lessons=n)
+                         f"(>= 5% margin){perf_note}", n_lessons=n)
             return InventResult(spec.name, spec.shape_class, spec.origin,
                                 "win", offline, race, lesson_id=lid,
-                                detail=f"{race.speedup:.3f}x", lessons_consulted=n)
+                                detail=f"{race.speedup:.3f}x{perf_note}",
+                                lessons_consulted=n)
+        # Correct-but-slow -> anti-pattern. When a perf loop ran, bank the BEST
+        # attempt WITH its latency trajectory (losses are data — a future author /
+        # SDK sees how far the optimize loop got and where it stalled).
         lid = self._bank_anti_pattern(
-            spec, f"correct but only {race.speedup:.3f}x (< 5% margin)", race)
+            spec, f"correct but only {race.speedup:.3f}x (< 5% margin){perf_note}",
+            race)
         self._record(spec, Status.DISCARD, race.speedup, race.correctness_pct,
-                     f"correct-but-slow: {race.speedup:.3f}x (< 5% margin)",
+                     f"correct-but-slow: {race.speedup:.3f}x (< 5% margin){perf_note}",
                      n_lessons=n)
         return InventResult(spec.name, spec.shape_class, spec.origin,
                             "anti_pattern", offline, race, lesson_id=lid,
-                            detail=f"correct but {race.speedup:.3f}x < 1.05x",
+                            detail=f"correct but {race.speedup:.3f}x < 1.05x{perf_note}",
                             lessons_consulted=n)
+
+    # -- the PERF loop (author -> measure -> read-latency -> re-author) -------
+
+    def _optimize_perf(self, spec: OpSpec, author: AuthoredKernel,
+                       race: RaceResult, lessons: list | None,
+                       race_fn: RaceFn | None) -> tuple[AuthoredKernel, RaceResult, str]:
+        """Drive ``KernelPerfLoop`` so a measured slow latency TEACHES the next
+        attempt (measured latency + dominant bottleneck + one targeted fix fed
+        back via the author's ``perf_feedback`` arg). Seeded with the already-
+        measured correct (kernel, race) so the running-best is real from round 0
+        and a round-1 regression keeps it. Returns the BEST (kernel, race) plus a
+        short note (loop reason + latency trajectory) appended to the ledger/bank.
+
+        The measure step is the SAME race the engine already uses (``race_fn`` or
+        ``_device_race``) so it RE-VALIDATES correctness AND re-measures each
+        round — a perf rewrite that breaks correctness is caught and stops the
+        loop (``regressed_or_broke``), never banked as a win."""
+        loop = KernelPerfLoop(
+            max_rounds=self.max_perf_rounds,
+            min_gain_pct=self.guards.marginal_improvement_pct,
+            min_utilization=self.guards.min_utilization)
+        measure = race_fn or self._device_race
+
+        def author_fn(perf_trail: list[PerfFeedback]) -> AuthoredKernel:
+            # Re-author with the accumulated perf feedback (analogous to the repair
+            # loop's ``feedback``). No repair feedback here — the kernel already
+            # compiled and ran correctly; the open problem is speed.
+            return self.author.author(spec, lessons, [], perf_feedback=perf_trail)
+
+        def measure_fn(kernel: AuthoredKernel) -> RaceResult:
+            return measure(kernel, spec)
+
+        outcome: PerfOutcome = loop.run(
+            author_fn, measure_fn, seed_kernel=author, seed_race=race)
+        note = (f" [perf loop: {outcome.reason} in {outcome.rounds} round(s); "
+                f"latency {outcome.trajectory_str}]")
+        best_kernel = outcome.kernel if outcome.kernel is not None else author
+        best_race = outcome.race if outcome.race is not None else race
+        return best_kernel, best_race, note
 
     # -- the REAL repair loop (author -> compile -> read-error -> re-author) --
 
@@ -1053,7 +1122,7 @@ class InventEngine:
                 lesson_id=lid, detail=f"{reason}{desc_sfx}", lessons_consulted=n)
 
         # Compiled after N rounds — gate + race + bank the repaired kernel.
-        return self._finish(spec, outcome.kernel, n, race_fn)
+        return self._finish(spec, outcome.kernel, n, race_fn, lessons=lessons)
 
     def run(self, specs: list[OpSpec],
             race_fn: RaceFn | None = None) -> list[InventResult]:
