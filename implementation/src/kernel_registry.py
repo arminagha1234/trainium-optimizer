@@ -94,6 +94,9 @@ def kernel_for_primitive(primitive: str) -> str | None:
 # reusable at all; >= PASSED_ON_DEVICE is reusable as HW-ready (see module doc).
 STATUS_RANK: dict[str, int] = {
     "analysis-only": 0, "written-not-compiled": 0, "algorithm-documented": 0,
+    # a candidate rejected by the adversarial anti-cheat (reward-hack / not a real
+    # kernel) is rank 0 — there is nothing to reuse or repair, author for real.
+    "failed-adversarial": 0,
     "failed-compile": 1,
     "compiled": 2, "failed-numerical": 2,
     "passed": 3,                       # numerics match via nki.simulate

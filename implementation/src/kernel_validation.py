@@ -36,6 +36,15 @@ from kernel_registry import (
     STATUS_RANK,
 )
 
+# The adversarial anti-cheat layer lives in its own module (pure-Python, no
+# Trainium) but is re-exported here so `verdict`'s `adversarial_ok` veto and the
+# checks that feed it share one import surface for callers.
+from kernel_anticheat import (  # noqa: F401 — re-exported for callers
+    adversarial_source_check,
+    require_reproducible,
+    run_candidate_before_reference,
+)
+
 # Router verdicts. Named constants (not bare strings) so a typo is a NameError,
 # not a silently-wrong route.
 REUSE = "REUSE"
@@ -48,26 +57,38 @@ PASSED = "passed"                       # rank 3 — numerics + NEFF, in simulat
 PASSED_ON_DEVICE = "passed-on-device"   # rank 4 — same, on real silicon
 FAILED_NUMERICAL = "failed-numerical"   # rank 2 — compiled/NEFF but numerics off
 FAILED_COMPILE = "failed-compile"       # rank 1 — no NEFF (incl. import-only)
+FAILED_ADVERSARIAL = "failed-adversarial"  # rank 0 — rejected by the anti-cheat
 
 
-def verdict(numerics_ok: bool, neff_emitted: bool, on_device: bool) -> str:
+def verdict(numerics_ok: bool, neff_emitted: bool, on_device: bool,
+            adversarial_ok: bool = True) -> str:
     """Consolidate one run outcome into a ladder status string.
 
     The truth table (see kernel_registry.STATUS_RANK for the ranks):
 
-        numerics_ok & neff_emitted & on_device -> "passed-on-device" (4)
-        numerics_ok & neff_emitted             -> "passed"           (3)
-        neff_emitted (numerics failed)         -> "failed-numerical" (2)
-        no NEFF (import-only / empty NEFF)     -> "failed-compile"   (1)
+        adversarial_ok is False                -> "failed-adversarial" (0)
+        numerics_ok & neff_emitted & on_device -> "passed-on-device"   (4)
+        numerics_ok & neff_emitted             -> "passed"             (3)
+        neff_emitted (numerics failed)         -> "failed-numerical"   (2)
+        no NEFF (import-only / empty NEFF)     -> "failed-compile"     (1)
 
-    The two invariants this encodes:
+    The invariants this encodes:
       * A NEFF is REQUIRED for a pass. ``numerics_ok`` alone (e.g. the kernel
         imported and a numpy-level check passed) but with NO emitted NEFF is
         rank-1 "failed-compile" — NOT a pass. "It imported" never ships.
       * ``on_device`` only ELEVATES an already-passing result (3 -> 4). It never
         rescues a numerics/compile failure — a device run that miscompiles is
         still a failure.
+      * ``adversarial_ok`` is the reward-hack veto (see kernel_anticheat). It
+        defaults True so honest callers and existing tests are unchanged. When
+        False — the candidate failed the static anti-cheat or the reproducibility
+        gate — it OVERRIDES everything and forces "failed-adversarial" (rank 0),
+        so a kernel that gamed the numerics gate (Sakana's silent framework
+        fallback, Kevin's recycled output buffer) can NEVER reach a pass rank,
+        no matter how good its faked numerics looked.
     """
+    if not adversarial_ok:
+        return FAILED_ADVERSARIAL
     if numerics_ok and neff_emitted:
         return PASSED_ON_DEVICE if on_device else PASSED
     if neff_emitted:
@@ -107,13 +128,26 @@ class KernelValidation:
     @classmethod
     def from_run(cls, *, numerics_ok: bool, neff_emitted: bool,
                  on_device: bool, numeric_error: float = float("inf"),
-                 artifact: str = "", notes: str = "") -> "KernelValidation":
+                 artifact: str = "", notes: str = "",
+                 adversarial_ok: bool = True,
+                 adversarial_reasons: list[str] | None = None
+                 ) -> "KernelValidation":
         """Build a KernelValidation directly from a run's raw signals, using the
-        single ``verdict`` gate so status/rank/tier can never disagree."""
-        status = verdict(numerics_ok, neff_emitted, on_device)
+        single ``verdict`` gate so status/rank/tier can never disagree.
+
+        ``adversarial_ok`` (default True) is the anti-cheat veto; pass the
+        concatenated output of ``kernel_anticheat.adversarial_source_check`` /
+        ``require_reproducible`` as ``adversarial_reasons`` and set
+        ``adversarial_ok=False`` to reject a reward-hacking candidate. The reason
+        is RECORDED in ``notes`` (honest audit trail) and the status is forced to
+        rank-0 "failed-adversarial", so it can never route to reuse."""
+        status = verdict(numerics_ok, neff_emitted, on_device, adversarial_ok)
         # tier reflects WHERE the run happened, independent of pass/fail, so a
         # failed-on-device result is still tagged on-device (honest audit trail).
         tier = "on-device" if on_device else "simulate"
+        if not adversarial_ok:
+            why = "; ".join(adversarial_reasons or ["adversarial gate rejected"])
+            notes = f"{notes} [adversarial: {why}]".strip()
         return cls(status=status, rank=STATUS_RANK.get(status, 0), tier=tier,
                    numeric_error=numeric_error, artifact=artifact, notes=notes)
 
