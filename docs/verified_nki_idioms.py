@@ -13,6 +13,17 @@ idiom and in the SUMMARY table at the bottom.
 
 >>> SEVERAL PRIOR ASSUMPTIONS WERE CONTRADICTED ON THIS STACK -- flagged with [NOTE]. <<<
 
+>>> CORRECTION (post-commit): idioms 1 (nc_matmul) and 2 (nc_transpose) originally
+    recorded a functional "returns the tile / no dst" form. That is WRONG for the
+    low-level nisa ISA ops: verified against the installed nki 0.6.0 SDK source
+    (nki/isa/__init__.pyi + _matmul.py + _transpose.py) they are DST-FIRST + IN-PLACE
+    and return None -- nisa.nc_matmul(dst, stationary, moving), nisa.nc_transpose(dst,
+    data), nisa.activation(dst, op, data, ...). A live on-device add_rmsnorm WIN was
+    authored with the dst-first form. Those two snippets are corrected below to the
+    SDK-true signature and marked "re-run pending" (not independently re-verified after
+    the fix). The high-level nl.transpose(t) DOES return a tile (idiom 2c, verified).
+    All OTHER idioms below remain as on-device-verified. <<<
+
 Canonical invocation (all idioms use this):
     import torch_xla.core.xla_model as xm
     dev = xm.xla_device()
@@ -45,9 +56,14 @@ def _v(name, pair_fn, ref_fn=None, atol=1e-4, rtol=1e-4, exact=False, note=""):
 # IDIOM 1 -- TILED MATMUL (free dim > 512)
 # GOTCHA: nc_matmul contracts over the PARTITION dim. stationary=[K,M],
 #   moving=[K,N] (K on partition), result=[M,N] lands in PSUM. Limits:
-#   K<=128, M<=128, moving free N<=512 -> loop/tile N. nc_matmul RETURNS
-#   the PSUM tile (no out=/dst=). Pass stationary=/moving= by keyword.
-# VERDICT: compiled=Y allclose=Y  max_err=2.29e-05
+#   K<=128, M<=128, moving free N<=512 -> loop/tile N.
+# [CORRECTED vs SDK source] nc_matmul is DST-FIRST + IN-PLACE, returns None:
+#   nisa.nc_matmul(dst, stationary, moving). Verified against nki 0.6.0
+#   nki/isa/__init__.pyi + _matmul.py ("dst = stationary.T @ moving") AND a
+#   live on-device add_rmsnorm WIN authored with the dst-first form. The
+#   earlier "returns the PSUM tile / no dst" claim here was mis-transcribed.
+# VERDICT: signature corrected vs SDK + live-author WIN; standalone re-run of
+#   THIS snippet pending (was not independently re-verified after the fix).
 # =====================================================================
 @jit
 def matmul_tiled(lhsT, rhs):
@@ -60,7 +76,8 @@ def matmul_tiled(lhsT, rhs):
     while n0 < N:                                  # plain Python loop -> lowers fine
         n1 = min(n0 + TILE, N)
         rt = nl.load(rhs[:, n0:n1])                # [K, <=512]
-        psum = nisa.nc_matmul(stationary=lt, moving=rt)   # -> [M, n1-n0] in PSUM
+        psum = nl.ndarray((M, n1 - n0), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(psum, lt, rt)               # DST-FIRST, in-place -> psum [M, n1-n0]
         nl.store(out[:, n0:n1], value=psum)
         n0 = n1
     return out
@@ -78,18 +95,23 @@ _v("1_matmul_tiled_N1024", _t1, atol=1e-2, rtol=1e-2,
 
 # =====================================================================
 # IDIOM 2 -- TRANSPOSE
-# GOTCHA: nisa.nc_transpose(data=t) transposes an SBUF tile. [NOTE] On THIS
-#   stack it worked on a size-1-partition [1,F] tile too (the historical
-#   "fails on size-1 partition" did NOT reproduce). nl.transpose(t) is an
-#   equally-correct high-level alternative. Both verified on [1,F].
-# VERDICT: 2a [P,F] Y/Y 0.0 | 2b [1,F] nc_transpose Y/Y 0.0 | 2c [1,F] nl.transpose Y/Y 0.0
+# GOTCHA: transposes an SBUF tile. The historical "fails on size-1 partition"
+#   did NOT reproduce (nl.transpose on [1,F] worked). [CORRECTED vs SDK source]
+#   the low-level nisa.nc_transpose is DST-FIRST + IN-PLACE, returns None:
+#   nisa.nc_transpose(dst, data) (nki 0.6.0 nki/isa/_transpose.py). The high-
+#   level nl.transpose(t) DOES return a tile and is the simpler robust path.
+# VERDICT: nl.transpose(t) verified on [1,F] (2c: Y/Y 0.0). The nisa dst-first
+#   form is per SDK source; standalone re-run of the corrected nisa snippet
+#   pending (the earlier rvalue-form nisa call was mis-transcribed).
 # =====================================================================
 @jit
 def transpose_isa(a):
     P, F = a.shape
     out = nl.ndarray((F, P), dtype=nl.float32, buffer=nl.shared_hbm)
     t = nl.load(a[:, :])
-    nl.store(out[:, :], value=nisa.nc_transpose(data=t))   # data= is the arg name
+    tt = nl.ndarray((F, P), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.nc_transpose(tt, t)                 # DST-FIRST, in-place -> tt [F,P]
+    nl.store(out[:, :], value=tt)
     return out
 
 @jit
@@ -104,9 +126,9 @@ def _t2(shape, fn):
     x = np.random.randn(*shape).astype(np.float32)
     return fn(torch.from_numpy(x).to(dev)).cpu().to(torch.float32).numpy(), x.T
 _v("2a_nc_transpose_PxF", lambda: _t2((8,16), transpose_isa),
-   note="nisa.nc_transpose(data=t) on normal [P,F]")
+   note="nisa.nc_transpose(dst, data) dst-first on normal [P,F]")
 _v("2b_nc_transpose_P1", lambda: _t2((1,16), transpose_isa),
-   note="[NOTE] size-1-partition nc_transpose WORKED here")
+   note="[NOTE] size-1-partition transpose worked; nisa form dst-first")
 _v("2c_nl_transpose_P1", lambda: _t2((1,16), transpose_hi),
    note="nl.transpose(t) alternative, also fine on [1,F]")
 
