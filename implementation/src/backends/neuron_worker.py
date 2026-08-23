@@ -42,6 +42,17 @@ from torch.distributed.tensor.parallel import (
 )
 from transformers import AutoConfig, AutoModelForCausalLM
 
+# Generic kernel-injection hook. Kept in a torch-free sibling module so the
+# inject/resolve logic is unit-testable on a CPU box (this worker itself is not
+# importable without torch). Fallback import mirrors the moe_fused pattern below,
+# covering both the package-relative (`backends.`) and src-on-path layouts.
+try:
+    from backends.kernel_inject import inject_kernel
+except Exception:  # noqa: BLE001
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from backends.kernel_inject import inject_kernel
+
 PEAK_TFLOPS_BF16 = 380.0  # per NeuronCore, Trn2 (trajectory-reporting.md)
 HBM_GB_PER_LOGICAL_CORE = 48.0  # 96 GB/device / 4 phys cores * LNC2 (2 phys/logical)
 
@@ -287,6 +298,12 @@ def main() -> None:
     ap.add_argument("--moe-kernel", default="",
                     help="Stage-3 MoE borrow: 'fused_nki' swaps the HF MoE "
                          "layer forward with the vendored fused NKI megakernel")
+    ap.add_argument("--kernel", default="",
+                    help="Generic kernel injection: a JSON descriptor "
+                         "{'target','entry','path'} pointing at an external "
+                         "(proprietary) kernel file whose 'entry' forward-factory "
+                         "is monkeypatched onto every module matching 'target'. "
+                         "See backends.kernel_inject.inject_kernel.")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -417,6 +434,22 @@ def main() -> None:
             moe_swap = f"eager-fallback: adapter error {e!r}"
             _log(f"moe-borrow adapter failed, running eager: {e!r}")
 
+    # GENERIC KERNEL INJECTION: the generalization of the hardcoded MoE swap
+    # above. Given a --kernel JSON descriptor (target/entry/path), import the
+    # kernel from its EXTERNAL on-disk file and monkeypatch it onto every module
+    # matching the target. Like the MoE borrow, inject_kernel NEVER raises — an
+    # unloadable kernel or no-match leaves the model eager and reports why, so
+    # this stays a correct (possibly unchanged) candidate for the equivalence
+    # gate. See backends/kernel_inject.py (torch-free so it is CPU-mock-testable).
+    kernel_inject = "not-requested"
+    if a.kernel:
+        try:
+            injected, reason = inject_kernel(model, a.kernel, _log)
+            kernel_inject = f"{'injected' if injected else 'eager-fallback'}: {reason}"
+        except Exception as e:  # noqa: BLE001 — never let injection crash a run
+            kernel_inject = f"eager-fallback: inject error {e!r}"
+            _log(f"kernel-inject failed, running eager: {e!r}")
+
     model = model.to(dev)
     model.eval()
     load_s = time.time() - t_load
@@ -523,6 +556,7 @@ def main() -> None:
         "world_size": world,
         "top1_tokens": eq_tokens,   # equivalence signature (last-K argmax)
         "moe_kernel_swap": moe_swap,  # Stage-3 borrow status (audit trail)
+        "kernel_inject": kernel_inject,  # generic-injection status (audit trail)
     })
 
     sys.stdout.flush()
