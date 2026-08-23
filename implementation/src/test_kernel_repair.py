@@ -25,6 +25,15 @@ AFFINE_SELECT_LOG = (
     "check: 's2d2_ts_as_valid_elem_count' [INTERNAL_ERROR] [NCC_IINAR001]"
 )
 TOPK_LOG = "error: AwsNeuronTopK rejected int64 key tensor in grouped routing"
+# The real, on-device-captured neuronx-cc failure for the Qwen3-Next MoE router's
+# sort-based torch.topk. A DIFFERENT top-k failure than TOPK_LOG: this is the
+# `sort` op being unsupported (NCC_EVRF029), not an int64-dtype reject.
+SORT_LOG = (
+    'loc(fused<772>["Qwen3NextTopKRouter.forward"("modeling_qwen3_next.py":772)]): '
+    "error: [NCC_EVRF029] Operation sort is not supported on trn2. Use supported "
+    "equivalent operation like TopK or replace it with an alternate implementation "
+    "via NKI. (from torch.topk(router_probs, top_k))"
+)
 UNKNOWN_LOG = "error: something entirely unfamiliar happened in pass QuxBar"
 
 
@@ -51,6 +60,31 @@ def test_affine_select_does_not_also_match_topk():
     # must not both fire on the same log (that would mis-route the fix).
     names = [r.name for r in match_error(AFFINE_SELECT_LOG)]
     assert "int64-topk-to-float-view" not in names
+
+
+def test_match_error_routes_sort_op_unsupported():
+    # The full-model MoE-router blocker: torch.topk -> XLA sort -> NCC_EVRF029.
+    # Must route ONLY to the sort-free argmax rewrite, not the int64-dtype one.
+    hits = match_error(SORT_LOG)
+    assert [r.name for r in hits] == ["topk-sort-to-argmax"]
+    assert hits[0].applies_at == "model-graph"
+    assert hits[0].confidence == "high"
+
+
+def test_sort_and_int64_topk_do_not_cross_match():
+    # Two distinct top-k failures share the topk/sort ops but have disjoint error
+    # signatures. Each log must route to exactly one entry — no cross-firing.
+    sort_names = [r.name for r in match_error(SORT_LOG)]
+    int64_names = [r.name for r in match_error(TOPK_LOG)]
+    assert "int64-topk-to-float-view" not in sort_names
+    assert "topk-sort-to-argmax" not in int64_names
+    assert sort_names == ["topk-sort-to-argmax"]
+    assert int64_names == ["int64-topk-to-float-view"]
+
+
+def test_match_ops_finds_sort_pre_compile():
+    hits = match_ops(["aten::sort"])
+    assert any(r.name == "topk-sort-to-argmax" for r in hits)
 
 
 def test_match_ops_finds_tril_pre_compile():

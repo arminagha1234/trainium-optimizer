@@ -22,7 +22,14 @@ The seed entries are grounded in REAL, on-device-captured failures (not guesses)
     only repro on trn2 (neuronx-cc 2.27.5334) went from exit-70 ISA-fail to
     "Compiler status PASS" after this rewrite — NO NKI kernel required.
   * ``int64-topk-to-float-view`` — AwsNeuronTopK rejecting an int64 top-k/sort in
-    MoE routing. Route the integer key through a float32 view.
+    MoE routing. Route the integer key through a float32 view. (This is a DTYPE
+    reject — the top-k algorithm is fine, the int64 KEY is not.)
+  * ``topk-sort-to-argmax`` — a DIFFERENT top-k failure: the MoE router's
+    ``torch.topk`` lowers to an XLA ``sort`` op, and ``sort`` itself is not a
+    supported trn2 ISA op (NCC_EVRF029). The dtype trick does NOT help here; the
+    fix is to replace the sort-based top-k with an iterative argmax (k rounds of
+    ``.max(dim=-1)`` with iota-compare masking). Grounded: this rewrite is what
+    made a FULL Qwen3-Next/Qwen3.5 model compile to a valid NEFF on trn2.
 
 Every rewrite is a hypothesis with EVIDENCE and a confidence; the repair loop
 still verifies by re-compiling. A catalog entry is a lead, not a guarantee.
@@ -93,6 +100,41 @@ REWRITES: tuple[Rewrite, ...] = (
         confidence="medium",
         evidence="HF transformers/integrations/moe.py grouped-experts torch.sort "
                  "on int64 expert_ids -> AwsNeuronTopK reject (MoE routing).",
+    ),
+    Rewrite(
+        name="topk-sort-to-argmax",
+        summary="Replace a sort-based MoE-router torch.topk with an iterative "
+                "argmax (k rounds of masked .max) — 'sort' is not a trn2 ISA op.",
+        error_signatures=(
+            "NCC_EVRF029",                     # the exact op-unsupported error code
+            "Operation sort is not supported",
+            "sort is not supported on trn2",
+        ),
+        hostile_ops=("aten::sort", "aten::topk", "sort", "topk"),
+        fix=(
+            "# This is an OP-unsupported reject, not a dtype reject: torch.topk in\n"
+            "# the router lowers to an XLA `sort`, and `sort` has no trn2 ISA op.\n"
+            "# Casting keys to float32 (int64-topk-to-float-view) does NOT help.\n"
+            "# Replace the sort-based top-k with a sort-free iterative argmax:\n"
+            "vals = router_probs                       # (tokens, num_experts)\n"
+            "idxs = []\n"
+            "for _ in range(top_k):                     # k rounds, no sort\n"
+            "    m = vals.max(dim=-1, keepdim=True)     # argmax = supported reduce\n"
+            "    idxs.append(m.indices)\n"
+            "    iota = torch.arange(vals.shape[-1], device=vals.device)\n"
+            "    mask = iota.view(1, -1) == m.indices   # mask the winner out\n"
+            "    vals = vals.masked_fill(mask, float('-inf'))\n"
+            "top_idx = torch.cat(idxs, dim=-1)          # was torch.topk(...).indices\n"
+            "# Gather the corresponding probs with the original (unmasked) tensor.\n"
+            "# Pure graph rewrite; no NKI kernel. Compiler PASS at full-model scale."
+        ),
+        applies_at="model-graph",
+        confidence="high",
+        evidence="Qwen3-Next/Qwen3.5 (GatedDeltaNet-MoE) full-model compiler-only "
+                 "compile on trn2 (neuronx-cc 2.27.5334): Qwen3NextTopKRouter.forward "
+                 "torch.topk at modeling_qwen3_next.py:772 -> NCC_EVRF029 'sort not "
+                 "supported'. Iterative-argmax rewrite -> full model PASS (valid "
+                 "~56MB NEFF). This, not .tril, was the load-bearing full-model blocker.",
     ),
     Rewrite(
         name="dynamic-slice-to-static-bucket",
