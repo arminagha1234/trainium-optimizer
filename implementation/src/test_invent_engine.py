@@ -514,6 +514,128 @@ def test_spec_file_loader(tmp_path):
     assert res.status == "no_author"
 
 
+# -- FIX 1: a missing torch_neuronx.nki_hop must NEVER abort the device path --
+# On torch-neuronx 2.9 the ``nki_hop`` module was removed. An eager, unused
+# ``from torch_neuronx import nki_hop`` at the top of _device_race raised
+# ImportError and aborted the race before ANY device work; the wrap_nki fallback
+# in _invoke_kernel imported it unguarded too. Both must survive its absence.
+def test_device_race_has_no_eager_nki_hop_import():
+    # The unused eager import is gone (it aborted the whole race on 2.9).
+    import inspect
+    src = inspect.getsource(InventEngine._device_race)
+    assert "import nki_hop" not in src
+    assert "from torch_neuronx import nki_hop" not in src
+
+
+def test_invoke_kernel_direct_call_needs_no_nki_hop():
+    # The PROVEN path is a direct positional call — it must never touch nki_hop,
+    # so a directly-callable kernel returns cleanly even with torch_neuronx absent
+    # (it is not installed in this env). Result is element [0] of a tuple return.
+    from invent_engine import _invoke_kernel
+    assert _invoke_kernel(lambda *a: (7, "meta"), [1, 2]) == 7
+    assert _invoke_kernel(lambda *a: 9, [1]) == 9
+
+
+def test_invoke_kernel_fallback_missing_nki_hop_is_runtimeerror_not_importerror():
+    # When the direct call raises TypeError and the kernel is not a tuple builder,
+    # the last-resort wrap_nki fallback lives in the removed-in-2.9
+    # torch_neuronx.nki_hop. The guarded import must degrade to a clear
+    # RuntimeError (recorded as race data by _device_race), NEVER an ImportError
+    # that aborts the race.
+    from invent_engine import _invoke_kernel
+
+    def _wants_kwargs(*args):
+        raise TypeError("kernel wants keyword args")
+
+    try:
+        _invoke_kernel(_wants_kwargs, [1])
+    except ImportError:  # pragma: no cover
+        raise AssertionError("nki_hop absence must not surface as ImportError")
+    except RuntimeError as e:
+        assert "wrap_nki" in str(e) and "nki_hop" in str(e)
+    else:  # pragma: no cover
+        raise AssertionError("expected the guarded fallback to raise RuntimeError")
+
+
+# -- FIX 2: the repair-loop compile gate runs the REAL compile ---------------
+# build() only IMPORTS/traces (a @nki.jit fn is lowered by neuronx-cc lazily, on
+# first invocation), so a real "failed to resolve name"/ISA error used to escape
+# the repair window and die at race time instead of teaching a round-2 rewrite.
+def test_repair_loop_feeds_compile_error_back_and_converges(tmp_path):
+    # The seam: an injected compile_fn fails round 1 with a COMPILER error and
+    # succeeds round 2; the author consumes the fed-back error and rewrites. We
+    # prove the compile error reaches repair feedback AND the loop converges,
+    # then goes through the SAME _finish gates as single-shot (-> win).
+    from kernel_repair import CompileResult
+    RESOLVE_ERR = ("device compile failed: RuntimeError('neuronx-cc: failed to "
+                   "resolve name softcap_kernel')")
+    seen = {"feedback": ""}
+
+    class _LearningLLM:  # KernelAuthor-shaped: .author(spec, lessons, feedback)
+        def author(self, spec, lessons, feedback):
+            trail = "".join(fb.error_log for fb in (feedback or []))
+            seen["feedback"] = trail
+            fixed = "resolve name" in trail        # learned from the fed-back error
+            src = ("import neuronxcc.nki as nki\n"
+                   f"@nki.jit\ndef {spec.name}_kernel(x):\n    return x\n")
+            return AuthoredKernel(op=spec.name, origin="invented",
+                                  numpy_impl=spec.reference, nki_src=src,
+                                  entry=f"{spec.name}_kernel",
+                                  pipeline_notes="good" if fixed else "bad")
+
+    rounds = {"n": 0}
+
+    def compile_fn(kernel):
+        rounds["n"] += 1
+        if kernel.pipeline_notes == "good":
+            return CompileResult(True, artifact="/tmp/k.neff")
+        return CompileResult(False, error_log=RESOLVE_ERR)
+
+    eng = InventEngine(out_dir=tmp_path, author=_LearningLLM(), max_repair_rounds=4)
+    res = eng.run_op(catalog()["softcap"], race_fn=_win_race, compile_fn=compile_fn)
+    assert rounds["n"] == 2                       # failed once, converged on round 2
+    assert "resolve name" in seen["feedback"]     # the compile error reached the author
+    assert res.status == "win"                    # converged kernel cleared _finish
+
+
+def test_compile_gate_runs_real_compile_and_surfaces_error(tmp_path):
+    # The DEFAULT _compile must, on device, run the real compile via
+    # _device_compile_probe and turn a compiler error into the CompileResult
+    # error_log the repair loop feeds back. The probe itself is device-only (needs
+    # torch + a NeuronCore, exactly like _device_race), so we stub it and force
+    # nki_available()->True; the assertion is that _compile WIRES the probe result.
+    import invent_engine as ie
+    spec = catalog()["softcap"]
+    kernel = author_kernel(spec)          # clean kernel: clears the offline gate
+    eng = InventEngine(out_dir=tmp_path)
+    prev = ie.nki_available
+    ie.nki_available = lambda: True       # pretend we are on device
+    kernel.build = lambda: (lambda *a: a)  # build() succeeds (import/trace only)
+    try:
+        # (1) probe reports a REAL neuronx-cc error -> compile FAILS with it.
+        RESOLVE = "failed to resolve name 'softcap_kernel'"
+        eng._device_compile_probe = lambda fn, s: RESOLVE
+        r_fail = eng._compile(kernel, spec)
+        assert not r_fail.ok
+        assert RESOLVE in r_fail.error_log
+        assert "device compile failed" in r_fail.error_log
+        # (2) probe reports None (it compiled) -> compile SUCCEEDS.
+        eng._device_compile_probe = lambda fn, s: None
+        r_ok = eng._compile(kernel, spec)
+        assert r_ok.ok and r_ok.artifact == kernel.entry
+    finally:
+        ie.nki_available = prev
+
+
+def test_compile_gate_off_device_stays_offline_only(tmp_path):
+    # Regression: off device (no nki) the compile gate keeps today's behavior — an
+    # offline-gate PASS is the honest best-effort; it must NOT require a device.
+    eng = InventEngine(out_dir=tmp_path)
+    spec = catalog()["softcap"]
+    r = eng._compile(author_kernel(spec), spec)
+    assert r.ok and r.artifact.startswith("offline-only:")
+
+
 # ===========================================================================
 # standalone runner (no pytest required)
 # ===========================================================================
