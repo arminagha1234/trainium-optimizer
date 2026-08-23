@@ -284,6 +284,10 @@ class NativePyTorchBackend:
             "--batch", str(batch),
             "--cc-flags", str(cfg.get("cc_flags", "")),   # Stage 2-5 compiler rewrites
             "--moe-kernel", str(cfg.get("moe_kernel", "")),  # Stage 3 MoE borrow
+            # Generic kernel injection: a JSON descriptor (target/entry/path) is
+            # threaded through to the worker's inject_kernel hook, exactly the way
+            # moe_kernel is threaded. Empty string => no injection (eager).
+            "--kernel", str(cfg.get("kernel", "")),
             "--out", str(out_f),
         ]
         env = {**os.environ,
