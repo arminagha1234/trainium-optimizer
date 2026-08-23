@@ -90,3 +90,5 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	huggingfacetb-smollm2-360m-instruct	HuggingFaceTB/SmolLM2-360M-Instruct	dense_causal_lm	69	12.171	3008	ok
 1	qwen-qwen2-5-coder-1-5b	Qwen/Qwen2.5-Coder-1.5B	dense_causal_lm	89	9.603	5404	ok
 1	deepseek-ai-deepseek-llm-7b-base	deepseek-ai/deepseek-llm-7b-base	dense_causal_lm	82	7.443	5950	ok
+1	bigscience-bloom-1b7	bigscience/bloom-1b7	dense_causal_lm	53	8.395	2714	ok
+1	microsoft-phi-3-mini-4k-instruct	microsoft/Phi-3-mini-4k-instruct	dense_causal_lm	1	-	95	ok
