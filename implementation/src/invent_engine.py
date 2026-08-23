@@ -1001,7 +1001,7 @@ def _invoke_kernel(fn: Callable, args: list):
     """
     try:
         out = fn(*args)
-    except TypeError:
+    except TypeError as exc:
         # Some jit builds return a (spec, meta, callable)-style tuple rather
         # than a directly-callable kernel; try the last callable element, then
         # fall back to the legacy wrap_nki path with a clear provenance tag.
@@ -1019,10 +1019,28 @@ def _invoke_kernel(fn: Callable, args: list):
             except ImportError:
                 wrap_nki = None
             if wrap_nki is None:
+                # FIX 1(b): the #1 masked cause here is an INVOCATION-CONTRACT
+                # mismatch — the authored kernel took an ``out=``/destination
+                # parameter (an extra required positional arg), so calling it
+                # with only the op's input tensors raised a "missing positional
+                # argument" TypeError. The old message ("no invocation path")
+                # threw that actionable signal away, so the repair loop could
+                # not learn to drop the out-param. Surface the REAL TypeError
+                # verbatim and name the contract the harness enforces.
                 raise RuntimeError(
-                    "authored kernel not directly callable and the wrap_nki "
-                    "fallback is unavailable (torch_neuronx.nki_hop removed in "
-                    "torch-neuronx 2.9) — no invocation path")
+                    f"authored kernel not directly callable: {exc!s}. The "
+                    f"harness invokes the kernel as `out = kernel(*inputs)` with "
+                    f"{len(args)} positional input tensor(s) and expects the "
+                    f"output tensor to be RETURNED. A kernel that declares an "
+                    f"`out=`/destination parameter (an extra required arg) or "
+                    f"otherwise mismatches this arity fails here: got "
+                    f"{len(args)} positional args but the kernel expects a "
+                    f"different count. Re-author the kernel to take exactly the "
+                    f"positional inputs and RETURN the output tensor — do NOT "
+                    f"take an out param. (The wrap_nki fallback is also "
+                    f"unavailable: torch_neuronx.nki_hop was removed in "
+                    f"torch-neuronx 2.9 — no invocation path.)"
+                ) from exc
             wrapped = wrap_nki(fn)
             out = wrapped[1](*args)
     return out[0] if isinstance(out, (list, tuple)) else out
