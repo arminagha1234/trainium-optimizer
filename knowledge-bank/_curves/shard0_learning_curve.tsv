@@ -85,3 +85,5 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	stabilityai-stablelm-2-1-6b	stabilityai/stablelm-2-1_6b	dense_causal_lm	63	2.846	3559	ok
 1	allenai-olmo-2-1124-7b	allenai/OLMo-2-1124-7B	dense_causal_lm	1	-	266	ok
 1	tiiuae-falcon-7b	tiiuae/falcon-7b	dense_causal_lm	1	-	152	ok
+1	bigcode-starcoder2-3b	bigcode/starcoder2-3b	dense_causal_lm	68	4.633	4037	ok
+1	ibm-granite-granite-3-1-2b-instruct	ibm-granite/granite-3.1-2b-instruct	dense_causal_lm	1	-	11	ok
