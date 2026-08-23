@@ -42,6 +42,7 @@ Run on device (.73 / .211):
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import importlib.util
 import json
 import os
@@ -62,8 +63,10 @@ from bank import (
     LessonType,
     Symptom,
     Tier,
+    _norm_family,
 )
 from guardrails import Guardrails
+import kernel_rewrites
 from ledger import Layer, Ledger, Origin, Row, Stage, Status, current_commit
 from invent_kernels import (
     AuthoredKernel,
@@ -133,6 +136,11 @@ class InventResult:
     race: RaceResult
     lesson_id: str = ""
     detail: str = ""
+    # How many previously-banked lessons (anti-patterns / prior wins) the engine
+    # RETRIEVED as relevant to this op before authoring. Makes the "learn from
+    # the bank" step observable. Last field with a default so existing positional
+    # constructions (incl. tests) are unaffected.
+    lessons_consulted: int = 0
 
 
 # A race function lets tests inject a deterministic device outcome. On device
@@ -190,6 +198,103 @@ class InventEngine:
         except Exception:  # noqa: BLE001 — a broken registry must not stop authoring
             return None
         return kspec if (kspec and kspec.usable) else None
+
+    # -- learn from the bank (retrieve relevant lessons before authoring) ----
+
+    def _lesson_relevant(self, lesson: Lesson, spec: OpSpec) -> bool:
+        """Is a banked lesson relevant to THIS op? By op name / shape_class /
+        symptom — the three keys the invent loop banks under (lesson ids are
+        ``invented-<op>-<shape_class>`` / ``antipattern-invented-<op>-<shape_class>``;
+        symptom signatures name the op)."""
+        name = (spec.name or "").lower()
+        sc = (spec.shape_class or "").lower()
+        hay = f"{lesson.lesson_id} {lesson.reason}".lower()
+        if name and name in hay:
+            return True
+        if sc and sc in hay:
+            return True
+        iv = lesson.intervention.get("spec", {}) if isinstance(lesson.intervention, dict) else {}
+        if isinstance(iv, dict) and (
+            iv.get("nki_kernel") == spec.name or iv.get("shape_class") == spec.shape_class
+        ):
+            return True
+        for s in lesson.symptoms_addressed:
+            if name and name in (s.signature or "").lower():
+                return True
+        return False
+
+    def _retrieve_lessons(self, spec: OpSpec) -> list[Lesson]:
+        """Query the bank for anti-patterns / prior lessons relevant to this op
+        BEFORE authoring, so previously-banked losses and wins become
+        load-bearing (today the engine WRITES lessons but never READS them).
+
+        Uses the bank's real retrieval API:
+          * ``KnowledgeBank.antipatterns(family, sdk)`` — family anti-patterns
+            (verified tier), the same index the pre-compile prune consults;
+          * ``KnowledgeBank.query_symptom("compute_bound", ...)`` — the ADIAS
+            symptom index the invent NKI_KERNEL / anti-pattern lessons are keyed
+            under (verified tier).
+        Both read VERIFIED only, so we additionally sweep the PROVISIONAL tier
+        the invent loop itself writes to — a loss banked on op A of a run should
+        inform a later authoring of the same op/shape-class in the SAME run,
+        without waiting on weekly human promotion (the compounding the framework
+        is built on). Relevance is filtered by ``_lesson_relevant``. Never
+        raises — a broken bank must not stop authoring."""
+        sdk = self.sdk_version
+        found: dict[str, Lesson] = {}
+
+        def _add(lessons: list[Lesson] | None) -> None:
+            for l in lessons or []:
+                if l.lesson_id in found:
+                    continue
+                if self._lesson_relevant(l, spec):
+                    found[l.lesson_id] = l
+
+        # (1) family anti-patterns (verified) — the real bank pruning index.
+        try:
+            _add(self.bank.antipatterns(spec.family, sdk))
+        except Exception:  # noqa: BLE001 — a broken bank must not stop authoring
+            pass
+        # (2) symptom index (verified) — invent lessons are keyed compute_bound.
+        try:
+            _add(self.bank.query_symptom("compute_bound", spec.family,
+                                         0.0, 0, 1, sdk))
+        except Exception:  # noqa: BLE001
+            pass
+        # (3) provisional tier the invent loop itself writes — so lessons compound
+        #     within an autonomous run before any human promotion.
+        try:
+            def _fam_ok(l: Lesson) -> bool:
+                af = l.applicability.architecture_family
+                if _norm_family(af) != _norm_family(spec.family):
+                    return False
+                pats = l.applicability.neuron_sdk_versions
+                return (not pats) or any(fnmatch.fnmatch(sdk, p) for p in pats)
+
+            _add([l for l in self.bank.load_all(Tier.PROVISIONAL)
+                  if l.type in (LessonType.ANTI_PATTERN, LessonType.NKI_KERNEL)
+                  and _fam_ok(l)])
+        except Exception:  # noqa: BLE001
+            pass
+        return list(found.values())
+
+    # -- diagnose a failure with the rewrite catalog -------------------------
+
+    def _diagnose_failure(self, error_text: str) -> tuple[str, str]:
+        """Match a compiler / error string against the rewrite catalog. Returns
+        ``(desc_suffix, reason_suffix)`` — both empty when nothing matches —
+        turning an opaque "failed" into an actionable "failed; known fix:
+        <rewrite>". The reason_suffix is appended to the banked anti-pattern so
+        the next author sees the fix; the desc_suffix lands in the ledger row."""
+        try:
+            rewrites = kernel_rewrites.match_error(error_text or "")
+        except Exception:  # noqa: BLE001 — diagnosis must never break banking
+            return "", ""
+        if not rewrites:
+            return "", ""
+        names = ", ".join(r.name for r in rewrites)
+        return (f" [known fix: {names}]",
+                f" Known fix (rewrite catalog): {kernel_rewrites.describe(rewrites)}")
 
     # -- offline gate --------------------------------------------------------
 
@@ -404,7 +509,8 @@ class InventEngine:
         return lesson_id
 
     def _bank_anti_pattern(self, spec: OpSpec, reason: str,
-                           race: RaceResult | None = None) -> str:
+                           race: RaceResult | None = None,
+                           diagnosis: str = "") -> str:
         """A wrong / slow / un-buildable invented kernel -> provisional anti-pattern.
 
         No ``matcher`` on purpose: this is a recorded WARNING ("we tried an
@@ -419,6 +525,9 @@ class InventEngine:
             detail = (f"{reason} (correct={race.correct}, "
                       f"speedup={race.speedup:.3f}x, "
                       f"kernel={race.kernel_ms:.3f}ms, base={race.baseline_ms:.3f}ms)")
+        # Append the rewrite-catalog diagnosis (if any) so the banked warning is
+        # actionable — the next author reads a known fix, not just "it failed".
+        detail = f"{detail}{diagnosis}"
         lesson = Lesson(
             lesson_id=lesson_id,
             type=LessonType.ANTI_PATTERN,
@@ -449,20 +558,33 @@ class InventEngine:
     # -- ledger --------------------------------------------------------------
 
     def _record(self, spec: OpSpec, status: Status, metric: float,
-                correctness: float, desc: str, origin: Origin = Origin.INVENTED) -> None:
+                correctness: float, desc: str, origin: Origin = Origin.INVENTED,
+                n_lessons: int = 0) -> None:
+        # Surface how many banked lessons informed this op (learn-from-the-bank
+        # step). Prefix only when >0 so records with no relevant prior are
+        # byte-for-byte unchanged.
+        prefix = f"[lessons:{n_lessons}] " if n_lessons else ""
         self.ledger.append(Row(
             commit=current_commit(self.out_dir),
             stage=Stage.INVENT, origin=origin, layer=Layer.KERNEL,
             source="invent-engine", metric=metric, mfu=-1.0,
             correctness=correctness, compile_s=0.0, status=status,
-            description=f"{spec.name}/{spec.shape_class}: {desc}",
+            description=f"{spec.name}/{spec.shape_class}: {prefix}{desc}",
         ))
 
     # -- the loop ------------------------------------------------------------
 
     def run_op(self, spec: OpSpec, race_fn: RaceFn | None = None) -> InventResult:
-        """Prior-art (Harvest) -> author -> offline gate -> on-device race ->
-        keep/discard -> bank."""
+        """Learn (retrieve) -> Prior-art (Harvest) -> author -> offline gate ->
+        on-device race -> keep/discard -> bank."""
+        # LEARN FIRST: retrieve previously-banked lessons (anti-patterns / prior
+        # wins) relevant to this op so the bank is READ, not just written. The
+        # count is recorded on the ledger row + result; the lessons themselves
+        # are handed to the author (which ignores them today — a future LLM
+        # author consumes them). This is the "compounding" step.
+        lessons = self._retrieve_lessons(spec)
+        n = len(lessons)
+
         # HARVEST FIRST (Harvest -> Borrow -> Invent): if the corpus already has
         # a usable kernel for this op's primitive, REUSE it — do not spend a
         # compile re-inventing what exists. Recorded as a HARVESTED keep so the
@@ -473,37 +595,45 @@ class InventEngine:
             self._record(spec, Status.KEEP, 0.0, 100.0,
                          f"harvested existing {prior.name} kernel "
                          f"({prior.status}, {tier}-validated) -> reuse, no authoring",
-                         origin=Origin.HARVESTED)
+                         origin=Origin.HARVESTED, n_lessons=n)
             return InventResult(spec.name, spec.shape_class, "harvested",
                                 "harvested",
                                 OfflineGate(True, False, 0.0,
                                             reason=f"prior art: {prior.name}"),
                                 RaceResult(False, reason="harvested (not raced)"),
-                                detail=f"reused {prior.name} [{prior.status}]")
+                                detail=f"reused {prior.name} [{prior.status}]",
+                                lessons_consulted=n)
 
-        author = author_kernel(spec)
+        # Hand the retrieved lessons to the author as OPTIONAL hints. The recipe
+        # author ignores them (kwarg defaults to None), so behaviour is unchanged
+        # today; the LLM author will consume them later.
+        author = author_kernel(spec, lessons=lessons)
 
         if not author.nki_src:
             self._record(spec, Status.DISCARD, 0.0, 0.0,
                          f"no author available ({author.pipeline_notes})",
-                         origin=Origin.NONE)
+                         origin=Origin.NONE, n_lessons=n)
             return InventResult(spec.name, spec.shape_class, spec.origin,
                                 "no_author",
                                 OfflineGate(False, False, float("inf"),
                                             reason="no author"),
                                 RaceResult(False, reason="no author"),
-                                detail=author.pipeline_notes)
+                                detail=author.pipeline_notes, lessons_consulted=n)
 
         offline = self.offline_gate(author, spec)
         if not offline.passed:
-            lid = self._bank_anti_pattern(spec, f"offline gate: {offline.reason}")
+            # Diagnose the offline-reject reason with the rewrite catalog.
+            desc_sfx, reason_sfx = self._diagnose_failure(offline.reason)
+            lid = self._bank_anti_pattern(
+                spec, f"offline gate: {offline.reason}", diagnosis=reason_sfx)
             self._record(spec, Status.DISCARD, 0.0,
                          100.0 if offline.parity_ok else 0.0,
-                         f"offline reject: {offline.reason}")
+                         f"offline reject: {offline.reason}{desc_sfx}", n_lessons=n)
             return InventResult(spec.name, spec.shape_class, spec.origin,
                                 "offline_reject", offline,
                                 RaceResult(False, reason="offline reject"),
-                                lesson_id=lid, detail=offline.reason)
+                                lesson_id=lid, detail=f"{offline.reason}{desc_sfx}",
+                                lessons_consulted=n)
 
         race = (race_fn or self._device_race)(author, spec)
 
@@ -511,19 +641,26 @@ class InventEngine:
             # Off-device (or un-buildable): offline gate passed, device deferred.
             # NOT a win and NOT an anti-pattern — honestly "not yet raced".
             self._record(spec, Status.DISCARD, 0.0, 100.0,
-                         f"offline pass; on-device race deferred ({race.reason})")
+                         f"offline pass; on-device race deferred ({race.reason})",
+                         n_lessons=n)
             return InventResult(spec.name, spec.shape_class, spec.origin,
                                 "device_deferred", offline, race,
-                                detail=race.reason)
+                                detail=race.reason, lessons_consulted=n)
 
         if not race.correct:
-            lid = self._bank_anti_pattern(spec, "incorrect on device", race)
+            # Diagnose the on-device failure (compiler/error string) with the
+            # rewrite catalog — an opaque "wrong" becomes an actionable fix.
+            desc_sfx, reason_sfx = self._diagnose_failure(race.reason)
+            lid = self._bank_anti_pattern(
+                spec, "incorrect on device", race, diagnosis=reason_sfx)
             self._record(spec, Status.DISCARD, race.speedup,
                          race.correctness_pct,
-                         f"WRONG on device ({race.correctness_pct:.1f}% within tol)")
+                         f"WRONG on device ({race.correctness_pct:.1f}% within tol)"
+                         f"{desc_sfx}", n_lessons=n)
             return InventResult(spec.name, spec.shape_class, spec.origin,
                                 "anti_pattern", offline, race,
-                                lesson_id=lid, detail="incorrect on device")
+                                lesson_id=lid, detail=f"incorrect on device{desc_sfx}",
+                                lessons_consulted=n)
 
         # Correct — now the speed race with the 5% invention margin.
         is_win = self.guards.is_improvement(race.speedup, 1.0, is_invention=True)
@@ -531,17 +668,19 @@ class InventEngine:
             lid = self._bank_win(spec, race)
             self._record(spec, Status.KEEP, race.speedup, race.correctness_pct,
                          f"WIN: {race.speedup:.3f}x vs {spec.baseline} "
-                         f"(>= 5% margin)")
+                         f"(>= 5% margin)", n_lessons=n)
             return InventResult(spec.name, spec.shape_class, spec.origin,
                                 "win", offline, race, lesson_id=lid,
-                                detail=f"{race.speedup:.3f}x")
+                                detail=f"{race.speedup:.3f}x", lessons_consulted=n)
         lid = self._bank_anti_pattern(
             spec, f"correct but only {race.speedup:.3f}x (< 5% margin)", race)
         self._record(spec, Status.DISCARD, race.speedup, race.correctness_pct,
-                     f"correct-but-slow: {race.speedup:.3f}x (< 5% margin)")
+                     f"correct-but-slow: {race.speedup:.3f}x (< 5% margin)",
+                     n_lessons=n)
         return InventResult(spec.name, spec.shape_class, spec.origin,
                             "anti_pattern", offline, race, lesson_id=lid,
-                            detail=f"correct but {race.speedup:.3f}x < 1.05x")
+                            detail=f"correct but {race.speedup:.3f}x < 1.05x",
+                            lessons_consulted=n)
 
     def run(self, specs: list[OpSpec],
             race_fn: RaceFn | None = None) -> list[InventResult]:

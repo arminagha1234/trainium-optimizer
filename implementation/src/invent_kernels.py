@@ -792,8 +792,15 @@ _RECIPES: dict[str, _AuthorRecipe] = {
 }
 
 
-def author_kernel(op_spec: OpSpec) -> AuthoredKernel:
+def author_kernel(op_spec: OpSpec, lessons: list | None = None) -> AuthoredKernel:
     """PLUGGABLE authoring step — the headline of Stage 4.
+
+    ``lessons`` (optional) are banked anti-patterns / prior wins the engine
+    retrieved as relevant to this op BEFORE authoring (see
+    ``InventEngine._retrieve_lessons``). This recipe-driven reference author does
+    NOT consume them — it defaults to None and behaviour is unchanged — but the
+    kwarg is the seam a future LLM/agent author uses to actually learn from the
+    bank (e.g. avoid a formulation a prior run banked as an anti-pattern).
 
     Given an ``OpSpec``, produce an ``AuthoredKernel`` following the 7-step
     incremental pipeline. This reference implementation is recipe-driven: it
