@@ -93,3 +93,6 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	bigscience-bloom-1b7	bigscience/bloom-1b7	dense_causal_lm	53	8.395	2714	ok
 1	microsoft-phi-3-mini-4k-instruct	microsoft/Phi-3-mini-4k-instruct	dense_causal_lm	1	-	95	ok
 1	tinyllama-tinyllama-1-1b-chat-v1-0	TinyLlama/TinyLlama-1.1B-Chat-v1.0	dense_causal_lm	85	11.048	5652	ok
+1	openai-community-gpt2-large	openai-community/gpt2-large	dense_causal_lm	81	6.104	3090	ok
+1	eleutherai-pythia-6-9b	EleutherAI/pythia-6.9b	dense_causal_lm	1	-	164	ok
+1	mosaicml-mpt-7b	mosaicml/mpt-7b	dense_causal_lm	0	-	4	FAIL_NO_BASELINE

@@ -1,0 +1,40 @@
+lesson_id: openai-community-gpt2-large-stage1-winner
+type: config_prior
+layer: config
+migration_risk: medium
+origin: ''
+applicability:
+  architecture_family: dense_causal_lm
+  param_count_range:
+  - 2800000000.0
+  - 5200000000.0
+  seq_len_range:
+  - 0
+  - 10000000
+  batch_range:
+  - 1
+  - 4096
+  parents_ok: []
+  neuron_sdk_versions:
+  - 2.28.*
+confidence:
+  n_models_validated: 1
+  architecture_diversity: 1
+  human_verified: false
+intervention:
+  spec:
+    tp_degree: 1
+    weights_dtype: bf16
+    attn_implementation: eager
+    compile_mode: compile-default
+    batch: 8
+    cp_degree: 1
+    dp_degree: 4
+    kv_replication: 1
+    cores_used: 4
+    cores_available: 4
+    cc_flags: --optlevel 3
+last_reverified_sdk: 2.28.0
+evidence:
+- model: openai-community/gpt2-large
+  metric: 31275.162878756848
