@@ -160,3 +160,31 @@ def test_equivalence_failure_blocks_promotion(tmp_path: Path):
     assert all(r.status is Status.DISCARD for r in config_changes)
     assert any("equivalence fail" in r.description for r in rows)
     assert orch.incumbent.provenance == "baseline"
+
+
+def test_equivalence_threshold_is_stage_aware(orchestrator: Orchestrator):
+    """A rewrite that shifts 10% of top-1 tokens is a legitimate CONFIG delta but
+    an FP-accumulation regression for a pure re-expression stage. So a 0.90 match
+    must PASS as CONFIG (0.75 floor) yet be REJECTED at GRAPH_REWRITE (0.95)."""
+    from backends.base import Measurements
+
+    orch = orchestrator
+    orch._baseline_tokens = list(range(100))
+    # 90 of 100 top-1 tokens match the baseline signature -> 0.90.
+    cand = Measurements(metric=1.0, top1_tokens=list(range(90)) + [10_000] * 10)
+
+    # The strict set covers exactly the re-expression stages, not CONFIG/INVENT.
+    assert Stage.CONFIG not in orch._STRICT_EQUIV_STAGES
+    assert Stage.INVENT not in orch._STRICT_EQUIV_STAGES
+    assert Stage.GRAPH_REWRITE in orch._STRICT_EQUIV_STAGES
+
+    loose = orch._equivalence(cand, SPEC, None,
+                              strict=Stage.CONFIG in orch._STRICT_EQUIV_STAGES)
+    strict = orch._equivalence(cand, SPEC, None,
+                               strict=Stage.GRAPH_REWRITE in orch._STRICT_EQUIV_STAGES)
+
+    assert loose.passed, "0.90 match should PASS as CONFIG (0.75 floor)"
+    assert not strict.passed, "0.90 match should be REJECTED at GRAPH_REWRITE (0.95)"
+    # Same measured correctness either way; only the gate differs.
+    assert loose.correctness_pct == pytest.approx(90.0)
+    assert strict.correctness_pct == pytest.approx(90.0)

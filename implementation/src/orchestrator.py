@@ -444,9 +444,25 @@ class Orchestrator:
 
     # -- tournament primitives ----------------------------------------------
 
-    def _equivalence(self, m: Measurements, spec: ModelSpec, neff) -> EquivalenceResult:
+    # Stages that only re-express the SAME computation — compiler-flag sweeps,
+    # borrowed/known kernels, and graph rewrites — must reproduce the baseline's
+    # argmax tokens essentially exactly. A rewrite that shifts >5% of top-1
+    # tokens is an FP-accumulation regression, not a legitimate output change, so
+    # these gate at 0.95. CONFIG/INVENT stages legitimately change more (different
+    # batching/parallelism/novel kernel), so they keep the looser 0.75 floor.
+    _STRICT_EQUIV_STAGES = frozenset(
+        {Stage.KNOWN_KERNEL, Stage.BORROW, Stage.GRAPH_REWRITE}
+    )
+
+    def _equivalence(
+        self, m: Measurements, spec: ModelSpec, neff, strict: bool = False,
+    ) -> EquivalenceResult:
         """Real correctness gate: fraction of top-1 tokens matching the Stage-0
-        baseline signature. No baseline signature (mock) -> injected checker."""
+        baseline signature. No baseline signature (mock) -> injected checker.
+
+        `strict` raises the pass threshold from 0.75 to 0.95 for pure
+        re-expression stages (cc-flag / borrow / graph-rewrite); the caller
+        (_evaluate) sets it from the stage. The mock path is unaffected."""
         ref = self._baseline_tokens
         cand = list(getattr(m, "top1_tokens", []) or [])
         if not ref:
@@ -456,8 +472,10 @@ class Orchestrator:
                                      notes="no output tokens (run failed/OOM)")
         n = min(len(ref), len(cand))
         match = sum(1 for i in range(n) if ref[i] == cand[i]) / n
-        return EquivalenceResult(passed=match >= 0.75, correctness_pct=match * 100.0,
-                                 notes=f"top1 match {match:.0%} vs baseline")
+        threshold = 0.95 if strict else 0.75
+        return EquivalenceResult(passed=match >= threshold, correctness_pct=match * 100.0,
+                                 notes=f"top1 match {match:.0%} vs baseline "
+                                       f"(need {threshold:.0%})")
 
     def _evaluate(
         self, cand: Candidate, spec: ModelSpec, stage: Stage,
@@ -534,7 +552,8 @@ class Orchestrator:
         # the Stage-0 baseline signature; a config that changes the output is a
         # bug, not a win. (Falls back to the injected checker when no signature
         # is available, e.g. the mock backend.)
-        eq = self._equivalence(m, spec, neff)
+        eq = self._equivalence(m, spec, neff,
+                               strict=stage in self._STRICT_EQUIV_STAGES)
         if not eq.passed:
             self._record(cand, stage, origin, layer, source, metric=0.0,
                          correctness=eq.correctness_pct,
@@ -570,6 +589,14 @@ class Orchestrator:
         if not self.guards.utilization_ok(m):
             desc = (f"{desc} [under-util: {m.device_utilization:.0%} of "
                     f"{m.cores_available} cores]")
+        # Kernel-borrow honesty (Stage 3 MoE): the worker reports whether the
+        # fused NKI megakernel actually swapped in or silently fell back to eager
+        # (precondition unmet). Surface it so the ledger row distinguishes "kernel
+        # ran" from "fell back to eager" instead of just logging the provenance
+        # label. Empty for candidates/backends that never attempt the swap.
+        swap = getattr(m, "moe_kernel_swap", "")
+        if swap and swap != "not-requested":
+            desc = f"{desc} [moe-kernel: {swap}]"
         self._record(
             cand, stage, origin, layer, source, metric=m.metric,
             correctness=eq.correctness_pct, compile_s=compile_s,
