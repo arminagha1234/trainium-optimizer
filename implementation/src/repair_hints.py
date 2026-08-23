@@ -66,18 +66,15 @@ HINTS: tuple[RepairHint, ...] = (
             r"nc_matmul.*'moving'",
         ),
         fix=(
-            "nisa.nc_matmul's REAL signature on this SDK is\n"
-            "    nisa.nc_matmul(dst, stationary, moving, ...)\n"
-            "`dst` is the FIRST (required) argument: a pre-allocated PSUM tile it\n"
-            "WRITES IN PLACE — it computes `dst = stationary.T @ moving` and\n"
-            "RETURNS NOTHING (do NOT assign its result). You are missing `moving`\n"
-            "because your two positional args bound to (dst, stationary). Fix by\n"
-            "allocating a PSUM dst and passing ALL THREE by keyword:\n"
-            "    psum = nl.ndarray((M, N), dtype=nl.float32, buffer=nl.psum)\n"
-            "    nisa.nc_matmul(dst=psum, stationary=stat, moving=mov)  # writes psum\n"
-            "    # ...then use `psum` below; nc_matmul returned None.\n"
-            "Shapes: stationary [K, M], moving [K, N] -> dst [M, N]; contraction K\n"
-            "is the PARTITION axis (K, M <= 128; moving free dim N <= 512)."
+            "nisa.nc_matmul RETURNS the result tile — there is NO `dst`/`out` arg.\n"
+            "Signature: nisa.nc_matmul(stationary, moving, *, ...) -> tile.\n"
+            "`stationary` and `moving` are the ONLY positionals. ASSIGN the return:\n"
+            "    psum = nisa.nc_matmul(stat, mov)   # -> [M, N] tile; then use psum\n"
+            "You hit 'missing moving' because you passed only one operand — pass\n"
+            "BOTH stationary and moving. Do NOT pass a `dst` (a 3rd positional\n"
+            "errors 'too many positional arguments'). Shapes: stationary [K, M],\n"
+            "moving [K, N] -> [M, N]; contraction K is the PARTITION axis\n"
+            "(K, M <= 128; moving free dim N <= 512)."
         ),
     ),
     RepairHint(
@@ -92,39 +89,35 @@ HINTS: tuple[RepairHint, ...] = (
             r"nc_transpose.*'data'",
         ),
         fix=(
-            "nisa.nc_transpose's REAL signature on this SDK is\n"
-            "    nisa.nc_transpose(dst, data, ...)\n"
-            "`dst` is the FIRST (required) arg: a pre-allocated tile it WRITES IN\n"
-            "PLACE with the transpose of `data`. It RETURNS NOTHING (do NOT assign\n"
-            "its result). Allocate dst and pass both by keyword:\n"
-            "    dst = nl.ndarray((F, P), dtype=data.dtype, buffer=nl.sbuf)\n"
-            "    nisa.nc_transpose(dst=dst, data=src)   # data [P,F] -> dst [F,P]\n"
-            "    # ...then use `dst`.\n"
-            "P, F each <= 128. ROBUST ALTERNATIVE: the HIGH-LEVEL `nl.transpose(x)`\n"
-            "RETURNS a tile (no dst) and is often simpler; or feed an already-[K, N]\n"
-            "`moving` operand into nc_matmul so no on-the-fly transpose is needed."
+            "nisa.nc_transpose RETURNS the transposed tile — there is NO `dst` arg.\n"
+            "Signature: nisa.nc_transpose(data, *, mask=None, dtype=None, ...) -> tile.\n"
+            "ASSIGN the return value:\n"
+            "    t = nisa.nc_transpose(data=src)   # data [P,F] -> t [F,P]; use `t`\n"
+            "Pass `data` (the only positional). Do NOT pass a `dst` (a 2nd positional\n"
+            "errors 'too many positional arguments'). P, F each <= 128. The HIGH-LEVEL\n"
+            "`nl.transpose(x)` also RETURNS a tile and is often simpler; or feed an\n"
+            "already-[K, N] `moving` operand into nc_matmul so no on-the-fly\n"
+            "transpose is needed."
         ),
     ),
     RepairHint(
         key="activation-signature",
-        title="nisa.activation called with the wrong signature (dst/op/data, no dtype)",
+        title="nisa.activation called with the wrong signature (op/data return-form)",
         patterns=(
-            r"activation\(\).*unexpected keyword argument 'dtype'",
             r"activation\(\).*missing.*required argument 'data'",
             r"activation\(\).*(?:unexpected keyword|missing.*required)",
+            r"activation\(\).*too many positional",
         ),
         fix=(
-            "nisa.activation's REAL signature on this SDK is\n"
-            "    nisa.activation(dst, op, data, bias=None, scale=1.0,\n"
-            "                    reduce_op=None, reduce_res=None, ...)\n"
-            "`dst` is FIRST and `data` (the input tile) is the THIRD positional\n"
-            "arg — it WRITES `op(scale*data + bias)` INTO dst and RETURNS NOTHING.\n"
-            "There is NO `dtype` keyword (cast on the host after .cpu() if needed).\n"
-            "Allocate dst and pass by keyword:\n"
-            "    dst = nl.ndarray((P, F), dtype=nl.float32, buffer=nl.sbuf)\n"
-            "    nisa.activation(dst=dst, op=nl.square, data=x, reduce_op=nl.add)\n"
-            "    # ...then use `dst`; do NOT write `nisa.activation(op=..., ...)`\n"
-            "    # without dst/data, and do NOT pass dtype=."
+            "nisa.activation RETURNS a tile — there is NO `dst`/`out` arg.\n"
+            "Signature: nisa.activation(op, data, *, bias=None, scale=1.0,\n"
+            "                           reduce_op=None, dtype=None, ...) -> tile.\n"
+            "`op` is FIRST and `data` (the input tile) is SECOND (the only two\n"
+            "positionals; the rest are keyword-only). It RETURNS `op(scale*data +\n"
+            "bias)` — ASSIGN it. `dtype=` IS a valid kwarg. Use `reduce_op=` for a\n"
+            "fused free-axis reduce. Example:\n"
+            "    ms = nisa.activation(nl.square, x, reduce_op=nl.add)   # use `ms`\n"
+            "Pass op and data (do NOT pass a `dst`)."
         ),
     ),
     RepairHint(

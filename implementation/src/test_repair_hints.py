@@ -35,11 +35,11 @@ UNKNOWN_ERR = "error: something entirely unfamiliar happened in pass QuxBar"
 
 _SEEDED = {
     "nc_matmul-missing-moving": (NC_MATMUL_ERR,
-                                 "nisa.nc_matmul(dst=psum, stationary=stat, moving=mov)"),
+                                 "nisa.nc_matmul(stat, mov)"),
     "nc_transpose-missing-data": (NC_TRANSPOSE_ERR,
-                                  "nisa.nc_transpose(dst=dst, data=src)"),
+                                  "nisa.nc_transpose(data=src)"),
     "activation-signature": (ACTIVATION_DTYPE_ERR,
-                             "nisa.activation(dst=dst, op=nl.square, data=x"),
+                             "nisa.activation(nl.square, x"),
     "simplifier-ismp902-host-cast": (ISMP902_ERR, "cast on the HOST"),
     "reduction-collapse-1d": (REDUCTION_1D_ERR, "keepdims=True"),
     "broadcast-to-freefn": (BROADCAST_ERR, "nl.broadcast_to(tile, shape=(P, F))"),
@@ -79,9 +79,9 @@ def test_nc_matmul_hint_is_imperative_and_specific():
     hits = match_hints(NC_MATMUL_ERR)
     assert [h.key for h in hits] == ["nc_matmul-missing-moving"]
     text = format_hints(hits)
-    # Teaches the REAL signature: dst first, in-place, no return value.
-    assert "moving" in text and "stationary" in text and "dst" in text
-    assert "RETURNS NOTHING" in text
+    # Teaches the REAL signature: return-form (stationary, moving) -> tile, no dst.
+    assert "moving" in text and "stationary" in text
+    assert "RETURNS the result tile" in text
 
 
 # -- unmatched error -> raw-error-only fallback (unchanged behaviour) --------
@@ -110,7 +110,7 @@ def test_hint_text_appears_in_built_author_prompt():
     fb = [Feedback(1, NC_MATMUL_ERR, [])]
     prompt = build_author_prompt(spec, None, fb)
     assert "COMPILER SAID" in prompt
-    assert "nisa.nc_matmul(dst=psum, stationary=stat, moving=mov)" in prompt
+    assert "nisa.nc_matmul(stat, mov)" in prompt
     # Raw error is STILL present (hint is in ADDITION, not a replacement).
     assert "missing value for required argument 'moving'" in prompt
 
@@ -119,7 +119,7 @@ def test_feedback_as_prompt_carries_the_hint():
     fb = Feedback(2, NC_TRANSPOSE_ERR, [])
     prompt = fb.as_prompt()
     assert "COMPILER SAID" in prompt
-    assert "nisa.nc_transpose(dst=dst, data=src)" in prompt
+    assert "nisa.nc_transpose(data=src)" in prompt
 
 
 def test_unmatched_feedback_prompt_has_no_hint_banner():

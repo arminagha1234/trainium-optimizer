@@ -124,28 +124,25 @@ reject turned into a DO/DON'T):
     max 512 for nc_version=gen3`. DO tile any larger free dim into <=512 chunks
     and loop, accumulating in PSUM. Also stationary free (M) <= 128 and the
     contraction (partition) dim <= 128.
-  * nc_matmul call signature (0.6.0) — it WRITES INTO a `dst` tile and returns
-    NOTHING. Exact signature (dst is the FIRST, required arg):
-      nisa.nc_matmul(dst, stationary, moving, *, is_stationary_onezero=False,
-        is_moving_onezero=False, is_transpose=False, accumulate=None,
-        tile_position=(), tile_size=(), ...)
-    It computes `dst = stationary.T @ moving` IN PLACE. DO NOT assign its result
-    (it is None). Allocate a PSUM dst and pass all three by keyword:
-      psum = nl.ndarray((M, N), dtype=nl.float32, buffer=nl.psum)
-      nisa.nc_matmul(dst=psum, stationary=stat_tile, moving=mov_tile)  # -> psum
-    then use `psum`. stationary [K,M], moving [K,N] -> dst [M,N]; contraction K
-    on the partition axis (K, M <= 128; moving free dim N <= 512). Passing only
-    two args binds (dst, stationary) and errors "missing required argument
-    'moving'".
-  * nc_transpose call signature (0.6.0) — like nc_matmul it WRITES INTO a `dst`
-    and returns NOTHING. Exact signature (dst first, both required):
-      nisa.nc_transpose(dst, data, engine=..., name=None)
-    DO call it as:
-      dst = nl.ndarray((F, P), dtype=data.dtype, buffer=nl.sbuf)
-      nisa.nc_transpose(dst=dst, data=src_tile)   # data [P,F] -> dst [F,P]
-    then use `dst`; do NOT assign the return value. P, F each <= 128. For
-    attention-style kernels prefer feeding an already-[K,N] moving operand into
-    nc_matmul over transposing on the fly.
+  * nc_matmul call signature (0.6.0) — it RETURNS the result tile; there is NO
+    `dst=`/`out=` parameter. Exact signature:
+      nisa.nc_matmul(stationary, moving, *, is_stationary_onezero=False,
+        is_moving_onezero=False, is_transpose=False, tile_position=(),
+        tile_size=(), mask=None) -> tile
+    DO assign the RETURNED tile: `psum = nisa.nc_matmul(stat_tile, mov_tile)`
+    (stationary and moving are the only positionals; the rest are keyword-only).
+    stationary [K,M], moving [K,N] -> result [M,N]; contraction K on the
+    partition axis (K, M <= 128; moving free dim N <= 512). DO NOT pass a
+    `dst=`/`out=` (there is none — a 3rd positional errors "too many positional
+    arguments") and DO NOT expect in-place; USE the return value.
+  * nc_transpose call signature (0.6.0) — RETURNS the transposed tile; there is
+    NO `dst`. Exact signature:
+      nisa.nc_transpose(data, *, mask=None, dtype=None, engine=...) -> tile
+    DO call it as `t = nisa.nc_transpose(data=src_tile)` (data [P,F] -> [F,P],
+    P, F each <= 128) and assign the RETURN value. The high-level
+    `nl.transpose(x)` also RETURNS a tile and is often simpler. For attention-
+    style kernels prefer feeding an already-[K,N] moving operand into nc_matmul
+    over transposing on the fly.
   * Reductions MUST stay 2-D: `nl.sum(axis=1)` that collapses to a 1-D tensor
     fails — SBUF/PSUM tiles need >= 2 dims. DO keep a [P,1]-shaped result
     (`nl.sum(x, axis=1, keepdims=True)`); DON'T let a tile collapse to 1-D. Same
@@ -177,17 +174,18 @@ kernel is a loss):
      per input and ONE store of the output — never round-trip a temporary
      through HBM (there is no HW cache; a spilled intermediate is pure loss).
   2. FUSE instructions onto the Scalar engine via `nisa.activation`. REAL
-     signature: `nisa.activation(dst, op, data, bias=None, scale=1.0,
-     reduce_op=None, ...)` — dst is FIRST, data (the input tile) is THIRD; it
-     WRITES `op(scale*data + bias)` INTO dst and RETURNS NOTHING, and there is NO
-     `dtype=` kwarg. With `reduce_op=` it also does a free-axis reduce in the SAME
-     instruction. Allocate dst, pass by keyword, then use dst —
-       * rmsnorm: `nisa.activation(dst=ms, op=nl.square, data=x,
-         reduce_op=nl.add)` gets mean-square in one pass; do NOT materialize a
-         squared tile then sum it separately.
-       * softmax: `nisa.activation(dst=e, op=nl.exp, data=x, bias=neg_rowmax,
+     signature: `nisa.activation(op, data, *, bias=None, scale=1.0,
+     reduce_op=None, dtype=None, ...) -> tile` — op is FIRST, data (the input
+     tile) is SECOND (the only two positionals; rest keyword-only); it RETURNS
+     `op(scale*data + bias)` as a tile (ASSIGN it — there is no `dst`/`out`).
+     With `reduce_op=` it also does a free-axis reduce in the SAME instruction.
+     Assign the return value —
+       * rmsnorm: `ms = nisa.activation(nl.square, x, reduce_op=nl.add)` gets
+         mean-square in one pass; do NOT materialize a squared tile then sum it
+         separately.
+       * softmax: `e = nisa.activation(nl.exp, x, bias=neg_rowmax,
          reduce_op=nl.add)` gives `exp(x-max)` + the running denominator at once.
-       * softcap: `nisa.activation(dst=t, op=nl.tanh, data=x, scale=1/cap)` then
+       * softcap: `t = nisa.activation(nl.tanh, x, scale=1/cap)` then
          one multiply by cap.
   3. HOIST loop-invariant loads (gamma / beta / cap / row-max operands) OUT of
      the tile loop — there is no HW cache, so a per-tile re-DMA of an invariant
