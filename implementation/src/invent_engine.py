@@ -416,7 +416,13 @@ class InventEngine:
         try:
             import torch  # noqa: PLC0415 — device-only import
             import nki      # noqa: PLC0415
-            from torch_neuronx import nki_hop  # noqa: PLC0415,F401
+            # NOTE: do NOT import ``torch_neuronx.nki_hop`` here. It was imported
+            # eagerly (unused) and on torch-neuronx 2.9 the ``nki_hop`` module no
+            # longer exists, so the import raised ImportError and aborted the race
+            # before ANY real device work — turning a healthy box into a recorded
+            # "device race error". The direct-call invocation path (see
+            # _invoke_kernel) needs nothing from nki_hop; the only place that
+            # still touches it is a LABELLED fallback, guarded there.
 
             inp = spec.real_inputs()
             ref = np.asarray(spec.reference(inp), dtype=np.float32)
@@ -725,15 +731,22 @@ class InventEngine:
 
     def _compile(self, kernel: AuthoredKernel, spec: OpSpec) -> CompileResult:
         """Default compile step the repair loop drives, mapping the engine's
-        offline + on-device build gates onto a ``CompileResult``:
+        offline + on-device gates onto a ``CompileResult``:
 
           * Offline gate FIRST (static NKI lint + numpy_impl smoke/parity). A
             lint or shape failure is a compile-blocking error whose reason IS the
             teacher fed back to the next author round — no device time is spent
             on a kernel that cannot even pass the text/shape checks.
-          * On device (``nki_available()``): actually ``build()`` the kernel; a
-            None result is a real build/trace failure (the "entry function not
-            found" class), reported as the error_log.
+          * On device (``nki_available()``): ``build()`` the kernel (import/trace);
+            a None result is a real build/trace failure (the "entry function not
+            found" class), reported as the error_log. Then run a REAL neuronx-cc
+            compile — ``build()`` alone only IMPORTS the module and a ``@nki.jit``
+            fn is lowered by neuronx-cc lazily on its FIRST invocation, so a real
+            "failed to resolve name"/ISA-validation error would otherwise ESCAPE
+            the repair window and die at race time instead of teaching a round-2
+            rewrite. ``_device_compile_probe`` forces that lowering and returns
+            the compiler error string, which becomes the ``error_log`` the
+            ``KernelRepairLoop`` feeds back to the author.
           * Off device: there is no neuronx-cc to run, so an offline-gate PASS is
             the honest best-effort "compiles as far as we can check here" — the
             true device compile is deferred and surfaces downstream as the
@@ -750,8 +763,52 @@ class InventEngine:
                     False,
                     error_log=f"device build/trace failed: entry "
                               f"'{kernel.entry}' did not resolve")
+            # build() only imported/traced. Force the REAL neuronx-cc lowering so
+            # a compile error ("failed to resolve name", ISA validation, ...) is
+            # caught INSIDE the repair window and fed back — not at race time.
+            compile_err = self._device_compile_probe(fn, spec)
+            if compile_err is not None:
+                return CompileResult(
+                    False, error_log=f"device compile failed: {compile_err}")
             return CompileResult(True, artifact=kernel.entry)
         return CompileResult(True, artifact=f"offline-only:{kernel.entry}")
+
+    def _device_compile_probe(self, fn: Callable, spec: OpSpec) -> str | None:
+        """Force a REAL neuronx-cc compile of a built ``@nki.jit`` kernel and
+        return the compiler error string (the teacher), or ``None`` if it
+        compiled (or could not be probed here).
+
+        Why this exists: a ``@nki.jit`` fn is only lowered by neuronx-cc on its
+        FIRST invocation, so ``build()`` (import/trace) succeeds even when the
+        kernel will NOT compile. We trigger the lowering by invoking the kernel
+        once on device (the SAME proven direct-call path ``_device_race`` uses)
+        and capture any compiler error verbatim.
+
+        Returns ``None`` (best-effort "cannot probe — treat build() as far as we
+        got") when there is no Neuron device handle or ``torch`` is unavailable:
+        without them we cannot compile-invoke, and fabricating an error would be
+        dishonest. Device-only, exactly like ``_device_race`` — not exercised on
+        a CPU box; tests drive ``_compile`` with a monkeypatched probe.
+        """
+        device = _neuron_device()
+        if device is None:
+            return None
+        try:
+            import torch  # noqa: PLC0415 — device-only import
+        except ImportError:
+            return None
+        try:
+            inp = spec.real_inputs()
+
+            def _to_dev(a: np.ndarray):
+                return (torch.from_numpy(np.ascontiguousarray(a))
+                        .to(torch.bfloat16).to(device))
+
+            args = [_to_dev(inp[k]) for k in _arg_order(spec.name, inp)]
+            _invoke_kernel(fn, args)   # forces neuronx-cc lowering (the compile)
+        except Exception as e:  # noqa: BLE001 — compiler errors are the teacher
+            return repr(e)
+        return None
 
     def _run_op_with_repair(self, spec: OpSpec, lessons: list, n: int,
                             race_fn: RaceFn | None,
@@ -952,7 +1009,20 @@ def _invoke_kernel(fn: Callable, args: list):
         if called is not _NO_CALL:
             out = called
         else:
-            from torch_neuronx.nki_hop import wrap_nki  # noqa: PLC0415
+            # Labelled fallback ONLY. ``wrap_nki`` lives in ``torch_neuronx.nki_hop``,
+            # which was REMOVED in torch-neuronx 2.9 — guard the optional import so a
+            # missing module never aborts the whole race with an ImportError. When
+            # it is absent we cannot take this fallback, so surface a clear (non-
+            # ImportError) RuntimeError that _device_race records as data.
+            try:
+                from torch_neuronx.nki_hop import wrap_nki  # noqa: PLC0415
+            except ImportError:
+                wrap_nki = None
+            if wrap_nki is None:
+                raise RuntimeError(
+                    "authored kernel not directly callable and the wrap_nki "
+                    "fallback is unavailable (torch_neuronx.nki_hop removed in "
+                    "torch-neuronx 2.9) — no invocation path")
             wrapped = wrap_nki(fn)
             out = wrapped[1](*args)
     return out[0] if isinstance(out, (list, tuple)) else out
