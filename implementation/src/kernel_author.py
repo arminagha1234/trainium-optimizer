@@ -96,6 +96,24 @@ any compile):
     eager gotcha) — use `* (1.0 / n)` instead of integer ops.
   * one multi-partition DMA per operand — never a per-index single-slice DMA on
     a packed (partition) axis inside a loop.
+
+INVOCATION CONTRACT (how the harness runs your kernel):
+  The kernel is called as `out = kernel(<inputs, in the order listed below>)`
+  and MUST RETURN the output tensor. Do NOT take an `out=` / destination
+  parameter and do NOT write into a passed-in output buffer — a kernel that
+  declares an extra `out` arg fails to invoke (wrong arity) because the harness
+  passes ONLY the input tensors positionally. Your entry signature must accept
+  exactly those positional inputs and `return` the result.
+
+Known NKI-0.6.0 pitfalls (observed on real silicon — do not repeat these):
+  * `nl.mgrid` is trace-only: it exists as a Python object but can leave an
+    unresolved `nki.language.mgrid` name at compile (it does not always lower).
+    Use it with care; prefer explicit index tiles / `nl.arange`-style index
+    ranges that actually lower to hardware indexing.
+  * NO Python tuple-unpacking in NKI loops: `for (a, b) in ...` fails with
+    "expecting simple variable" — iterate a single simple loop variable instead.
+  * Mind tile/partition bounds: the partition (first) dim must be <= 128, and
+    never index the output past its declared dim size.
 Return ONLY the kernel source in a single ```python code block.
 """
 
@@ -142,18 +160,60 @@ def _fmt_feedback(feedback: list[Feedback] | None) -> str:
     return "\n\n".join(blocks)
 
 
+def _op_input_order(spec: OpSpec) -> list[str] | None:
+    """The exact positional inputs the harness will pass to the kernel, in order.
+
+    Mirrors ``invent_engine._arg_order`` (the single source of truth for the
+    invocation order) via a late import so ``kernel_author`` stays importable
+    before ``invent_engine`` (which imports THIS module) finishes loading. Falls
+    back to the spec's own offline-input keys, then to ``None`` if neither is
+    resolvable — the prompt then simply omits the concrete list rather than
+    guessing."""
+    try:
+        from invent_engine import _arg_order  # noqa: PLC0415 — late to avoid a cycle
+    except Exception:  # noqa: BLE001
+        _arg_order = None
+    inp: dict = {}
+    try:
+        got = spec.offline_inputs()
+        if isinstance(got, dict):
+            inp = got
+    except Exception:  # noqa: BLE001 — never let prompt-building fail on input gen
+        inp = {}
+    if _arg_order is not None:
+        try:
+            order = _arg_order(spec.name, inp)
+            if order:
+                return list(order)
+        except Exception:  # noqa: BLE001
+            pass
+    return list(inp.keys()) or None
+
+
 def build_author_prompt(spec: OpSpec, lessons: list | None,
                         feedback: list[Feedback] | None) -> str:
     """Assemble the authoring prompt from the NKI preamble, the op spec, the
     retrieved bank lessons, and the prior-round compiler errors + matched
-    rewrites. Deterministic and side-effect free, so it is directly unit-testable
-    (the tests assert the compiler error and the matched rewrite NAME both appear
-    in the returned string)."""
+    rewrites. Deterministic and side-effect free (given the spec), so it is
+    directly unit-testable (the tests assert the compiler error and the matched
+    rewrite NAME both appear in the returned string, and that the FULL multi-round
+    error history is present)."""
+    inputs = _op_input_order(spec)
+    if inputs:
+        inputs_line = ", ".join(inputs)
+        sig_hint = f"{spec.name}_kernel({inputs_line})"
+    else:
+        inputs_line = "(the op's input tensors, in declared order)"
+        sig_hint = f"{spec.name}_kernel(...)"
     return (
         f"{_NKI_PREAMBLE}\n"
         f"## Op to author\n"
         f"  name        : {spec.name}\n"
-        f"  entry naming: define `@nki.jit def {spec.name}_kernel(...)`\n"
+        f"  entry naming: define `@nki.jit def {sig_hint}`\n"
+        f"  invocation  : the harness calls `out = {spec.name}_kernel({inputs_line})` "
+        f"and expects the output tensor RETURNED — take exactly these positional "
+        f"inputs, NO `out=`/destination param.\n"
+        f"  inputs      : {inputs_line}\n"
         f"  family      : {spec.family}\n"
         f"  shape_class : {spec.shape_class}\n"
         f"  dtype       : {spec.dtype}\n"
@@ -161,7 +221,8 @@ def build_author_prompt(spec: OpSpec, lessons: list | None,
         f"  notes       : {spec.notes or '(none)'}\n\n"
         f"## Relevant banked lessons (anti-patterns / prior wins to heed)\n"
         f"{_fmt_lessons(lessons)}\n\n"
-        f"## Prior compile attempts (learn from each error)\n"
+        f"## Prior compile attempts — ALL rounds, learn from EVERY error "
+        f"(do not repeat a fix that already failed a prior round)\n"
         f"{_fmt_feedback(feedback)}\n"
     )
 

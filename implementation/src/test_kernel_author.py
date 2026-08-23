@@ -108,6 +108,65 @@ def test_prompt_no_feedback_is_round_one():
 
 
 # ---------------------------------------------------------------------------
+# FIX 1(a): the prompt states the invocation contract + the op's inputs
+# ---------------------------------------------------------------------------
+def test_prompt_states_return_a_tensor_no_out_param_contract():
+    spec = catalog()["rmsnorm"]
+    prompt = build_author_prompt(spec, lessons=None, feedback=None)
+    lower = prompt.lower()
+    # The harness contract: RETURN the output tensor, take no out= param.
+    assert "return" in lower
+    assert "out=" in prompt or "destination" in lower
+    assert "no `out=`" in prompt or "do not take an" in lower or "NO `out=`" in prompt
+    # The op's actual _arg_order inputs are listed so the LLM writes a matching
+    # signature. rmsnorm's inputs are x, gamma.
+    assert "x, gamma" in prompt
+    assert "rmsnorm_kernel(x, gamma)" in prompt
+
+
+def test_prompt_lists_arg_order_for_multi_input_op():
+    spec = catalog()["attn_decode"]           # inputs: q, k, v
+    prompt = build_author_prompt(spec, lessons=None, feedback=None)
+    assert "q, k, v" in prompt
+    assert "attn_decode_kernel(q, k, v)" in prompt
+
+
+# ---------------------------------------------------------------------------
+# FIX 2: full cross-round error history + NKI pitfalls in the preamble
+# ---------------------------------------------------------------------------
+def test_prompt_includes_all_prior_round_errors():
+    spec = catalog()["softcap"]
+    # A multi-round trail: each round has a DISTINCT error signature.
+    trail = [
+        Feedback(round=1, error_log="ERR_ROUND_ONE: unresolved nki.language.mgrid name",
+                 rewrites=[]),
+        Feedback(round=2, error_log="ERR_ROUND_TWO: expecting simple variable",
+                 rewrites=[]),
+        Feedback(round=3, error_log="ERR_ROUND_THREE: partition dim exceeds 128",
+                 rewrites=[]),
+    ]
+    prompt = build_author_prompt(spec, lessons=None, feedback=trail)
+    # EVERY round's error must be present (not just the latest), each labeled.
+    assert "ERR_ROUND_ONE" in prompt
+    assert "ERR_ROUND_TWO" in prompt
+    assert "ERR_ROUND_THREE" in prompt
+    assert "Round 1" in prompt and "Round 2" in prompt and "Round 3" in prompt
+
+
+def test_preamble_carries_nki_pitfalls():
+    # The observed regressions must be called out in the standing preamble.
+    spec = catalog()["softcap"]
+    prompt = build_author_prompt(spec, lessons=None, feedback=None)
+    lower = prompt.lower()
+    # mgrid lowering pitfall (worded as "use with care", not "does not exist").
+    assert "mgrid" in lower
+    assert "trace-only" in lower or "does not always lower" in lower or "unresolved" in lower
+    # tuple-unpack pitfall.
+    assert "expecting simple variable" in lower
+    assert "tuple-unpack" in lower or "for (a, b)" in lower
+
+
+# ---------------------------------------------------------------------------
 # extraction helpers
 # ---------------------------------------------------------------------------
 def test_extract_nki_source_and_entry_from_fenced_block():

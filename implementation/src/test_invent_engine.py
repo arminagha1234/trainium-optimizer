@@ -557,6 +557,34 @@ def test_invoke_kernel_fallback_missing_nki_hop_is_runtimeerror_not_importerror(
         raise AssertionError("expected the guarded fallback to raise RuntimeError")
 
 
+# -- FIX 1(b): an out-param (destination-passing) kernel must surface the REAL
+# arity error, not the masked generic "no invocation path" message, so the
+# repair loop can learn to drop the out= param and RETURN the tensor instead.
+def test_invoke_kernel_out_param_kernel_surfaces_actionable_arity_error():
+    from invent_engine import _invoke_kernel
+
+    # The LLM wrote a destination-passing kernel: 3 required args, writes into
+    # `out`. The harness calls it with only the op's 2 input tensors (x, gamma),
+    # so Python raises "missing 1 required positional argument: 'out'".
+    def rmsnorm_kernel(x, gamma, out):        # noqa: ARG001 - signature is the point
+        return out
+
+    try:
+        _invoke_kernel(rmsnorm_kernel, [1, 2])   # 2 inputs, kernel needs 3
+    except RuntimeError as e:
+        msg = str(e)
+        # The REAL TypeError text (the actionable cause) is surfaced verbatim...
+        assert "positional argument" in msg
+        assert "out" in msg
+        # ...and the contract is named so the model knows what to change.
+        assert "return" in msg.lower()
+        assert "out param" in msg.lower() or "out=" in msg
+        # It is NOT masked behind the old generic non-actionable phrasing alone.
+        assert "got 2 positional args" in msg
+    else:  # pragma: no cover
+        raise AssertionError("expected a RuntimeError surfacing the arity mismatch")
+
+
 # -- FIX 2: the repair-loop compile gate runs the REAL compile ---------------
 # build() only IMPORTS/traces (a @nki.jit fn is lowered by neuronx-cc lazily, on
 # first invocation), so a real "failed to resolve name"/ISA error used to escape

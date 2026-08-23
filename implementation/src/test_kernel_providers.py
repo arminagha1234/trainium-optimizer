@@ -72,16 +72,40 @@ class _FakeBedrockClient:
         return {"body": _FakeBody(json.dumps(payload).encode("utf-8"))}
 
 
+class _FakeBotoConfig:
+    """Stand-in for botocore.config.Config — records the timeout/retry kwargs so
+    a test can assert bedrock_complete_fn built the client with read_timeout=600."""
+
+    def __init__(self, **kwargs):
+        self.read_timeout = kwargs.get("read_timeout")
+        self.connect_timeout = kwargs.get("connect_timeout")
+        self.retries = kwargs.get("retries")
+        self.kwargs = kwargs
+
+
+def _install_fake_botocore(monkeypatch):
+    # bedrock_complete_fn does `from botocore.config import Config`; provide a
+    # fake botocore.config so the import resolves without real botocore installed.
+    botocore_mod = types.ModuleType("botocore")
+    config_mod = types.ModuleType("botocore.config")
+    config_mod.Config = _FakeBotoConfig
+    botocore_mod.config = config_mod
+    monkeypatch.setitem(sys.modules, "botocore", botocore_mod)
+    monkeypatch.setitem(sys.modules, "botocore.config", config_mod)
+
+
 def _install_fake_boto3(monkeypatch, sink: dict):
     fake = types.ModuleType("boto3")
 
-    def _client(service, region_name=None, **_):
+    def _client(service, region_name=None, config=None, **_):
         sink["service"] = service
         sink["region"] = region_name
+        sink["config"] = config
         return _FakeBedrockClient(sink)
 
     fake.client = _client
     monkeypatch.setitem(sys.modules, "boto3", fake)
+    _install_fake_botocore(monkeypatch)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +184,58 @@ def test_bedrock_omits_temperature_when_none_includes_when_set(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# FIX 3: provider robustness — long read_timeout, region resolution, defaults
+# ---------------------------------------------------------------------------
+def test_bedrock_client_built_with_long_read_timeout(monkeypatch):
+    # Opus-5's thinking pass exceeds boto3's 60s default read timeout; the client
+    # must be built with read_timeout=600 (+ connect_timeout + retries).
+    sink: dict = {}
+    _install_fake_boto3(monkeypatch, sink)
+    bedrock_complete_fn(region="us-west-2", temperature=None)("hi def x_kernel(")
+    cfg = sink["config"]
+    assert cfg is not None, "client must be built with an explicit botocore Config"
+    assert cfg.read_timeout == 600
+    assert cfg.connect_timeout == 15
+    assert cfg.retries == {"max_attempts": 3}
+
+
+def test_bedrock_default_max_tokens_is_32000():
+    import inspect
+    default = inspect.signature(bedrock_complete_fn).parameters["max_tokens"].default
+    assert default == 32000, default
+
+
+def test_anthropic_default_max_tokens_is_32000():
+    import inspect
+    default = inspect.signature(anthropic_complete_fn).parameters["max_tokens"].default
+    assert default == 32000, default
+
+
+def test_bedrock_resolves_region_from_env(monkeypatch):
+    sink: dict = {}
+    _install_fake_boto3(monkeypatch, sink)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-central-1")
+    # region arg omitted -> resolve from AWS_DEFAULT_REGION.
+    bedrock_complete_fn(temperature=None)("hi def x_kernel(")
+    assert sink["region"] == "eu-central-1"
+
+
+def test_bedrock_raises_clear_error_when_no_region(monkeypatch):
+    sink: dict = {}
+    _install_fake_boto3(monkeypatch, sink)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    try:
+        bedrock_complete_fn(region=None, temperature=None)
+    except ProviderNotAvailable as exc:
+        assert "region" in str(exc).lower()
+        assert "AWS_REGION" in str(exc)
+    else:
+        raise AssertionError("expected ProviderNotAvailable when no region resolves")
+
+
+# ---------------------------------------------------------------------------
 # BUG #2: thinking-token budget — stop_reason=max_tokens + no text must NOT
 # silently return "" (empty authored source); it must raise EmptyCompletion.
 # ---------------------------------------------------------------------------
@@ -183,11 +259,12 @@ class _MaxTokensBedrockClient:
 def _install_fake_boto3_maxtokens(monkeypatch, sink: dict):
     fake = types.ModuleType("boto3")
 
-    def _client(service, region_name=None, **_):
+    def _client(service, region_name=None, config=None, **_):
         return _MaxTokensBedrockClient(sink)
 
     fake.client = _client
     monkeypatch.setitem(sys.modules, "boto3", fake)
+    _install_fake_botocore(monkeypatch)
 
 
 def test_bedrock_raises_on_max_tokens_with_no_text(monkeypatch):
@@ -327,6 +404,15 @@ def _run_standalone() -> int:
             old = _os.environ.get(name)
             _os.environ.pop(name, None)
             self._undo.append(lambda: _os.environ.__setitem__(name, old) if old is not None else None)
+
+        def setenv(self, name, value):
+            import os as _os
+            missing = name not in _os.environ
+            old = _os.environ.get(name)
+            _os.environ[name] = value
+            self._undo.append(
+                lambda: _os.environ.pop(name, None) if missing
+                else _os.environ.__setitem__(name, old))
 
         def undo(self):
             for fn in reversed(self._undo):
