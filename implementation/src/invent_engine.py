@@ -67,6 +67,8 @@ from bank import (
 )
 from guardrails import Guardrails
 import kernel_rewrites
+from kernel_author import KernelAuthor, RecipeAuthor
+from kernel_repair import CompileResult, Feedback, KernelRepairLoop
 from ledger import Layer, Ledger, Origin, Row, Stage, Status, current_commit
 from invent_kernels import (
     AuthoredKernel,
@@ -147,6 +149,11 @@ class InventResult:
 # the engine's own ``_device_race`` is used.
 RaceFn = Callable[[AuthoredKernel, OpSpec], RaceResult]
 
+# A compile function lets the repair loop (and tests) turn an AuthoredKernel into
+# a CompileResult (ok + error_log). On device the engine's own ``_compile`` is
+# used; tests inject a deterministic stand-in compiler.
+CompileFnT = Callable[[AuthoredKernel], CompileResult]
+
 
 # ---------------------------------------------------------------------------
 # engine
@@ -161,7 +168,18 @@ class InventEngine:
         guards: Guardrails | None = None,
         sdk_version: str = _SDK,
         registry: "Any" = None,
+        author: KernelAuthor | None = None,
+        max_repair_rounds: int = 1,
     ) -> None:
+        # The pluggable authoring seam. Defaults to the recipe table
+        # (``RecipeAuthor`` wraps ``invent_kernels.author_kernel``) so behaviour
+        # is unchanged; pass an ``LLMAuthor`` (or any ``KernelAuthor``) to drive
+        # authoring from a model/agent. ``max_repair_rounds`` is the bound on the
+        # author -> compile -> read-error -> re-author loop; the DEFAULT of 1 is
+        # today's single-shot authoring (no repair loop), so existing runs and
+        # tests are byte-for-byte unchanged. >1 activates the real repair loop.
+        self.author: KernelAuthor = author or RecipeAuthor()
+        self.max_repair_rounds = max_repair_rounds
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         # Default the bank under the run dir so an experiment never pollutes the
@@ -574,14 +592,21 @@ class InventEngine:
 
     # -- the loop ------------------------------------------------------------
 
-    def run_op(self, spec: OpSpec, race_fn: RaceFn | None = None) -> InventResult:
+    def run_op(self, spec: OpSpec, race_fn: RaceFn | None = None,
+               compile_fn: "CompileFnT | None" = None) -> InventResult:
         """Learn (retrieve) -> Prior-art (Harvest) -> author -> offline gate ->
-        on-device race -> keep/discard -> bank."""
+        on-device race -> keep/discard -> bank.
+
+        ``compile_fn`` is the seam the repair loop compiles through (only used
+        when ``max_repair_rounds > 1``). It defaults to the engine's own
+        ``_compile`` (offline gate + on-device build), and is injectable the same
+        way ``race_fn`` is, so the repair loop is unit-testable off-device with a
+        deterministic stand-in compiler."""
         # LEARN FIRST: retrieve previously-banked lessons (anti-patterns / prior
         # wins) relevant to this op so the bank is READ, not just written. The
         # count is recorded on the ledger row + result; the lessons themselves
-        # are handed to the author (which ignores them today — a future LLM
-        # author consumes them). This is the "compounding" step.
+        # are handed to the author (which the recipe author ignores today; the
+        # LLM author consumes them). This is the "compounding" step.
         lessons = self._retrieve_lessons(spec)
         n = len(lessons)
 
@@ -604,11 +629,25 @@ class InventEngine:
                                 detail=f"reused {prior.name} [{prior.status}]",
                                 lessons_consulted=n)
 
-        # Hand the retrieved lessons to the author as OPTIONAL hints. The recipe
-        # author ignores them (kwarg defaults to None), so behaviour is unchanged
-        # today; the LLM author will consume them later.
-        author = author_kernel(spec, lessons=lessons)
+        # REAL repair loop (only when asked). With the default max_repair_rounds=1
+        # this branch is skipped entirely and authoring is the single-shot path
+        # below — byte-for-byte today's behaviour.
+        if self.max_repair_rounds and self.max_repair_rounds > 1:
+            return self._run_op_with_repair(spec, lessons, n, race_fn, compile_fn)
 
+        # SINGLE-SHOT (default): author once through the seam with no feedback.
+        # RecipeAuthor forwards ``lessons`` to ``author_kernel`` exactly as before.
+        author = self.author.author(spec, lessons, [])
+        return self._finish(spec, author, n, race_fn)
+
+    def _finish(self, spec: OpSpec, author: AuthoredKernel, n: int,
+                race_fn: RaceFn | None) -> InventResult:
+        """Shared tail: offline gate -> on-device race -> keep/discard -> bank.
+
+        Extracted verbatim from the original single-shot ``run_op`` so BOTH the
+        single-shot and the repaired-kernel paths run the SAME gates (offline
+        parity + lint, on-device race, 5% invention margin) and produce the SAME
+        honest outcomes. Behaviour for the single-shot path is unchanged."""
         if not author.nki_src:
             self._record(spec, Status.DISCARD, 0.0, 0.0,
                          f"no author available ({author.pipeline_notes})",
@@ -681,6 +720,74 @@ class InventEngine:
                             "anti_pattern", offline, race, lesson_id=lid,
                             detail=f"correct but {race.speedup:.3f}x < 1.05x",
                             lessons_consulted=n)
+
+    # -- the REAL repair loop (author -> compile -> read-error -> re-author) --
+
+    def _compile(self, kernel: AuthoredKernel, spec: OpSpec) -> CompileResult:
+        """Default compile step the repair loop drives, mapping the engine's
+        offline + on-device build gates onto a ``CompileResult``:
+
+          * Offline gate FIRST (static NKI lint + numpy_impl smoke/parity). A
+            lint or shape failure is a compile-blocking error whose reason IS the
+            teacher fed back to the next author round — no device time is spent
+            on a kernel that cannot even pass the text/shape checks.
+          * On device (``nki_available()``): actually ``build()`` the kernel; a
+            None result is a real build/trace failure (the "entry function not
+            found" class), reported as the error_log.
+          * Off device: there is no neuronx-cc to run, so an offline-gate PASS is
+            the honest best-effort "compiles as far as we can check here" — the
+            true device compile is deferred and surfaces downstream as the
+            on-device race's ``ran=False`` (device_deferred). Tests inject their
+            own ``compile_fn`` to exercise the loop deterministically on CPU.
+        """
+        offline = self.offline_gate(kernel, spec)
+        if not offline.passed:
+            return CompileResult(False, error_log=f"offline gate: {offline.reason}")
+        if nki_available():
+            fn = kernel.build()
+            if fn is None:
+                return CompileResult(
+                    False,
+                    error_log=f"device build/trace failed: entry "
+                              f"'{kernel.entry}' did not resolve")
+            return CompileResult(True, artifact=kernel.entry)
+        return CompileResult(True, artifact=f"offline-only:{kernel.entry}")
+
+    def _run_op_with_repair(self, spec: OpSpec, lessons: list, n: int,
+                            race_fn: RaceFn | None,
+                            compile_fn: CompileFnT | None) -> InventResult:
+        """Drive authoring through ``KernelRepairLoop`` so a compile failure
+        TEACHES the next attempt (the exact error + the matched rewrite fed back
+        via the author's ``feedback`` arg). On convergence the compiled kernel
+        goes through the SAME ``_finish`` gates as single-shot; on a
+        non-converging loop (exhausted / stalled) the failure is banked as an
+        anti-pattern (losses are data), diagnosed with the rewrite catalog."""
+        loop = KernelRepairLoop(max_rounds=self.max_repair_rounds)
+        _compile = compile_fn or (lambda k: self._compile(k, spec))
+
+        def author_fn(trail: list[Feedback]) -> AuthoredKernel:
+            return self.author.author(spec, lessons, trail)
+
+        outcome = loop.run(author_fn, _compile)
+
+        if not outcome.ok:
+            last_err = outcome.trail[-1].error_log if outcome.trail else ""
+            desc_sfx, reason_sfx = self._diagnose_failure(last_err)
+            suggested = ", ".join(r.name for r in outcome.suggested_rewrites)
+            reason = (f"kernel repair did not converge in {outcome.rounds} "
+                      f"round(s) ({outcome.reason})"
+                      + (f"; suggested rewrites: {suggested}" if suggested else ""))
+            lid = self._bank_anti_pattern(spec, reason, diagnosis=reason_sfx)
+            self._record(spec, Status.DISCARD, 0.0, 0.0,
+                         f"repair failed: {reason}{desc_sfx}", n_lessons=n)
+            return InventResult(
+                spec.name, spec.shape_class, spec.origin, "offline_reject",
+                OfflineGate(False, False, float("inf"), reason=reason),
+                RaceResult(False, reason=outcome.reason),
+                lesson_id=lid, detail=f"{reason}{desc_sfx}", lessons_consulted=n)
+
+        # Compiled after N rounds — gate + race + bank the repaired kernel.
+        return self._finish(spec, outcome.kernel, n, race_fn)
 
     def run(self, specs: list[OpSpec],
             race_fn: RaceFn | None = None) -> list[InventResult]:
