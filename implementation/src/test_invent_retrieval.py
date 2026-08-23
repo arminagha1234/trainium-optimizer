@@ -166,8 +166,15 @@ def test_diagnose_failure_matches_known_signature(tmp_path):
         "ISA validation: s2d2_ts_as_valid_elem_count assertion")
     assert "tril-to-const-mask" in desc_sfx
     assert "tril-to-const-mask" in reason_sfx
-    # unmatched / empty -> no suffix (opaque failures stay opaque, not mislabeled)
-    assert eng._diagnose_failure("some unrelated error NCC_EVRF029") == ("", "")
+    # NCC_EVRF029 (the MoE-router sort reject) is now a REAL catalogued signature
+    # (topk-sort-to-argmax, added in the sort->argmax PR) -> it must diagnose, not
+    # be treated as "unrelated". (This test previously used NCC_EVRF029 as its
+    # negative example, which went stale once the signature was catalogued.)
+    d_sort, r_sort = eng._diagnose_failure(
+        "NCC_EVRF029: Operation sort is not supported on trn2")
+    assert "topk-sort-to-argmax" in d_sort and "topk-sort-to-argmax" in r_sort
+    # a GENUINELY unmatched / empty error -> no suffix (opaque stays opaque, not mislabeled)
+    assert eng._diagnose_failure("some unrelated compiler error QUX_9999") == ("", "")
     assert eng._diagnose_failure("") == ("", "")
 
 
