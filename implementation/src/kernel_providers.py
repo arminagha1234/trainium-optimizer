@@ -162,38 +162,59 @@ def _guard_empty_completion(text: str, stop_reason, max_tokens: int) -> str:
 # ---------------------------------------------------------------------------
 def bedrock_complete_fn(model_id: str = "anthropic.claude-opus-5",
                         region: str | None = None,
-                        max_tokens: int = 16000,
+                        max_tokens: int = 32000,
                         temperature: float | None = 0.0) -> CompleteFn:
     """Return a ``complete_fn`` backed by boto3 ``bedrock-runtime`` InvokeModel.
 
     Uses the Anthropic Messages request/response schema. ``region`` falls back
-    to ``$AWS_REGION`` then ``$AWS_DEFAULT_REGION``; credentials resolve through
-    the standard boto3 chain (env, shared config, or — on the trn2 EC2 boxes —
-    the instance role). boto3 is imported here, not at module import, so this
-    module loads without boto3 installed and a missing dependency surfaces as a
-    clear ``ProviderNotAvailable`` at factory-call time.
+    to ``$AWS_REGION`` then ``$AWS_DEFAULT_REGION``, and a clear
+    ``ProviderNotAvailable`` is raised if none resolves (boto3 would otherwise
+    fail deep inside the first call with an opaque region error). Credentials
+    resolve through the standard boto3 chain (env, shared config, or — on the
+    trn2 EC2 boxes — the instance role). boto3 is imported here, not at module
+    import, so this module loads without boto3 installed and a missing
+    dependency surfaces as a clear ``ProviderNotAvailable`` at factory-call time.
+
+    The client is built with an explicit ``botocore`` ``Config``: a 600s
+    ``read_timeout`` (Opus-5's thinking pass routinely runs well past boto3's 60s
+    default read timeout — a small default caused mid-authoring read timeouts),
+    a 15s ``connect_timeout``, and 3 retry attempts.
 
     Note on ``temperature``: current Anthropic models reject sampling params
     (400). Pass ``temperature=None`` when the resolved ``model_id`` is a
     current-generation model; the default ``0.0`` suits older models where a
     deterministic sample is still accepted.
 
-    ``max_tokens`` defaults to 16000 (BUG #2): Opus-5 is a thinking model and a
-    small cap (the old 4096) can be exhausted entirely by the ``thinking`` block,
-    leaving zero ``text`` blocks. A response that still comes back with
+    ``max_tokens`` defaults to 32000 (BUG #2): Opus-5 is a thinking model and a
+    small cap (the old 4096) can be exhausted entirely by the ``thinking`` block
+    — a thinking model can spend 16k on thinking alone before writing any answer
+    — leaving zero ``text`` blocks. A response that still comes back with
     ``stop_reason == "max_tokens"`` and no text raises ``EmptyCompletion`` rather
     than silently returning an empty authored source.
     """
     try:
         import boto3  # noqa: PLC0415 — lazy so the module imports without boto3
+        from botocore.config import Config as _BotoConfig  # noqa: PLC0415
     except ImportError as exc:  # pragma: no cover - exercised via make_complete_fn test
         raise ProviderNotAvailable(
             "Bedrock provider requires boto3. Install it (`pip install boto3`) "
             "or select provider='anthropic' with ANTHROPIC_API_KEY set."
         ) from exc
 
-    resolved_region = region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
-    client = boto3.client("bedrock-runtime", region_name=resolved_region)
+    resolved_region = (region or os.environ.get("AWS_REGION")
+                       or os.environ.get("AWS_DEFAULT_REGION"))
+    if not resolved_region:
+        raise ProviderNotAvailable(
+            "Bedrock provider needs an AWS region: pass region=... or set "
+            "AWS_REGION (or AWS_DEFAULT_REGION) in the environment."
+        )
+    # Long read_timeout: Opus-5's thinking pass exceeds boto3's 60s default and
+    # was timing out mid-authoring. connect_timeout + bounded retries keep a
+    # transient network blip from failing the whole round.
+    boto_config = _BotoConfig(read_timeout=600, connect_timeout=15,
+                              retries={"max_attempts": 3})
+    client = boto3.client("bedrock-runtime", region_name=resolved_region,
+                          config=boto_config)
 
     def _complete(prompt: str) -> str:
         body = _messages_body(prompt, max_tokens, temperature, include_version=True)
@@ -212,17 +233,22 @@ def bedrock_complete_fn(model_id: str = "anthropic.claude-opus-5",
 # Anthropic SDK (fallback)
 # ---------------------------------------------------------------------------
 def anthropic_complete_fn(model: str = "claude-opus-5",
-                          max_tokens: int = 16000) -> CompleteFn:
+                          max_tokens: int = 32000) -> CompleteFn:
     """Return a ``complete_fn`` backed by the ``anthropic`` SDK.
 
     Reads ``ANTHROPIC_API_KEY`` from the environment (the SDK's default client
     resolution). Lazy-imported so this module loads without the SDK; a missing
     dependency surfaces as a clear ``ProviderNotAvailable``.
 
-    ``max_tokens`` defaults to 16000 for the same reason as ``bedrock_complete_fn``
-    (BUG #2): a thinking model can spend a small cap entirely on ``thinking``.
-    A response with ``stop_reason == "max_tokens"`` and no text raises
-    ``EmptyCompletion`` instead of returning an empty authored source."""
+    ``max_tokens`` defaults to 32000 for the same reason as ``bedrock_complete_fn``
+    (BUG #2): a thinking model can spend 16k on ``thinking`` alone before writing
+    any answer. A response with ``stop_reason == "max_tokens"`` and no text raises
+    ``EmptyCompletion`` instead of returning an empty authored source.
+
+    The client is constructed with a 600s ``timeout`` and 3 ``max_retries`` (same
+    spirit as the Bedrock read-timeout fix — a thinking model's long generation
+    exceeds the SDK's short default) when the installed SDK accepts those kwargs;
+    it degrades to the default client if it does not."""
     try:
         import anthropic  # noqa: PLC0415 — lazy so the module imports without anthropic
     except ImportError as exc:  # pragma: no cover - exercised via make_complete_fn test
@@ -232,7 +258,10 @@ def anthropic_complete_fn(model: str = "claude-opus-5",
             "provider='bedrock'."
         ) from exc
 
-    client = anthropic.Anthropic()
+    try:
+        client = anthropic.Anthropic(timeout=600.0, max_retries=3)
+    except TypeError:  # pragma: no cover - very old SDK without these kwargs
+        client = anthropic.Anthropic()
 
     def _complete(prompt: str) -> str:
         resp = client.messages.create(
