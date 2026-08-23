@@ -27,7 +27,10 @@ from invent_engine import (
     load_specs_from_file,
     _analytic_roofline,
     _measure_candidate,
+    _bf16_correct,
     _BF16_RIDGE_FLOPS_PER_BYTE,
+    _BF16_ATOL,
+    _BF16_RTOL,
 )
 from invent_kernels import (
     AuthoredKernel,
@@ -756,6 +759,101 @@ def test_measure_candidate_scrubs_between_repro_runs():
     _got, _ref, ok, _why = _measure_candidate(
         lambda: 42, lambda: 42, scrub_fn=_scrub, repro_runs=3)
     assert ok and scrubs["n"] >= 1          # scrub ran between repeats
+
+
+# ===========================================================================
+# bf16-fairness correctness oracle (the "fp32 numpy oracle is unfair" fix)
+# ===========================================================================
+def test_bf16_correct_accepts_bf16_noise_that_fails_the_fp32_gate():
+    # The crux: the incumbent bf16 op ITSELF misses the fp32 ideal on a few
+    # elements (bf16 rounding). A kernel that MATCHES that incumbent within bf16
+    # tol is correct — even though it, like the incumbent, misses the fp32 ideal.
+    rng = np.random.default_rng(0)
+    ref = rng.standard_normal((256, 256)).astype(np.float32)          # fp32 ideal
+    # incumbent bf16 op: ref plus a handful of >1e-2 excursions (what bf16 does).
+    oracle = ref.copy()
+    idx = (rng.integers(0, 256, 40), rng.integers(0, 256, 40))
+    oracle[idx] += 0.05                                               # bf16-scale miss
+    # kernel tracks the incumbent to well within bf16 tol (same rounding).
+    got = oracle + rng.uniform(-2e-3, 2e-3, ref.shape).astype(np.float32)
+
+    # Under the OLD fp32 gate the kernel would be WRONG (it inherits the same
+    # >1e-2 misses vs the fp32 ideal)...
+    assert not np.allclose(got, ref, atol=_BF16_ATOL, rtol=_BF16_RTOL)
+    # ...but the FAIR gate (vs the bf16 incumbent) accepts it.
+    correct, pct, note = _bf16_correct(got, ref, oracle, "torch-bf16@cpu")
+    assert correct and pct > 99.0
+    assert "kernel_no_worse_than_incumbent" in note
+
+
+def test_bf16_correct_accepts_kernel_more_accurate_than_incumbent():
+    # The real add_rmsnorm case: the KERNEL misses the fp32 ideal on FEWER
+    # elements (8) than the incumbent bf16 op does (47) — it is strictly better,
+    # so it must be correct even though neither is bit-exact vs fp32.
+    rng = np.random.default_rng(7)
+    ref = rng.standard_normal((512, 4096)).astype(np.float32)
+    flat = rng.choice(ref.size, size=47 + 8, replace=False)   # distinct positions
+    oracle = ref.copy().ravel(); oracle[flat[:47]] += 0.2      # incumbent misses 47
+    got = ref.copy().ravel(); got[flat[47:]] += 0.2           # kernel misses only 8
+    oracle = oracle.reshape(ref.shape); got = got.reshape(ref.shape)
+    correct, pct, note = _bf16_correct(got, ref, oracle, "torch-bf16@cpu")
+    assert correct and "k_fail=8" in note and "o_fail=47" in note
+
+
+def test_bf16_correct_rejects_garbage_vs_a_correct_incumbent():
+    # Anti-reward-hacking: a kernel wildly off the fp32 ideal must FAIL. The
+    # oracle is the CORRECT torch incumbent (~= fp32 ref); garbage matches
+    # neither, so it fails the PRIMARY gate AND the fp32 sanity backstop.
+    rng = np.random.default_rng(1)
+    ref = rng.standard_normal((128, 128)).astype(np.float32)
+    oracle = ref + rng.uniform(-1e-3, 1e-3, ref.shape).astype(np.float32)
+    garbage = rng.standard_normal((128, 128)).astype(np.float32)      # unrelated
+    correct, pct, _ = _bf16_correct(garbage, ref, oracle, "torch-bf16@cpu")
+    assert not correct and pct < 50.0
+
+
+def test_bf16_correct_rejects_kernel_materially_worse_than_incumbent():
+    # The sanity backstop's own job: a kernel that tracks the incumbent within
+    # bf16 tol on MOST elements but is materially worse than it vs the fp32 ideal
+    # (a large-error region the incumbent does not have) is rejected.
+    rng = np.random.default_rng(3)
+    ref = rng.standard_normal((128, 128)).astype(np.float32)
+    oracle = ref + rng.uniform(-1e-3, 1e-3, ref.shape).astype(np.float32)  # ~= ref
+    got = oracle.copy()
+    got[:, :40] += 0.5                     # 31% of elements grossly wrong vs fp32
+    correct, _, note = _bf16_correct(got, ref, oracle, "torch-bf16@cpu")
+    assert not correct and "kernel_no_worse_than_incumbent=False" in note
+
+
+def test_bf16_correct_no_oracle_falls_back_to_fp32_ref_never_silent_pass():
+    rng = np.random.default_rng(2)
+    ref = rng.standard_normal((64, 64)).astype(np.float32)
+    good = ref + rng.uniform(-1e-3, 1e-3, ref.shape).astype(np.float32)
+    bad = rng.standard_normal((64, 64)).astype(np.float32)
+    c_good, _, note = _bf16_correct(good, ref, None, "no oracle")
+    c_bad, _, _ = _bf16_correct(bad, ref, None, "no oracle")
+    assert c_good and not c_bad
+    assert "strict-fp32 fallback" in note
+
+
+def test_bf16_oracle_is_bf16_not_the_fp32_reference():
+    # _bf16_oracle must return the SAME-PRECISION (bf16) incumbent, which for a
+    # reduction op like add_rmsnorm DIFFERS from the fp32 numpy reference on some
+    # elements at 1e-2 — proving the oracle is the bf16 op, not the fp32 ref.
+    try:
+        import torch  # noqa: F401
+    except Exception:  # noqa: BLE001 — torch-less box: nothing to check here
+        return
+    from invent_engine import _bf16_oracle
+    from invent_kernels import _add_rmsnorm_inputs, _add_rmsnorm_reference
+    inp = _add_rmsnorm_inputs(512, 4096, 8)
+    oracle, src = _bf16_oracle("add_rmsnorm", inp, device=None)   # CPU bf16 path
+    ref = np.asarray(_add_rmsnorm_reference(inp), dtype=np.float32)
+    assert oracle is not None and oracle.shape == ref.shape
+    assert "cpu" in src
+    # bf16 rounding makes the incumbent miss the fp32 ideal on >= 1 element —
+    # the very reason the fp32 gate is unfair to a bf16 kernel.
+    assert not np.allclose(oracle, ref, atol=_BF16_ATOL, rtol=_BF16_RTOL)
 
 
 # ===========================================================================
