@@ -98,3 +98,4 @@ pass	model_slug	hf_id	family	configs_explored	best_speedup	wallclock_s	status
 1	mosaicml-mpt-7b	mosaicml/mpt-7b	dense_causal_lm	0	-	4	FAIL_NO_BASELINE
 1	stabilityai-stablelm-3b-4e1t	stabilityai/stablelm-3b-4e1t	dense_causal_lm	74	2.275	4883	ok
 1	allenai-olmo-2-1124-13b	allenai/OLMo-2-1124-13B	dense_causal_lm	1	-	724	ok
+1	qwen-qwen2-5-coder-7b	Qwen/Qwen2.5-Coder-7B	dense_causal_lm	84	6.736	5907	ok
