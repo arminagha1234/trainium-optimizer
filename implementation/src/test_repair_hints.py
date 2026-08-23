@@ -32,6 +32,19 @@ BROADCAST_ERR = ("device build/trace failed: AttributeError(\"'Tensor' object "
 PARTITION_BCAST_ERR = ("device build/trace failed: AssertionError('Unexpected "
                        "partition broadcast!')")
 UNKNOWN_ERR = "error: something entirely unfamiliar happened in pass QuxBar"
+INFER_TILE_ERR = ('device compile failed: RuntimeError("authored kernel not '
+                  'directly callable: Failed to infer tile from tensor k_res, '
+                  'used by parameter a of nki api a = b: the first dimension of '
+                  'the tile is not the partition dimension of the tensor.")')
+OUTPUT_DEPS_ERR = ("device compile failed: SyntaxError('Unexpected output "
+                   "dependencies, missing indices in the dst access: j.')")
+TOO_MANY_POS_ERR = ('device compile failed: RuntimeError("authored kernel not '
+                    'directly callable: too many positional arguments. The harness '
+                    'invokes the kernel as out = kernel(*inputs) ... do NOT take an '
+                    'out param.")')
+ISFV902_ERR = ('device compile failed: RuntimeError("RunNeuronCCImpl: error '
+               'condition error != 0: [INTERNAL_ERROR] [NCC_ISFV902] SFKVectorizer '
+               'error: gist(): incompatible function arguments.")')
 
 _SEEDED = {
     "nc_matmul-missing-moving": (NC_MATMUL_ERR,
@@ -44,6 +57,11 @@ _SEEDED = {
     "reduction-collapse-1d": (REDUCTION_1D_ERR, "keepdims=True"),
     "broadcast-to-freefn": (BROADCAST_ERR, "nl.broadcast_to(tile, shape=(P, F))"),
     "unexpected-partition-broadcast": (PARTITION_BCAST_ERR, "Broadcast the [1,F]"),
+    "infer-tile-partition-dim": (INFER_TILE_ERR, "keep the partition dim first"),
+    "unexpected-output-dependencies": (OUTPUT_DEPS_ERR,
+                                       "nl.store(out[:, a:b], value=tile)"),
+    "too-many-positional-return-form": (TOO_MANY_POS_ERR, "RETURN-FORM contract"),
+    "sfkvectorizer-gist-isfv902": (ISFV902_ERR, "partition dim >=2"),
 }
 
 
@@ -165,3 +183,62 @@ def test_hint_bonus_bounded_by_max_rounds():
     assert not out.ok
     assert out.rounds == 3
     assert out.reason == "exhausted rounds"
+
+
+# -- NEW attn_decode-run signatures: unique routing + no cross-fire ----------
+
+def test_infer_tile_routes_uniquely_and_teaches_partition_first():
+    names = [h.key for h in match_hints(INFER_TILE_ERR)]
+    assert names == ["infer-tile-partition-dim"], names
+    text = format_hints(match_hints(INFER_TILE_ERR))
+    assert "PARTITION axis" in text and "FREE axis" in text
+
+
+def test_output_deps_routes_uniquely_and_teaches_full_slice_store():
+    names = [h.key for h in match_hints(OUTPUT_DEPS_ERR)]
+    assert names == ["unexpected-output-dependencies"], names
+    text = format_hints(match_hints(OUTPUT_DEPS_ERR))
+    assert "nl.store(out[:, a:b], value=tile)" in text
+
+
+def test_too_many_positional_routes_to_return_form_and_teaches_no_dst():
+    names = [h.key for h in match_hints(TOO_MANY_POS_ERR)]
+    assert names == ["too-many-positional-return-form"], names
+    text = format_hints(match_hints(TOO_MANY_POS_ERR))
+    assert "NO out=/dst= parameter" in text
+    assert "nl.ndarray(shape, dtype, buffer=nl.shared_hbm)" in text
+    assert "nisa.nc_matmul(stationary, moving)" in text
+
+
+def test_isfv902_routes_uniquely_and_does_not_misroute_to_ismp902():
+    # NCC_ISFV902 (vectorizer gist crash) and NCC_ISMP902 (Simplifier is_subset)
+    # are DIFFERENT compiler crashes with DIFFERENT fixes — must not cross-fire.
+    names = [h.key for h in match_hints(ISFV902_ERR)]
+    assert names == ["sfkvectorizer-gist-isfv902"], names
+    assert "simplifier-ismp902-host-cast" not in names
+    # and the ISMP902 host-cast error must NOT hit the new isfv902 hint.
+    assert "sfkvectorizer-gist-isfv902" not in [h.key for h in match_hints(ISMP902_ERR)]
+
+
+def test_new_hint_appears_in_built_author_prompt():
+    from invent_kernels import catalog
+    from kernel_author import build_author_prompt
+
+    spec = catalog()["attn_decode"]
+    prompt = build_author_prompt(spec, None, [Feedback(1, TOO_MANY_POS_ERR, [])])
+    assert "COMPILER SAID" in prompt
+    assert "RETURN-FORM contract" in prompt
+    # Raw error still present (hint is in ADDITION, not a replacement).
+    assert "too many positional arguments" in prompt
+
+
+def test_new_hint_error_gets_extra_rounds_before_stalling():
+    # The exact stall the first live attn_decode run hit: the author repeats the
+    # SAME "too many positional arguments" error. With the NEW hint matched, the
+    # loop grants hint_bonus extra rounds before bailing (was: bail at round 2).
+    loop = KernelRepairLoop(max_rounds=8, stall_patience=2, hint_bonus=2)
+    out = loop.run(lambda trail: "broken",
+                   lambda k: CompileResult(False, error_log=TOO_MANY_POS_ERR))
+    assert not out.ok
+    assert out.reason.startswith("stalled")
+    assert out.rounds == 4, out.rounds

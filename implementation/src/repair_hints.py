@@ -192,6 +192,64 @@ HINTS: tuple[RepairHint, ...] = (
             "implicit partition broadcast in the arithmetic, not the index op.)"
         ),
     ),
+    RepairHint(
+        key="infer-tile-partition-dim",
+        title="a tile's first dim is not the partition axis (tile inference failed)",
+        patterns=(
+            r"Failed to infer tile",
+            r"first dimension of the tile is not the partition",
+        ),
+        fix=(
+            "Every SBUF/PSUM tile's FIRST dim is the PARTITION axis (<=128). Shape\n"
+            "your loads so dim0 is the partition dim; do NOT put a large feature dim\n"
+            "(e.g. H=4096) on dim0 - tile it onto the FREE axis (dim1). E.g. load x as\n"
+            "[P<=128, free] and iterate/tile the free axis, keep the partition dim first."
+        ),
+    ),
+    RepairHint(
+        key="unexpected-output-dependencies",
+        title="output tile has unwritten/partially-indexed dst access",
+        patterns=(
+            r"Unexpected output dependencies",
+            r"missing indices in the dst access",
+        ),
+        fix=(
+            "Every index of the output tile must be written each iteration. If you\n"
+            "store into out[..., j] inside a loop over j, ensure ALL j are covered (or\n"
+            "store the full 2-D slice at once via nl.store(out[:, a:b], value=tile)).\n"
+            "Do not leave dst indices unwritten or partially indexed."
+        ),
+    ),
+    RepairHint(
+        key="too-many-positional-return-form",
+        title="too many positional arguments (return-form contract / no dst)",
+        patterns=(
+            r"too many positional arguments",
+        ),
+        fix=(
+            "RETURN-FORM contract: (a) the @nki.jit entry takes EXACTLY the input\n"
+            "tensors and RETURNS the output - NO out=/dst= parameter; allocate the\n"
+            "output inside with nl.ndarray(shape, dtype, buffer=nl.shared_hbm) and\n"
+            "return it. (b) nisa.nc_matmul(stationary, moving) and\n"
+            "nisa.nc_transpose(data=...) take NO dst - a 3rd/2nd positional overflows.\n"
+            "ASSIGN their RETURN value."
+        ),
+    ),
+    RepairHint(
+        key="sfkvectorizer-gist-isfv902",
+        title="NCC_ISFV902 SFKVectorizer gist() internal crash (degenerate partition)",
+        patterns=(
+            r"NCC_ISFV902",
+            r"SFKVectorizer",
+            r"gist\(\)",
+        ),
+        fix=(
+            "neuronx-cc internal vectorizer crash (NCC_ISFV902) - usually triggered by\n"
+            "a SIZE-1-PARTITION tile or a degenerate/trivial reduction. Restructure to\n"
+            "carry a GENUINE partition dim (P>=2); avoid [1,F] tiles and single-\n"
+            "iteration loops; tile the work so every tile has partition dim >=2."
+        ),
+    ),
 )
 
 
