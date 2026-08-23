@@ -34,6 +34,7 @@ from bank_hygiene import (
     maybe_revalidate_at_startup,
 )
 from guardrails import Guardrails
+from kernel_registry import KernelRegistry
 from ledger import Ledger, Origin
 from orchestrator import ModelSpec, Orchestrator
 from preflight import (
@@ -215,6 +216,8 @@ def run_one(
     profile_loop_rounds: int = 3,
     profile_loop_patience: int = 2,
     preflight: bool = True,
+    registry: "KernelRegistry | None" = None,
+    kernels_wired: bool = False,
     serve_target: "ServeTarget | None" = None,
 ) -> ModelResult:
     """Optimize a single model. Crashes are caught and returned, never raised,
@@ -232,7 +235,17 @@ def run_one(
         # the whole class fails fast next time. Only skips KNOWN-BAD arches, so
         # working dense models are untouched.
         if preflight:
-            ok, reason = preflight_check(spec, bank=bank, sdk_version=sdk_version)
+            # Pass the kernel registry so a linear-attention skip's REASON names
+            # the kernel it needs + whether one is available on this install
+            # (instead of the generic LINEAR_ATTN_REASON). With --kernels-wired
+            # AND a usable kernel registered, such a model is allowed to PROCEED
+            # via the kernel path. Registry reads $TRN_OPT_KERNEL_DIR (empty if
+            # unset), so with no kernel dir + kernels_wired=False this is
+            # byte-for-byte today's behaviour.
+            ok, reason = preflight_check(
+                spec, bank=bank, sdk_version=sdk_version,
+                registry=registry, kernels_wired=kernels_wired,
+            )
             if not ok:
                 _record_preflight_skip(
                     run_dir, out_root, cycle, slug, spec, bank, sdk_version,
@@ -609,6 +622,17 @@ def main() -> None:
                     help="disable the pre-flight arch gate (on by default; it "
                          "only ever skips known-bad arches, so leaving it on is safe)")
     ap.set_defaults(preflight=True)
+    # --- kernel routing: let a registered+usable kernel unblock a linear-attn
+    #     model (once the backend injection hook is wired). OFF by default, so
+    #     the default behaviour is unchanged (a linear-attn model still skips,
+    #     but its reason now names the needed kernel + availability). The kernel
+    #     registry always reads $TRN_OPT_KERNEL_DIR (empty if unset). ---
+    ap.add_argument("--kernels-wired", dest="kernels_wired", action="store_true",
+                    help="allow a registered+usable kernel (from "
+                         "$TRN_OPT_KERNEL_DIR) to let a linear-attention model "
+                         "PROCEED instead of skipping. Off by default: default "
+                         "still skips, but with a named-kernel reason.")
+    ap.set_defaults(kernels_wired=False)
     # --- bank hygiene: re-validate stale verified priors when the SDK changed ---
     ap.add_argument("--revalidate", action="store_true",
                     help="at STARTUP, re-validate verified config-priors whose "
@@ -623,6 +647,10 @@ def main() -> None:
     out_root = a.out_root.resolve()
     out_root.mkdir(parents=True, exist_ok=True)
     bank = KnowledgeBank(a.bank_root.resolve())
+    # Construct the kernel registry ONCE (reads $TRN_OPT_KERNEL_DIR; empty if
+    # unset). Passed into every preflight_check so a linear-attention skip names
+    # the kernel it needs and reports availability.
+    registry = KernelRegistry()
     instance_type = a.instance_type or None
     cycles = 0 if a.forever else a.cycles          # 0 == run until stopped
     policy = AutoPromotionPolicy.overnight() if a.auto_promote else AutoPromotionPolicy()
@@ -657,7 +685,8 @@ def main() -> None:
 
     log(f"=== overnight START: backend={a.backend} instance={instance_type} "
         f"cycles={'forever' if cycles == 0 else cycles} auto_promote={a.auto_promote} "
-        f"preflight={a.preflight} models={models} ===")
+        f"preflight={a.preflight} kernels_wired={a.kernels_wired} "
+        f"kernel_dir={registry.kernel_dir} models={models} ===")
     log(f"    (touch {stop_file} to stop cleanly after the current model)")
 
     # BANK HYGIENE (startup, opt-in) — re-validate stale verified priors when
@@ -697,6 +726,8 @@ def main() -> None:
                     profile_loop_rounds=a.profile_loop_rounds,
                     profile_loop_patience=a.profile_loop_patience,
                     preflight=a.preflight,
+                    registry=registry,
+                    kernels_wired=a.kernels_wired,
                     serve_target=serve_target,
                 ))
 
