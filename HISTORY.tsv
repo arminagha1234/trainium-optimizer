@@ -87,3 +87,10 @@ timestamp	cycle	model	model_id	baseline	best	speedup	box_tok_s	verified	win_stag
 2026-08-24T10:39:24Z	1	smollm2-1-7b	HuggingFaceTB/SmolLM2-1.7B	10572.6	14460.3	1.368	14474	verified	config	93.8	baseline+borrow+config+graph_rewrite+invent+known_kernel	2.28.0
 2026-08-24T11:04:57Z	1	bloom-1b7	bigscience/bloom-1b7	11917.4	24779.9	2.079	24785	verified	config	100.0	baseline+borrow+config+graph_rewrite+invent+known_kernel	2.28.0
 2026-08-24T10:46:01Z	1	deepseek-ai-deepseek-coder-1-3b-instruct	deepseek-ai/deepseek-coder-1.3b-instruct	4329.1	81574.1	18.843	0	verified	config	100.0	baseline+borrow+config+graph_rewrite+invent+known_kernel	2.28.0
+2026-08-24T12:17:22Z	1	huggingfacetb-smollm2-360m-instruct	HuggingFaceTB/SmolLM2-360M-Instruct	3660.7	48063.8	13.130	96597	verified	config	100.0	baseline+borrow+config+graph_rewrite+invent+known_kernel+profile_loop	2.28.0
+2026-08-24T12:49:09Z	1	openai-community-gpt2	openai-community/gpt2	15065.5	157879.3	10.480	317497	verified	config	81.2	baseline+borrow+config+graph_rewrite+invent+known_kernel+profile_loop	2.28.0
+2026-08-24T13:29:53Z	1	eleutherai-pythia-1-4b	EleutherAI/pythia-1.4b	5467.4	13294.3	2.432	26569	verified	config	75.0	baseline+borrow+config+graph_rewrite+invent+known_kernel+profile_loop	2.28.0
+2026-08-24T12:02:07Z	1	granite-3-1-2b	ibm-granite/granite-3.1-2b-instruct	5739.0	13301.7	2.318	13282	verified	config	87.5	baseline+borrow+config+graph_rewrite+invent+known_kernel	2.28.0
+2026-08-24T13:23:39Z	1	phi-2	microsoft/phi-2	4175.5	9841.0	2.357	9900	verified	config	87.5	baseline+borrow+config+graph_rewrite+invent+known_kernel	2.28.0
+2026-08-24T12:05:33Z	1	allenai-olmo-1b-0724-hf	allenai/OLMo-1B-0724-hf	6978.1	86993.7	12.467	0	verified	config	100.0	baseline+borrow+config+graph_rewrite+invent+known_kernel	2.28.0
+2026-08-24T13:17:21Z	1	togethercomputer-redpajama-incite-instruct-3b-v1	togethercomputer/RedPajama-INCITE-Instruct-3B-v1	3345.0	9824.2	2.937	19679	verified	config	93.8	baseline+borrow+config+graph_rewrite+invent+known_kernel	2.28.0

@@ -14,31 +14,35 @@ Recipes and trajectory charts live under [`optimized_models/`](./optimized_model
 | 6 | Qwen2.5-0.5B-Instruct | qwen2.5 | 0.5B | 4,833 | **74,269** | **15.368×** | TP=2, torch.compile(neuron), bf16, batch=8, DP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-0-5b-instruct/) |
 | 7 | Qwen3-4B | qwen3 | 4B | 1,882 | **26,548** | **14.104×** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-4b/) |
 | 8 | gpt2 | gpt2 | 124M | 11,764 | **156,833** | **13.332×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/gpt2/) |
-| 9 | SmolLM2-1.7B-Instruct | smollm2 | 1.7B | 3,911 | **50,650** | **12.950×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-1-7b-instruct/) |
-| 10 | Qwen2.5-3B-Instruct | qwen2.5 | 3B | 2,754 | **35,056** | **12.729×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-3b-instruct/) |
-| 11 | SmolLM2-360M-Instruct | smollm2 | 360M | 3,954 | **48,130** | **12.171×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-360m-instruct/) |
-| 12 | TinyLlama-1.1B-Chat-v1.0 | tinyllama | 1.1B | 4,355 | **48,108** | **11.048×** | config + compiler graph-rewrite | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/tinyllama-1-1b-chat-v1-0/) |
-| 13 | gpt2-medium | gpt2 | 355M | 6,083 | **61,158** | **10.055×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/gpt2-medium/) |
-| 14 | Qwen2.5-Coder-1.5B | qwen2.5 | 1.5B | 4,078 | **39,159** | **9.603×** | config + compiler graph-rewrite | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-coder-1-5b/) |
-| 15 | Mistral-7B-Instruct-v0.3 | mistral | 7B | 2,555 | **23,270** | **9.108×** | TP=4, torch.compile(neuron), bf16, batch=32 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/mistral-7b-instruct-v0-3/) |
-| 16 | Qwen3-8B | qwen3 | 8B | 1,903 | **16,876** | **8.870×** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-8b/) |
-| 17 | bloom-1b7 | bloom | 1.7B | 2,969 | **24,926** | **8.395×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/bloom-1b7/) |
-| 18 | deepseek-llm-7b-base | deepseek | 7B | 2,781 | **20,702** | **7.443×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/deepseek-llm-7b-base/) |
-| 19 | gpt2-large | gpt2 | 774M | 4,170 | **30,620** | **7.343×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/gpt2-large/) |
-| 20 | Qwen2.5-Math-7B | qwen2.5 | 7B | 2,930 | **19,826** | **6.765×** | config + compiler graph-rewrite | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-math-7b/) |
-| 21 | Qwen2.5-Coder-7B | qwen2.5 | 7B | 2,949 | **19,866** | **6.736×** | config + compiler graph-rewrite | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-coder-7b/) |
-| 22 | Qwen3-14B | qwen3 | 14B | 1,699 | **10,343** | **6.087×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-14b/) |
-| 23 | Qwen2.5-14B-Instruct | qwen2.5 | 14B | 1,819 | **10,256** | **5.637×** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-14b-instruct/) |
-| 24 | Qwen3-32B | qwen3 | 32B | 975 | **3,698** | **3.794×** | TP=4, torch.compile(neuron), bf16, batch=1, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-32b/) |
-| 25 | Qwen2.5-7B-Instruct | qwen2.5 | 7B | 2,920 | **9,891** | **3.387×** | TP=4, bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-7b-instruct/) |
-| 26 | SmolLM2-360M | smollm2 | 360M | 10,836 | **31,764** | **2.931×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-360m/) |
-| 27 | opt-1.3b | opt | 1.3B | 7,396 | **21,452** | **2.900×** | config + compiler graph-rewrite | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/opt-1-3b/) |
-| 28 | stablelm-2-1_6b | stablelm | 1.6B | 4,933 | **14,141** | **2.866×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/stablelm-2-1-6b/) |
-| 29 | bloom-560m | bloom | 560M | 17,095 | **48,320** | **2.826×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/bloom-560m/) |
-| 30 | pythia-1.4b | pythia | 1.3B | 5,454 | **13,294** | **2.438×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/pythia-1-4b/) |
-| 31 | opt-2.7b | opt | 2.7B | 4,810 | **11,649** | **2.422×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/opt-2-7b/) |
-| 32 | stablelm-3b-4e1t | stablelm | 3B | 3,393 | **7,721** | **2.275×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/stablelm-3b-4e1t/) |
-| 33 | pythia-2.8b | pythia | 2.7B | 3,108 | **6,450** | **2.076×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/pythia-2-8b/) |
-| 34 | SmolLM2-1.7B | smollm2 | 7B | 10,573 | **14,460** | **1.368×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-1-7b/) |
+| 9 | SmolLM2-360M-Instruct | smollm2 | 360M | 3,661 | **48,064** | **13.130×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-360m-instruct/) |
+| 10 | SmolLM2-1.7B-Instruct | smollm2 | 1.7B | 3,911 | **50,650** | **12.950×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-1-7b-instruct/) |
+| 11 | Qwen2.5-3B-Instruct | qwen2.5 | 3B | 2,754 | **35,056** | **12.729×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-3b-instruct/) |
+| 12 | OLMo-1B-0724-hf | olmo | ? | 6,978 | **86,994** | **12.467×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/olmo-1b-0724-hf/) |
+| 13 | TinyLlama-1.1B-Chat-v1.0 | tinyllama | 1.1B | 4,355 | **48,108** | **11.048×** | config + compiler graph-rewrite | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/tinyllama-1-1b-chat-v1-0/) |
+| 14 | gpt2-medium | gpt2 | 355M | 6,083 | **61,158** | **10.055×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/gpt2-medium/) |
+| 15 | Qwen2.5-Coder-1.5B | qwen2.5 | 1.5B | 4,078 | **39,159** | **9.603×** | config + compiler graph-rewrite | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-coder-1-5b/) |
+| 16 | Mistral-7B-Instruct-v0.3 | mistral | 7B | 2,555 | **23,270** | **9.108×** | TP=4, torch.compile(neuron), bf16, batch=32 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/mistral-7b-instruct-v0-3/) |
+| 17 | Qwen3-8B | qwen3 | 8B | 1,903 | **16,876** | **8.870×** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-8b/) |
+| 18 | bloom-1b7 | bloom | 1.7B | 2,969 | **24,926** | **8.395×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/bloom-1b7/) |
+| 19 | deepseek-llm-7b-base | deepseek | 7B | 2,781 | **20,702** | **7.443×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/deepseek-llm-7b-base/) |
+| 20 | gpt2-large | gpt2 | 774M | 4,170 | **30,620** | **7.343×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/gpt2-large/) |
+| 21 | Qwen2.5-Math-7B | qwen2.5 | 7B | 2,930 | **19,826** | **6.765×** | config + compiler graph-rewrite | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-math-7b/) |
+| 22 | Qwen2.5-Coder-7B | qwen2.5 | 7B | 2,949 | **19,866** | **6.736×** | config + compiler graph-rewrite | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-coder-7b/) |
+| 23 | Qwen3-14B | qwen3 | 14B | 1,699 | **10,343** | **6.087×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-14b/) |
+| 24 | Qwen2.5-14B-Instruct | qwen2.5 | 14B | 1,819 | **10,256** | **5.637×** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-14b-instruct/) |
+| 25 | Qwen3-32B | qwen3 | 32B | 975 | **3,698** | **3.794×** | TP=4, torch.compile(neuron), bf16, batch=1, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-32b/) |
+| 26 | Qwen2.5-7B-Instruct | qwen2.5 | 7B | 2,920 | **9,891** | **3.387×** | TP=4, bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-7b-instruct/) |
+| 27 | RedPajama-INCITE-Instruct-3B-v1 | redpajama | 3B | 3,345 | **9,824** | **2.937×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/redpajama-incite-instruct-3b-v1/) |
+| 28 | SmolLM2-360M | smollm2 | 360M | 10,836 | **31,764** | **2.931×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-360m/) |
+| 29 | opt-1.3b | opt | 1.3B | 7,396 | **21,452** | **2.900×** | config + compiler graph-rewrite | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/opt-1-3b/) |
+| 30 | stablelm-2-1_6b | stablelm | 1.6B | 4,933 | **14,141** | **2.866×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/stablelm-2-1-6b/) |
+| 31 | bloom-560m | bloom | 560M | 17,095 | **48,320** | **2.826×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/bloom-560m/) |
+| 32 | pythia-1.4b | pythia | 1.3B | 5,454 | **13,294** | **2.438×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/pythia-1-4b/) |
+| 33 | opt-2.7b | opt | 2.7B | 4,810 | **11,649** | **2.422×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/opt-2-7b/) |
+| 34 | phi-2 | microsoft | ? | 4,176 | **9,841** | **2.357×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/phi-2/) |
+| 35 | granite-3.1-2b-instruct | granite | ? | 5,739 | **13,302** | **2.318×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/granite-3-1-2b-instruct/) |
+| 36 | stablelm-3b-4e1t | stablelm | 3B | 3,393 | **7,721** | **2.275×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/stablelm-3b-4e1t/) |
+| 37 | pythia-2.8b | pythia | 2.7B | 3,108 | **6,450** | **2.076×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/pythia-2-8b/) |
+| 38 | SmolLM2-1.7B | smollm2 | 7B | 10,573 | **14,460** | **1.368×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-1-7b/) |
 
-34 verified model(s). Speedup is measured against the eager baseline on the same instance and probe shape. See [`HISTORY.tsv`](./HISTORY.tsv) for the append-only record.
+38 verified model(s). Speedup is measured against the eager baseline on the same instance and probe shape. See [`HISTORY.tsv`](./HISTORY.tsv) for the append-only record.
