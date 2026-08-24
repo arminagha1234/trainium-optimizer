@@ -94,3 +94,11 @@ timestamp	cycle	model	model_id	baseline	best	speedup	box_tok_s	verified	win_stag
 2026-08-24T13:23:39Z	1	phi-2	microsoft/phi-2	4175.5	9841.0	2.357	9900	verified	config	87.5	baseline+borrow+config+graph_rewrite+invent+known_kernel	2.28.0
 2026-08-24T12:05:33Z	1	allenai-olmo-1b-0724-hf	allenai/OLMo-1B-0724-hf	6978.1	86993.7	12.467	0	verified	config	100.0	baseline+borrow+config+graph_rewrite+invent+known_kernel	2.28.0
 2026-08-24T13:17:21Z	1	togethercomputer-redpajama-incite-instruct-3b-v1	togethercomputer/RedPajama-INCITE-Instruct-3B-v1	3345.0	9824.2	2.937	19679	verified	config	93.8	baseline+borrow+config+graph_rewrite+invent+known_kernel	2.28.0
+2026-08-24T14:36:27Z	1	qwen-qwen2-5-coder-1-5b	Qwen/Qwen2.5-Coder-1.5B	3722.6	35129.7	9.437	0	verified	config	87.5	baseline+borrow+config+graph_rewrite+invent+known_kernel	2.28.0
+2026-08-24T14:52:26Z	2	openai-community-gpt2	openai-community/gpt2	11729.1	156974.1	13.383	313918	verified	config	81.2	baseline+borrow+config+graph_rewrite+invent+known_kernel	2.28.0
+2026-08-24T15:08:18Z	2	openai-community-gpt2-medium	openai-community/gpt2-medium	6645.3	61003.8	9.180	122564	verified	config	75.0	baseline+borrow+config+graph_rewrite+invent+known_kernel	2.28.0
+2026-08-24T15:30:49Z	2	openai-community-gpt2-large	openai-community/gpt2-large	5117.3	30611.9	5.982	61210	verified	config	93.8	baseline+borrow+config+graph_rewrite+invent+known_kernel	2.28.0
+2026-08-24T15:45:53Z	2	stabilityai-stablelm-2-1-6b	stabilityai/stablelm-2-1_6b	4827.5	14183.3	2.938	28364	verified	config	75.0	baseline+borrow+config+graph_rewrite+invent+known_kernel	2.28.0
+2026-08-24T14:05:01Z	1	facebook-opt-1-3b	facebook/opt-1.3b	6859.0	21076.8	3.073	42312	verified	config	93.8	baseline+borrow+config+graph_rewrite+invent+known_kernel+profile_loop	2.28.0
+2026-08-24T15:05:28Z	1	stabilityai-stablelm-2-1-6b	stabilityai/stablelm-2-1_6b	5020.9	14240.9	2.836	28429	verified	config	75.0	baseline+borrow+config+graph_rewrite+invent+known_kernel+profile_loop	2.28.0
+2026-08-24T15:55:19Z	1	bigscience-bloom-1b7	bigscience/bloom-1b7	2556.0	24852.2	9.723	49619	verified	config	87.5	baseline+borrow+config+graph_rewrite+invent+known_kernel+profile_loop	2.28.0
