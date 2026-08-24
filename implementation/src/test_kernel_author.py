@@ -339,6 +339,48 @@ def test_author_prompt_contains_performance_rules():
     assert "reciprocal" in low                       # (8) delayed division
 
 
+# ---------------------------------------------------------------------------
+# Pillar 1: op-aware knowledge retrieval is wired into the prompt
+# ---------------------------------------------------------------------------
+def test_prompt_includes_op_aware_knowledge_by_default():
+    # rmsnorm (normalization) must pull the reduction/normalization knowledge:
+    # keepdims + activation-reduce-fusion + a fenced worked example naming the op.
+    prompt = build_author_prompt(catalog()["rmsnorm"], lessons=None, feedback=None)
+    assert "Relevant verified techniques & worked examples" in prompt
+    assert "op family: normalization" in prompt
+    assert "activation-reduce-fusion" in prompt
+    assert "rmsnorm_kernel" in prompt          # the worked example is embedded
+
+
+def test_prompt_knowledge_is_op_specific():
+    # An attention op gets the flash/online-softmax example; a normalization op
+    # does NOT — the retrieval is op-aware, not one-size-fits-all.
+    attn = build_author_prompt(catalog()["attn_decode"], lessons=None, feedback=None)
+    assert "op family: attention" in attn
+    assert "flash" in attn.lower() or "online" in attn.lower()
+    norm = build_author_prompt(catalog()["rmsnorm"], lessons=None, feedback=None)
+    assert "op family: attention" not in norm
+    # The scan-only technique never leaks into a normalization prompt.
+    assert "chunked-scan" not in norm
+
+
+def test_include_knowledge_false_reproduces_baseline_prompt():
+    # The A/B measurement flips exactly this switch: include_knowledge=False must
+    # remove the retrieved section and leave the rest byte-identical.
+    from kernel_author import _NKI_PREAMBLE
+    spec = catalog()["softmax"]
+    enriched = build_author_prompt(spec, lessons=None, feedback=None)
+    baseline = build_author_prompt(spec, lessons=None, feedback=None,
+                                   include_knowledge=False)
+    assert "Relevant verified techniques & worked examples" in enriched
+    assert "Relevant verified techniques & worked examples" not in baseline
+    # The baseline is the enriched prompt with ONLY the knowledge block removed.
+    assert len(baseline) < len(enriched)
+    # The standing preamble + op section are present in BOTH.
+    assert "## Op to author" in baseline and "## Op to author" in enriched
+    assert _NKI_PREAMBLE.strip() in baseline
+
+
 def test_perf_preamble_is_ordered_after_correctness_preamble():
     # Correctness rules first (they gate compile), perf rules second — both must
     # be present and the perf block must not have displaced the NKI contract.

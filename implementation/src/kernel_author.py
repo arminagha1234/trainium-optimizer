@@ -47,6 +47,15 @@ from kernel_repair import Feedback
 from kernel_rewrites import match_error
 from repair_hints import format_hints, match_hints
 
+# Op-aware retrieval: the verified-technique + worked-example knowledge base
+# (Pillar 1 — make the author SKILLED). Pure-python data module (no heavy
+# imports), so this top-level import is cheap; guarded so a missing module never
+# breaks authoring (the prompt then simply omits the retrieved section).
+try:
+    from nki_knowledge import knowledge_for_prompt
+except Exception:  # noqa: BLE001 — never let prompt-building fail on retrieval
+    knowledge_for_prompt = None
+
 
 # ---------------------------------------------------------------------------
 # the seam
@@ -295,15 +304,40 @@ def _op_input_order(spec: OpSpec) -> list[str] | None:
     return list(inp.keys()) or None
 
 
+def _knowledge_section(spec: OpSpec, include_knowledge: bool) -> str:
+    """The op-aware "Relevant verified techniques & worked examples" block from
+    ``nki_knowledge`` — the RETRIEVAL that makes the standing preamble op-specific
+    (an attention op gets flash/online-softmax examples; a reduction gets
+    keepdims + activation-reduce-fusion; a matmul gets the tiled PSUM idiom).
+
+    Returns "" when disabled (``include_knowledge=False``, the pre-enrichment
+    baseline used by the A/B measurement) or when the knowledge module is
+    unavailable, so the rest of the prompt is byte-identical to before."""
+    if not include_knowledge or knowledge_for_prompt is None:
+        return ""
+    try:
+        section = knowledge_for_prompt(spec)
+    except Exception:  # noqa: BLE001 — retrieval must never break authoring
+        return ""
+    return f"{section}\n\n" if section else ""
+
+
 def build_author_prompt(spec: OpSpec, lessons: list | None,
                         feedback: list[Feedback] | None,
-                        perf_feedback: list | None = None) -> str:
-    """Assemble the authoring prompt from the NKI preamble, the op spec, the
-    retrieved bank lessons, and the prior-round compiler errors + matched
+                        perf_feedback: list | None = None,
+                        *, include_knowledge: bool = True) -> str:
+    """Assemble the authoring prompt from the NKI preamble, the OP-AWARE retrieved
+    knowledge (verified techniques + worked examples for this op family), the op
+    spec, the retrieved bank lessons, and the prior-round compiler errors + matched
     rewrites. Deterministic and side-effect free (given the spec), so it is
     directly unit-testable (the tests assert the compiler error and the matched
     rewrite NAME both appear in the returned string, and that the FULL multi-round
-    error history is present)."""
+    error history is present).
+
+    ``include_knowledge`` (keyword-only, default True) gates the retrieved
+    knowledge section. It defaults ON — every real authoring call is enriched.
+    Passing ``False`` reproduces the pre-enrichment prompt EXACTLY, which is how
+    the before/after on-device measurement isolates the retrieval's effect."""
     inputs = _op_input_order(spec)
     if inputs:
         inputs_line = ", ".join(inputs)
@@ -314,6 +348,7 @@ def build_author_prompt(spec: OpSpec, lessons: list | None,
     return (
         f"{_NKI_PREAMBLE}\n"
         f"{_PERF_PREAMBLE}\n"
+        f"{_knowledge_section(spec, include_knowledge)}"
         f"## Op to author\n"
         f"  name        : {spec.name}\n"
         f"  entry naming: define `@nki.jit def {sig_hint}`\n"
