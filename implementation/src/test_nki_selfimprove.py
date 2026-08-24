@@ -126,8 +126,54 @@ def test_render_surfaces_best_template_and_failures():
         assert "first correct at iteration 2" in text.lower()
         assert "winning template" in text.lower()
         assert "softmax_kernel" in text  # the template excerpt is present
-        assert "FAILED approaches" in text
+        # A correct best exists -> failed approaches are reframed as micro-changes
+        # to avoid WITHIN the winning structure (not "change the approach").
         assert "compile:matmul_moving" in text
+        assert "regressed before" in text.lower()
+
+
+def test_keep_winner_bias_when_correct_best_exists():
+    """When a CORRECT best kernel exists, the rendered lesson MUST instruct the
+    author to KEEP the winning template and refine one thing — NOT rewrite it
+    with a novel approach. This is the anti-regression bias (softmax regressed
+    when lessons pushed novel approaches)."""
+    with tempfile.TemporaryDirectory() as d:
+        bank = SI.LessonBank(d)
+        # A single correct-but-slow win, no failures.
+        bank.update("softmax", "sc", _rec(1, correct=True, speedup=0.398,
+                    approach="nl.exp,nl.max,nl.sum,loops=1"),
+                    kernel_src="import nki\n@nki.jit\ndef softmax_kernel(x):\n"
+                               "    m = nl.max(x)\n    e = nl.exp(x - m)\n"
+                               "    return e / nl.sum(e)",
+                    entry="softmax_kernel")
+        text = bank.render_for_prompt("softmax")
+        low = text.lower()
+        # The explicit keep-winner directive is present.
+        assert "keep-the-winner" in low
+        assert "start from this winning template" in low
+        assert "improve exactly one thing" in low
+        assert "do not rewrite it" in low
+        assert "keep this structure" in low
+        # It cites the measured best and its approach.
+        assert "0.398x" in text
+        assert "nl.exp" in text
+        # And it does NOT tell the author to change the structural approach when
+        # a correct kernel already exists.
+        assert "change the structural approach" not in low
+
+
+def test_no_winner_bias_says_change_approach_when_no_correct_kernel():
+    """The keep-winner directive must NOT fire before any correct kernel; there
+    the failed-approach guidance is still 'change the structural approach'."""
+    with tempfile.TemporaryDirectory() as d:
+        bank = SI.LessonBank(d)
+        bank.update("softmax", "sc", _rec(1, correct=False, speedup=0.0,
+                    cls="incorrect", approach="bad", reason="wrong on device"))
+        text = bank.render_for_prompt("softmax")
+        low = text.lower()
+        assert "keep-the-winner" not in low
+        assert "no correct kernel yet" in low
+        assert "change the structural approach" in low
 
 
 def test_render_empty_before_any_attempt():

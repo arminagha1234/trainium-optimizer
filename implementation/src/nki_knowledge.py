@@ -172,6 +172,13 @@ LANDMINES: dict[str, str] = {
     "size-1-partition":
         "A size-1-partition tile can trip an internal vectorizer crash "
         "(NCC_ISFV902/SFKVectorizer) — carry a genuine partition dim (P>=2).",
+    "attn-scores-on-partition":
+        "DEVICE-VERIFIED (self-improve, trn2): for single-query attention lay the "
+        "scores as [128, S/128] with the KV sequence on the PARTITION axis (never "
+        "the [1,S] row — that transposes a size-1 partition and trips NCC_IPMN902). "
+        "Reduce max/sum on the free axis; take the global max via a transpose + "
+        "nc_matmul(ones_row, gmax) broadcast; use nisa.nc_transpose(data=), not "
+        "nl.transpose. This is the structure that raced correct at 0.438x.",
     "chunk-partition-limit":
         "Scan chunk_size AND state dstate must each be <= 128 (they sit on the "
         "partition axis). seqlen must be divisible by chunk_size.",
@@ -303,14 +310,24 @@ def attn_decode_kernel(q, k, v):
     sm = nl.sum(e, axis=1, keepdims=True)                    # denominator [1,1]
     p  = e * nl.broadcast_to(nl.reciprocal(sm), shape=e.shape)   # delayed division
     # PV: contract over S -> transpose p to [S,1] so S is the partition axis.
-    out = nisa.nc_matmul(stationary=nl.transpose(p), moving=vs)  # [1,d_v]
+    out = nisa.nc_matmul(stationary=nisa.nc_transpose(data=p), moving=vs)  # [1,d_v]
     o = nl.ndarray(out.shape, dtype=nl.float32, buffer=nl.shared_hbm)
     nl.store(o[:, :], value=out); return o""",
     "Algorithm from nki-samples attention_fwd_performance (v1->v8a ladder), "
     "return-form-translated. For long S tile K/V by 512 and run the online-softmax "
     "(running max + rescale) so the denominator accumulates without materializing "
     "the full score row (flash attention). nc_matmul contracts on the partition "
-    "axis — keep head-dim d<=128 there.",
+    "axis — keep head-dim d<=128 there. "
+    "DEVICE-VERIFIED (self-improve loop, trn2, 2026-08-24): a full decode kernel "
+    "built on this structure raced CORRECT at 0.438x vs torch-eager SDPA. The two "
+    "fixes the loop found and that this example now reflects: (1) transpose with "
+    "`nisa.nc_transpose(data=...)`, NEVER `nl.transpose` (the alias trips "
+    "NCC_IPMN902/vectorizer on the [1,S] score row); (2) lay scores as "
+    "[128, S/128] with S on the PARTITION axis (P>=2) so max/sum are cheap "
+    "free-axis reduces and you never transpose a size-1-partition tile — compute "
+    "the global max via a transpose + `nc_matmul(ones_row, gmax)` broadcast. The "
+    "complete verified template is banked at "
+    "knowledge-bank/harvested/attn_decode_verified.py.",
 )
 
 _EX_ELEMENTWISE = WorkedExample(
@@ -447,7 +464,8 @@ KNOWLEDGE: dict[str, KnowledgeEntry] = {
          "activation-reduce-fusion", "psum-native-accumulation",
          "downcast-before-transpose"),
         ("nc_matmul", "nc_transpose", "activation", "reduce", "reciprocal"),
-        ("no-dst-param", "moving-free-512", "no-1d-collapse", "partition-le-128"),
+        ("no-dst-param", "moving-free-512", "no-1d-collapse", "partition-le-128",
+         "size-1-partition", "attn-scores-on-partition"),
         (_EX_ATTENTION, _EX_SOFTMAX),
     ),
     SCAN: KnowledgeEntry(

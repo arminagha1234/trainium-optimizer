@@ -212,18 +212,34 @@ class OpLesson:
             "op on this device (learn from them; do not repeat a failed "
             "approach):",
         ]
-        if self.best_correct and self.best_speedup is not None:
+        keep_winner = self.best_correct and self.best_speedup is not None
+        if keep_winner:
+            # KEEP-THE-WINNER bias: a correct kernel already exists. The author
+            # must START FROM the winning template and REFINE it (one small,
+            # targeted change toward more speed), NOT replace it with a novel
+            # approach. The loop already keeps the best-correct kernel and
+            # discards regressions; make that explicit in the PROMPT so the
+            # author does not waste an iteration rewriting from scratch (which is
+            # exactly how softmax regressed: lessons pushed novel approaches that
+            # broke correctness).
+            sig = self.best_approach_sig or "(the template below)"
             lines.append(
-                f"  - Best CORRECT kernel so far: {self.best_speedup:.3f}x vs "
-                f"baseline (first correct at iteration {self.rounds_to_correct}). "
-                f"YOUR TARGET: beat {self.best_speedup:.3f}x while staying correct."
+                f"  - KEEP-THE-WINNER: your best is {self.best_speedup:.3f}x via "
+                f"{sig} (first correct at iteration {self.rounds_to_correct}, "
+                f"CORRECT). START FROM this winning template and improve exactly "
+                f"ONE thing to go faster — keep its structure; do NOT rewrite it "
+                f"with a novel approach. A change that regresses correctness or "
+                f"speed will be DISCARDED and this {self.best_speedup:.3f}x "
+                f"kernel kept, so a rewrite can only cost you an iteration."
             )
-            if self.best_approach_sig:
-                lines.append(f"    winning approach: {self.best_approach_sig}")
+            lines.append(
+                f"    YOUR TARGET: beat {self.best_speedup:.3f}x while staying "
+                f"correct, by refining the template below (not replacing it)."
+            )
             exc = source_excerpt(self.best_kernel_src)
             if exc:
-                lines.append("    winning template (reuse its structure, then "
-                             "optimize further):")
+                lines.append("    winning template (KEEP this structure; change "
+                             "one thing to make it faster):")
                 lines.append("    ```python")
                 for ln in exc.splitlines():
                     lines.append("    " + ln)
@@ -234,8 +250,15 @@ class OpLesson:
                 f"CORRECT kernel is the first goal — correctness before speed."
             )
         if self.failed_approaches:
-            lines.append("  - FAILED approaches so far — do NOT repeat these; "
-                         "change the structural approach:")
+            if keep_winner:
+                # With a winner in hand, failed approaches are micro-changes to
+                # AVOID inside the winning structure — NOT a cue to change tack.
+                lines.append("  - Within that winning structure, these specific "
+                             "changes regressed before — do NOT re-apply them "
+                             "(but keep the winning structure):")
+            else:
+                lines.append("  - FAILED approaches so far — do NOT repeat these; "
+                             "change the structural approach:")
             # De-dup by (class, approach) so the list stays short + actionable.
             seen: set[tuple] = set()
             for fa in self.failed_approaches:
