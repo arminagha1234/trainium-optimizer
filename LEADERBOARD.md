@@ -6,7 +6,7 @@ Recipes and trajectory charts live under [`optimized_models/`](./optimized_model
 
 | Rank | Model | Family | Params | Baseline (tok/s) | Best (tok/s) | Speedup | Best config | Hardware | Verified | Recipe |
 |-----:|:------|:-------|-------:|-----------------:|-------------:|--------:|:------------|:-------------|:---------|:-------|
-| 🥇 | Qwen3-0.6B | qwen3 | 0.6B | 3,179 | **87,017** | **27.374×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-0-6b/) |
+| 🥇 | Qwen3-0.6B | qwen3 | 0.6B | 3,022 | **84,938** | **28.109×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-0-6b/) |
 | 🥈 | Qwen3-1.7B | qwen3 | 1.7B | 2,770 | **51,151** | **18.469×** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-1-7b/) |
 | 🥉 | Gemma-2-2B | gemma-2 | 2B | 1,996 | **34,051** | **17.061×** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/gemma-2-2b/) |
 | 4 | Qwen2.5-1.5B-Instruct | qwen2.5 | 1.5B | 3,797 | **59,241** | **15.601×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-1-5b-instruct/) |
@@ -32,7 +32,7 @@ Recipes and trajectory charts live under [`optimized_models/`](./optimized_model
 | 24 | Qwen2.5-7B-Instruct | qwen2.5 | 7B | 2,920 | **9,891** | **3.387×** | TP=4, bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-7b-instruct/) |
 | 25 | SmolLM2-360M | smollm2 | 360M | 10,836 | **31,764** | **2.931×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-360m/) |
 | 26 | opt-1.3b | opt | 1.3B | 7,396 | **21,452** | **2.900×** | config + compiler graph-rewrite | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/opt-1-3b/) |
-| 27 | stablelm-2-1_6b | stablelm | 1.6B | 5,001 | **14,231** | **2.846×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/stablelm-2-1-6b/) |
+| 27 | stablelm-2-1_6b | stablelm | 1.6B | 4,933 | **14,141** | **2.866×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/stablelm-2-1-6b/) |
 | 28 | bloom-560m | bloom | 560M | 17,095 | **48,320** | **2.826×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/bloom-560m/) |
 | 29 | pythia-1.4b | pythia | 1.3B | 5,454 | **13,294** | **2.438×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/pythia-1-4b/) |
 | 30 | opt-2.7b | opt | 2.7B | 4,810 | **11,649** | **2.422×** | config search (native-pytorch-beta3) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/opt-2-7b/) |
