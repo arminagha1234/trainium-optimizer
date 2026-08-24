@@ -1,0 +1,21 @@
+Gated DeltaNet NKI kernels — provenance & license
+=================================================
+
+The kernel source vendored under ``gdn_src/`` (constants.py and
+nki_kernels/*.py) is harvested verbatim from:
+
+    repo    : kernels/jburtoft/qwen35-deltanet-tkg-full  (HuggingFace)
+    revision: v4
+    license : Apache-2.0
+
+The source repository's README declares: "Custom NKI kernels: original work in
+this repo family, published under Apache 2.0." and "License: Apache 2.0." No
+standalone LICENSE file ships in that repo; the Apache-2.0 grant is asserted in
+its README front-matter (``license: apache-2.0``) and License section. The files
+are reproduced here unmodified except for ``gdn_src/nki_kernels/__init__.py``,
+which was reduced to a bare package marker so the adapter can lazily import a
+single kernel submodule without eagerly importing all seven (a packaging shim;
+kernel bodies are untouched).
+
+Registration mode: vendored (Apache-2.0). See kernel.json ``notes`` for the
+on-device validation record.

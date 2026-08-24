@@ -1,0 +1,10 @@
+{
+  "name": "DeltaNet",
+  "status": "passed-on-device",
+  "entry": "adapter:build_gdn_forward",
+  "path": "DeltaNet/adapter.py",
+  "variants": ["gated_delta_net", "deltanet", "linear_attention", "gated_delta", "delta_rule", "qwen3_next_gdn", "qwen3_5_gated_delta_net"],
+  "tolerances": {"fp32": 1.0e-5},
+  "backend": "native-pytorch-beta3",
+  "notes": "Qwen3.5 / Qwen3-Next Gated DeltaNet (gated delta-rule, per-head scalar log-decay) NKI kernels, vendored verbatim under gdn_src/ (Apache-2.0 per source repo README; see ./NOTICE) from HF kernels/jburtoft/qwen35-deltanet-tkg-full (v4). This is the PERF path replacing the reference-torch chunk_gated_delta_rule. Shape dispatch (adapter:build_gdn_forward): S==1 & cached -> deltanet_tkg_batched_bh (decode); S>=128 & S%128==0 -> deltanet_fused_chunked_fwd_batched (prefill perf, needs lower/identity/lower_diag masks built in-adapter); S<128 -> deltanet_recurrent_fwd[_state] (per-slice loop). Constraints: head_dim==128, gate per-head scalar log-decay<=0, chunk multiple 128, fp32, no group axis (GQA expanded before kernel). On-device validated on trn2 (nki 0.6.0): out cos 1.0 (chunked max_err ~3e-7, tkg ~1.5e-5), final_state cos 1.0. Injected via backends.kernel_inject. Harvest identity: 'GatedDeltaNet'."
+}

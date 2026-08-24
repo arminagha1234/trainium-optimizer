@@ -64,6 +64,8 @@ PRIMITIVE_TO_KERNEL: dict[str, str] = {
     "mamba2": "Mamba2",
     "ssm": "Mamba2",
     "selectivescan": "Mamba2",
+    "mamba2ssd": "Mamba2",         # mamba2_ssd (harvested SSD kernel, dir Mamba2)
+    "ssmscan": "Mamba2",           # ssm_scan
     # other linear-recurrent families the corpus covers
     "rwkv6": "RWKV6",
     "rwkv7": "RWKV7",
@@ -73,6 +75,8 @@ PRIMITIVE_TO_KERNEL: dict[str, str] = {
     "slstm": "sLSTM",
     "rglru": "RGLRU",
     "kda": "KDA",           # Kimi Delta Attention
+    "kimideltaattention": "KDA",           # kimi_delta_attention
+    "gateddeltalinearattention": "KDA",    # gated_delta_linear_attention (KDA path)
     "powerretention": "PowerRetention",
     # dense-attention variants that also need authored kernels
     "mla": "MLA",

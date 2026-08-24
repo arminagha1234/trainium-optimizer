@@ -1,0 +1,10 @@
+{
+  "name": "Mamba2",
+  "status": "passed-on-device",
+  "entry": "adapter:build_mamba2_forward",
+  "path": "Mamba2/adapter.py",
+  "variants": ["mamba2_ssd", "ssm_scan", "mamba2", "ssm", "selective_scan", "ssd"],
+  "tolerances": {"fp32": 1.0e-6},
+  "backend": "native-pytorch-beta3",
+  "notes": "Mamba-2 SSD (state-space-duality) selective-scan NKI kernel, referenced from the installed nkilib package (nkilib.experimental.scan.ssd; github.com/aws-neuron/nki-library) rather than vendored. Layouts x[B,H,L,P] dt[B,H,L] A[H] B/C[B,L,N] -> y[B,H,L,P]; adapter takes model-native mixer tensors x[B,L,H,P], dt[B,L,H], A[H], B/C[B,L,N]. Constraints: ngroups=1, dstate<=128, chunk<=128, seqlen % chunk == 0, fp32 scan. On-device validated on trn2 (neuronx-cc 2.27 / torch_xla 2.9): matches ssd_torch_ref to ~1e-7 (fp32-exact); a 2-layer Mamba-2 matched reference end-to-end at cosine 1.0. Injected output-as-return through backends.kernel_inject via adapter:build_mamba2_forward. Harvest identity: 'Mamba2SSD'."
+}

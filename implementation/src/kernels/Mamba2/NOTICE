@@ -1,0 +1,14 @@
+Mamba2 SSD kernel — provenance
+==============================
+
+The Mamba-2 SSD (state-space-duality) selective-scan kernel banked in this slot
+is NOT vendored into this repository. It is the ``ssd`` kernel from the AWS
+Neuron nki-library, referenced by import at run time:
+
+    module : nkilib.experimental.scan.ssd
+    source : https://github.com/aws-neuron/nki-library
+    install: provided by the ``nkilib`` package on the Trainium target box
+
+Registration mode: harvest-source-referenced (installed package). The adapter
+(adapter.py) imports the kernel lazily on-device; no kernel source is copied
+here. See kernel.json ``notes`` for the on-device validation record.
