@@ -507,6 +507,45 @@ def _attn_decode_inputs(S: int, d: int, seed: int) -> Inputs:
     }
 
 
+# ---- long-context flash attention (whole-sequence, streaming softmax) -------
+# Matches the on-device-validated flash_nki_opt kernel banked under
+# kernels/FlashAttention: q,k,v are (d_head, seqlen); the output is
+# (seqlen, d_head); scores are UNSCALED. This op is HARVEST-only (a real,
+# on-device-validated kernel exists in the registry), so it is deliberately NOT
+# in the built-in author catalog — there is no return-form recipe to invent it.
+def _flash_attention_reference(inp: Inputs) -> np.ndarray:
+    """Non-causal, unscaled flash attention. q,k,v [d_head, S]; out [S, d_head].
+    out = softmax(q^T @ k, axis=-1) @ v^T (numerically stabilized)."""
+    q, k, v = inp["q"], inp["k"], inp["v"]
+    scores = q.T @ k                                  # [S, S], unscaled
+    return _softmax(scores, axis=-1) @ v.T            # [S, d_head]
+
+
+def _flash_attention_inputs(S: int, d: int, seed: int) -> Inputs:
+    g = _rng(seed)
+    return {
+        "q": g.standard_normal((d, S)).astype(np.float32),
+        "k": g.standard_normal((d, S)).astype(np.float32),
+        "v": g.standard_normal((d, S)).astype(np.float32),
+    }
+
+
+def flash_attention_spec(seqlen: int = 2048, d_head: int = 128) -> OpSpec:
+    """OpSpec for the long-context flash-attention op the FlashAttention kernel
+    serves. ``primitive="flash_attention"`` so the invent engine's prior-art /
+    Harvest step REUSES the registered on-device kernel instead of authoring.
+    Not part of the built-in ``catalog()`` (harvest-only; no author recipe)."""
+    return OpSpec(
+        "flash_attention", "dense_causal_lm", f"flash-s{seqlen}-hd{d_head}", "bf16",
+        _flash_attention_reference,
+        lambda: _flash_attention_inputs(512, d_head, 21),
+        lambda: _flash_attention_inputs(seqlen, d_head, 22),
+        baseline="torch-eager SDPA (whole sequence)", origin="invented",
+        primitive="flash_attention",
+        notes="streaming online-softmax flash attention; handles S=8192 where "
+              "the dense compiler OOMs")
+
+
 # ---- bootstrap seeds -------------------------------------------------------
 def _rmsnorm_reference(inp: Inputs) -> np.ndarray:
     x = inp["x"]

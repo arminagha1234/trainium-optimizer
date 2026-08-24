@@ -77,6 +77,14 @@ PRIMITIVE_TO_KERNEL: dict[str, str] = {
     # dense-attention variants that also need authored kernels
     "mla": "MLA",
     "attentionsink": "AttentionSink",
+    # long-context flash attention — the streaming online-softmax kernel that
+    # never materializes [S,S] and is the ONLY path that runs S=8192 attention
+    # (the compiler OOMs on the dense form). On-device validated (rank 4).
+    "flashattention": "FlashAttention",
+    "flashattn": "FlashAttention",
+    "flash": "FlashAttention",
+    "longcontextattention": "FlashAttention",
+    "attentionlongcontext": "FlashAttention",
 }
 
 

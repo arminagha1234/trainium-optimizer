@@ -1,0 +1,10 @@
+{
+  "name": "FlashAttention",
+  "status": "passed-on-device",
+  "entry": "adapter:build_flash_forward",
+  "path": "FlashAttention/adapter.py",
+  "variants": ["flash_attention", "attention_long_context", "flash_fwd", "flash_fwd_fp32", "flash_fwd_causal"],
+  "tolerances": {"bf16": 1.0e-2},
+  "backend": "native-pytorch-beta3",
+  "notes": "Streaming online-softmax flash-attention NKI kernel (never materializes [S,S]); the only path that handles S=8192 attention (the compiler OOMs on dense). Layout q,k,v=(d_head,seqlen), out=(seqlen,d_head), UNSCALED scores. Entries: flash_fwd (bf16 non-causal), flash_fwd_fp32, flash_fwd_causal (bf16 + causal). On-device validated at S=2048/4096/8192; bf16 tracks the bf16 incumbent to ~1e-2 max_abs_err and matches its fp32-miss count (the framework's fair correctness bar). Invoked output-as-arg via torch_neuronx.nki_jit; injected through backends.kernel_inject via adapter:build_flash_forward."
+}
