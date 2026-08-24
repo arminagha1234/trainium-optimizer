@@ -413,6 +413,35 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001 — never let the unblock crash a run
         _log(f"moe-router-patch: skipped ({e!r})")
 
+    # QWEN3-NEXT / Qwen3.5 (GatedDeltaNet-MoE) FULL rewrite bundle. The int64
+    # topk patch above only clears the AwsNeuronTopK dtype crash (NCC_EVRF013);
+    # the Qwen3-Next arch needs THREE MORE pure graph rewrites to both COMPILE
+    # and be numerically CORRECT — none of which the dtype patch supplies:
+    #   1. sort-free iterative-argmax router  -> clears NCC_EVRF029 (`sort` op,
+    #      which the int64->fp32 dtype trick does NOT help);
+    #   2. tril->const-mask in the GatedDeltaNet chunk rule -> clears NCC_IINAR001
+    #      (TensorScalarAffineSelect s2d2_ts_as_valid_elem_count);
+    #   3. sort-free static-shape DENSE expert dispatch -> fixes the grouped-MoE
+    #      NUMERICAL break (HF's expert path is cosine ~0.75 wrong on trn2 even
+    #      after it compiles).
+    # Proven on-device (arch-proof): compiles ~92s, cosine 0.998 vs CPU-bf16.
+    # See backends/qwen3_next_rewrites.py + kernel_rewrites.py entries
+    # topk-sort-to-argmax / tril-to-const-mask / dense-moe-static-dispatch.
+    # Gated to the qwen3_next arch so no other model is touched.
+    try:
+        try:
+            from backends.qwen3_next_rewrites import (
+                install_qwen3_next_neuron_rewrites, is_qwen3_next_arch)
+        except Exception:  # noqa: BLE001
+            import os as _os, sys as _sys
+            _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+            from backends.qwen3_next_rewrites import (
+                install_qwen3_next_neuron_rewrites, is_qwen3_next_arch)
+        if is_qwen3_next_arch(cfg):
+            install_qwen3_next_neuron_rewrites(_log)
+    except Exception as e:  # noqa: BLE001 — never let the unblock crash a run
+        _log(f"qwen3-next-rewrites: skipped ({e!r})")
+
     # Stage-3 BORROW: optionally swap the HF MoE block forward with the vendored
     # fused NKI megakernel. The adapter runs a full precondition gauntlet (arch,
     # exact A3B/TP4 dims, nkilib availability) and NEVER raises — on any unmet

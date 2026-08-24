@@ -137,6 +137,53 @@ REWRITES: tuple[Rewrite, ...] = (
                  "~56MB NEFF). This, not .tril, was the load-bearing full-model blocker.",
     ),
     Rewrite(
+        name="dense-moe-static-dispatch",
+        summary="Replace HF's data-dependent grouped-MoE expert dispatch with a "
+                "sort-free static-shape DENSE dispatch (compute every expert, "
+                "weight by a scattered gate) — the grouped path is numerically "
+                "WRONG on trn2 even after it compiles.",
+        # CORRECTNESS symptom, not a compile abort: after the router/tril rewrites
+        # the model COMPILES but its logits diverge. Indexed by the offending
+        # op/source names so match_ops (graph inspection) and an equivalence-gate
+        # failure log ("moe"/"grouped_mm"/"cosine") both route here. These
+        # signatures are disjoint from the compile-error entries above.
+        error_signatures=(
+            "grouped_mm_experts_forward",
+            "grouped_mm",
+            "Qwen3NextExperts",
+            "moe-correctness",
+        ),
+        hostile_ops=(
+            "aten::index_add_", "aten::nonzero", "aten::one_hot",
+            "grouped_mm", "_grouped_mm", "aten::histc", "aten::bincount",
+        ),
+        fix=(
+            "# NOT a compile abort — a CORRECTNESS break. HF's Qwen3NextExperts /\n"
+            "# moe.py expert path (one_hot/nonzero/where/index_add_, or\n"
+            "# sort+histc+grouped_mm) is data-dependent AND numerically wrong on\n"
+            "# trn2 (cosine ~0.75). Replace it with a dense, static-shape dispatch:\n"
+            "gate_full = torch.zeros(T, E, device=x.device, dtype=w.dtype)\n"
+            "gate_full = gate_full.scatter(1, top_k_index, top_k_weights)  # (T,E)\n"
+            "out = torch.zeros_like(x)\n"
+            "for e in range(E):                       # every expert, every token\n"
+            "    g, u = F.linear(x, gate_up_proj[e]).chunk(2, dim=-1)\n"
+            "    h = F.linear(act_fn(g) * u, down_proj[e])\n"
+            "    out = out + h * gate_full[:, e:e+1]  # 0 for non-selected experts\n"
+            "# Same math as top-k routing; no sort/topk/nonzero/grouped_mm; static\n"
+            "# shapes (C8 host-dispatch friendly). Exact on CPU (maxdiff 0)."
+        ),
+        applies_at="model-graph",
+        confidence="high",
+        evidence="Qwen3-Next/Qwen3.5 (GatedDeltaNet-MoE) tiny arch-proof on trn2 "
+                 "(neuronx-cc 2.27.5334, transformers 5.15.0): after the sort-free "
+                 "router + tril->const-mask rewrites the model COMPILED but was "
+                 "numerically wrong (cosine ~0.75), isolated to the MoE expert path "
+                 "(full + linear attention were both correct in isolation, cosine "
+                 "0.99998/0.99999). Dense dispatch -> cosine 0.99793 vs CPU-bf16, "
+                 "top-1 14/16 (the bf16 noise floor). Wired in "
+                 "backends/qwen3_next_rewrites.install_qwen3_next_neuron_rewrites.",
+    ),
+    Rewrite(
         name="dynamic-slice-to-static-bucket",
         summary="Replace a data-dependent (dynamic) slice length with a static, "
                 "bucketed shape padded on the host.",
