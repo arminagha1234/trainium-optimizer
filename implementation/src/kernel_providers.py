@@ -104,14 +104,18 @@ class EmptyCompletion(RuntimeError):
 _ENTRY_IN_PROMPT_RE = re.compile(r"\bdef\s+(\w+_kernel)\b")
 
 
-def echo_complete_fn(prompt: str) -> str:
+def echo_complete_fn(prompt: str, **_: object) -> str:
     """Deterministic, offline ``complete_fn``.
 
     Emits a single lint-clean ``@nki.jit`` stub whose entry name matches the
     ``<op>_kernel`` the prompt asks for (``build_author_prompt`` writes an
     ``entry naming: define ``@nki.jit def <op>_kernel(...)``` line), so the
     result round-trips through ``extract_nki_source`` / ``extract_entry`` into a
-    well-formed ``AuthoredKernel``. No network, no randomness — safe for CI."""
+    well-formed ``AuthoredKernel``. No network, no randomness — safe for CI.
+
+    Accepts (and ignores) arbitrary kwargs so a caller passing the new
+    ``max_tokens_override=`` kwarg (for op-aware budget bumps) never breaks the
+    offline stub — echo has no cap to bump."""
     m = _ENTRY_IN_PROMPT_RE.search(prompt or "")
     entry = m.group(1) if m else "echo_kernel"
     return (
@@ -217,7 +221,15 @@ def bedrock_complete_fn(model_id: str = "anthropic.claude-opus-5",
     — leaving zero ``text`` blocks. A response that still comes back with
     ``stop_reason == "max_tokens"`` and no text raises ``EmptyCompletion`` rather
     than silently returning an empty authored source.
-    """
+
+    OP-AWARE BUDGET (BUG #3, closes the attention token wall — 2026-08-25): the
+    returned callable accepts an optional ``max_tokens_override=`` kwarg at
+    CALL time. This is the plumbing ``LLMAuthor`` uses to spend MORE tokens on
+    hard ops (attention / matmul / scan) that regularly exhaust the 32k default
+    on their thinking pass, while leaving cheap ops (elementwise / reduction)
+    at the factory default. When ``max_tokens_override`` is ``None`` (or absent
+    — legacy callers) the factory ``max_tokens`` is used, so this change is
+    fully backward-compatible."""
     try:
         import boto3  # noqa: PLC0415 — lazy so the module imports without boto3
         from botocore.config import Config as _BotoConfig  # noqa: PLC0415
@@ -242,15 +254,20 @@ def bedrock_complete_fn(model_id: str = "anthropic.claude-opus-5",
     client = boto3.client("bedrock-runtime", region_name=resolved_region,
                           config=boto_config)
 
-    def _complete(prompt: str) -> str:
-        body = _messages_body(prompt, max_tokens, temperature, include_version=True)
+    def _complete(prompt: str, *, max_tokens_override: int | None = None) -> str:
+        # Per-call override lets LLMAuthor budget hard ops (attention, matmul,
+        # scan) more tokens than the factory default without rebuilding the
+        # client. ``None`` (default) uses the factory value — legacy callers
+        # and existing tests are unaffected.
+        effective = max_tokens_override if max_tokens_override else max_tokens
+        body = _messages_body(prompt, effective, temperature, include_version=True)
         resp = client.invoke_model(modelId=model_id, body=json.dumps(body))
         raw = resp["body"].read()
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode("utf-8")
         payload = json.loads(raw)
         text = _text_from_content(payload.get("content", []))
-        return _guard_empty_completion(text, payload.get("stop_reason"), max_tokens)
+        return _guard_empty_completion(text, payload.get("stop_reason"), effective)
 
     return _complete
 
@@ -274,7 +291,12 @@ def anthropic_complete_fn(model: str = "claude-opus-5",
     The client is constructed with a 600s ``timeout`` and 3 ``max_retries`` (same
     spirit as the Bedrock read-timeout fix — a thinking model's long generation
     exceeds the SDK's short default) when the installed SDK accepts those kwargs;
-    it degrades to the default client if it does not."""
+    it degrades to the default client if it does not.
+
+    OP-AWARE BUDGET (BUG #3, 2026-08-25): the returned callable accepts an
+    optional ``max_tokens_override=`` kwarg at CALL time — the plumbing
+    ``LLMAuthor`` uses to spend more tokens on hard ops (attention / matmul /
+    scan) that exhaust the default. Mirror of the Bedrock adapter."""
     try:
         import anthropic  # noqa: PLC0415 — lazy so the module imports without anthropic
     except ImportError as exc:  # pragma: no cover - exercised via make_complete_fn test
@@ -289,15 +311,17 @@ def anthropic_complete_fn(model: str = "claude-opus-5",
     except TypeError:  # pragma: no cover - very old SDK without these kwargs
         client = anthropic.Anthropic()
 
-    def _complete(prompt: str) -> str:
+    def _complete(prompt: str, *, max_tokens_override: int | None = None) -> str:
+        # Per-call override: same op-aware-budget lever as the Bedrock provider.
+        effective = max_tokens_override if max_tokens_override else max_tokens
         resp = client.messages.create(
             model=model,
-            max_tokens=max_tokens,
+            max_tokens=effective,
             system=KERNEL_AUTHORING_PREAMBLE,
             messages=[{"role": "user", "content": prompt}],
         )
         text = _text_from_content(resp.content)
-        return _guard_empty_completion(text, getattr(resp, "stop_reason", None), max_tokens)
+        return _guard_empty_completion(text, getattr(resp, "stop_reason", None), effective)
 
     return _complete
 

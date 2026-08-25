@@ -56,6 +56,70 @@ try:
 except Exception:  # noqa: BLE001 — never let prompt-building fail on retrieval
     knowledge_for_prompt = None
 
+# Op-family classifier (same one that drives the retrieved knowledge section) —
+# reused here to decide the AUTHORING BUDGET for an op. Guarded like
+# knowledge_for_prompt above: if the module is missing, every op is treated as
+# NORMAL (default budget), so authoring never fails on the import.
+try:
+    from nki_knowledge import classify_op as _classify_op
+except Exception:  # noqa: BLE001
+    _classify_op = None
+
+
+# ---------------------------------------------------------------------------
+# Op-aware AUTHORING BUDGET (BUG #3 — the attention token wall, 2026-08-25).
+# ---------------------------------------------------------------------------
+# The Bedrock/Anthropic Opus-5 completion is an ADAPTIVE-THINKING model: it
+# spends tokens on a hidden `thinking` block BEFORE writing any `text`. For
+# hard ops (attention, matmul, scan) with a ~7 KiB enriched-knowledge prompt
+# the default 32k cap was fully consumed by thinking, leaving stop_reason=
+# 'max_tokens' + zero text → `EmptyCompletion` and a dead round (observed on
+# attn_decode, self-improve loop, main ef109764: "Attention hit a TOKEN-BUDGET
+# wall (EmptyCompletion: 32k thinking exhausted, worsened by ~7.2k-char
+# enriched prompt) not a skill wall").
+#
+# Two levers, both keyed off the op family:
+#   HARD ops → bump the model's max_tokens to _HARD_MAX_TOKENS AND trim the
+#              retrieved knowledge section to _HARD_MAX_EXAMPLES (drop the
+#              second worked example, save ~1-2 KiB of prompt so more of the
+#              raised budget is spent on the answer rather than digesting the
+#              prompt).
+#   Other ops → keep the provider factory default and the 2-example knowledge
+#               section — they compile without the extra headroom and the
+#               second example is a proven correctness lever there.
+#
+# HARD is `attention`, `matmul`, `scan` — the three families whose kernels
+# hinge on nc_matmul and whose worked examples are the largest (attention
+# alone is a full flash-attention idiom; scan is the SSD chunked scan). Every
+# other family (elementwise / reduction / normalization / softmax / moe_router)
+# has never hit the token wall in practice.
+_HARD_OP_FAMILIES: frozenset[str] = frozenset({"attention", "matmul", "scan"})
+_HARD_MAX_TOKENS: int = 48000
+_HARD_MAX_EXAMPLES: int = 1
+_DEFAULT_MAX_EXAMPLES: int = 2
+
+
+def op_budget(spec: OpSpec) -> tuple[int | None, int]:
+    """Return ``(max_tokens_override, max_examples)`` for authoring this op.
+
+    ``max_tokens_override`` is ``None`` for a NORMAL op — the LLM provider uses
+    its factory default (32k). ``_HARD_MAX_TOKENS`` for a HARD op family
+    (attention / matmul / scan) that needs more headroom for its thinking pass.
+
+    ``max_examples`` controls how many worked-example snippets ``nki_knowledge``
+    embeds — trimmed to 1 for hard ops so the raised budget is spent on the
+    author's answer, kept at 2 (the pre-fix default) for everything else."""
+    if _classify_op is None:
+        return None, _DEFAULT_MAX_EXAMPLES
+    try:
+        fam = _classify_op(spec.name, family=getattr(spec, "family", None),
+                           notes=getattr(spec, "notes", None))
+    except Exception:  # noqa: BLE001 — a classifier failure must not break authoring
+        return None, _DEFAULT_MAX_EXAMPLES
+    if fam in _HARD_OP_FAMILIES:
+        return _HARD_MAX_TOKENS, _HARD_MAX_EXAMPLES
+    return None, _DEFAULT_MAX_EXAMPLES
+
 
 # ---------------------------------------------------------------------------
 # the seam
@@ -304,7 +368,8 @@ def _op_input_order(spec: OpSpec) -> list[str] | None:
     return list(inp.keys()) or None
 
 
-def _knowledge_section(spec: OpSpec, include_knowledge: bool) -> str:
+def _knowledge_section(spec: OpSpec, include_knowledge: bool,
+                       max_examples: int = _DEFAULT_MAX_EXAMPLES) -> str:
     """The op-aware "Relevant verified techniques & worked examples" block from
     ``nki_knowledge`` — the RETRIEVAL that makes the standing preamble op-specific
     (an attention op gets flash/online-softmax examples; a reduction gets
@@ -312,11 +377,15 @@ def _knowledge_section(spec: OpSpec, include_knowledge: bool) -> str:
 
     Returns "" when disabled (``include_knowledge=False``, the pre-enrichment
     baseline used by the A/B measurement) or when the knowledge module is
-    unavailable, so the rest of the prompt is byte-identical to before."""
+    unavailable, so the rest of the prompt is byte-identical to before.
+
+    ``max_examples`` bounds how many worked-example snippets the section embeds
+    (default 2). Trimmed to 1 for hard ops by ``LLMAuthor.author`` to save ~1-2
+    KiB of prompt on the attention/matmul/scan path where the token wall bites."""
     if not include_knowledge or knowledge_for_prompt is None:
         return ""
     try:
-        section = knowledge_for_prompt(spec)
+        section = knowledge_for_prompt(spec, max_examples=max_examples)
     except Exception:  # noqa: BLE001 — retrieval must never break authoring
         return ""
     return f"{section}\n\n" if section else ""
@@ -325,7 +394,8 @@ def _knowledge_section(spec: OpSpec, include_knowledge: bool) -> str:
 def build_author_prompt(spec: OpSpec, lessons: list | None,
                         feedback: list[Feedback] | None,
                         perf_feedback: list | None = None,
-                        *, include_knowledge: bool = True) -> str:
+                        *, include_knowledge: bool = True,
+                        max_examples: int = _DEFAULT_MAX_EXAMPLES) -> str:
     """Assemble the authoring prompt from the NKI preamble, the OP-AWARE retrieved
     knowledge (verified techniques + worked examples for this op family), the op
     spec, the retrieved bank lessons, and the prior-round compiler errors + matched
@@ -337,7 +407,13 @@ def build_author_prompt(spec: OpSpec, lessons: list | None,
     ``include_knowledge`` (keyword-only, default True) gates the retrieved
     knowledge section. It defaults ON — every real authoring call is enriched.
     Passing ``False`` reproduces the pre-enrichment prompt EXACTLY, which is how
-    the before/after on-device measurement isolates the retrieval's effect."""
+    the before/after on-device measurement isolates the retrieval's effect.
+
+    ``max_examples`` (keyword-only, default 2) trims the worked-example count
+    embedded in the knowledge section. ``LLMAuthor.author`` sets this to 1 for
+    hard ops (attention / matmul / scan) — the two-example default is preserved
+    for everything else so every existing test that does not pass this kwarg
+    reads a byte-identical prompt."""
     inputs = _op_input_order(spec)
     if inputs:
         inputs_line = ", ".join(inputs)
@@ -348,7 +424,7 @@ def build_author_prompt(spec: OpSpec, lessons: list | None,
     return (
         f"{_NKI_PREAMBLE}\n"
         f"{_PERF_PREAMBLE}\n"
-        f"{_knowledge_section(spec, include_knowledge)}"
+        f"{_knowledge_section(spec, include_knowledge, max_examples=max_examples)}"
         f"## Op to author\n"
         f"  name        : {spec.name}\n"
         f"  entry naming: define `@nki.jit def {sig_hint}`\n"
@@ -442,18 +518,55 @@ class LLMAuthor:
                  build_prompt: Callable[..., str] = build_author_prompt) -> None:
         self._complete = complete_fn
         self._build_prompt = build_prompt
+        # Cache the once-per-instance decision of whether ``complete_fn`` accepts
+        # the ``max_tokens_override=`` kwarg the real providers now expose. Real
+        # bedrock/anthropic complete_fns accept it; tests / legacy code inject a
+        # bare ``lambda prompt: "..."`` which does NOT. Detected via TypeError on
+        # the first call, memoized so we do not pay the fallback cost each round.
+        self._complete_accepts_override: bool | None = None
+
+    def _call_complete(self, prompt: str,
+                       max_tokens_override: int | None) -> str:
+        """Call the injected ``complete_fn`` with (or without) ``max_tokens_override``.
+
+        Backward-compat plumbing: real providers accept the override; a legacy
+        callable of signature ``(prompt) -> str`` does not. We try the override
+        form first (once) and fall back on ``TypeError``, then remember the
+        decision. When ``max_tokens_override`` is ``None`` there is nothing to
+        pass, so we call the plain form directly."""
+        if max_tokens_override is None:
+            return self._complete(prompt)
+        if self._complete_accepts_override is False:
+            return self._complete(prompt)
+        try:
+            out = self._complete(prompt, max_tokens_override=max_tokens_override)
+            self._complete_accepts_override = True
+            return out
+        except TypeError:
+            # Legacy complete_fn without the override kwarg — fall back and
+            # remember so we do not re-raise TypeError next round.
+            self._complete_accepts_override = False
+            return self._complete(prompt)
 
     def author(self, spec: OpSpec, lessons: list | None = None,
                feedback: list[Feedback] | None = None,
                perf_feedback: list | None = None) -> AuthoredKernel:
-        prompt = self._build_prompt(spec, lessons, feedback, perf_feedback)
-        completion = self._complete(prompt)
+        # Op-aware budget: hard ops (attention / matmul / scan) get MORE
+        # completion tokens and FEWER worked-example snippets in the enriched
+        # section — the two levers that close the attention token wall. See
+        # ``op_budget`` for the classification.
+        max_tokens_override, max_examples = op_budget(spec)
+        prompt = self._build_prompt(spec, lessons, feedback, perf_feedback,
+                                    max_examples=max_examples)
+        completion = self._call_complete(prompt, max_tokens_override)
         nki_src = extract_nki_source(completion)
         entry = extract_entry(nki_src)
         rounds = len(feedback or [])
+        budget_note = (f", max_tokens={max_tokens_override}" if max_tokens_override
+                       else "")
         notes = (f"LLM-authored via injected complete_fn "
                  f"(provider-agnostic); repair round {rounds + 1}, "
-                 f"{len(lessons or [])} lesson(s) consulted")
+                 f"{len(lessons or [])} lesson(s) consulted{budget_note}")
         return AuthoredKernel(
             op=spec.name,
             origin="invented",
