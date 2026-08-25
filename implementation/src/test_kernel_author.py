@@ -28,9 +28,13 @@ from invent_kernels import OpSpec, author_kernel, catalog, WRITE_NEW_OPS
 from kernel_author import (
     LLMAuthor,
     RecipeAuthor,
+    _HARD_MAX_EXAMPLES,
+    _HARD_MAX_TOKENS,
+    _DEFAULT_MAX_EXAMPLES,
     build_author_prompt,
     extract_entry,
     extract_nki_source,
+    op_budget,
 )
 from kernel_repair import CompileResult, Feedback
 from kernel_rewrites import match_error
@@ -389,6 +393,125 @@ def test_perf_preamble_is_ordered_after_correctness_preamble():
     assert _NKI_PREAMBLE.strip() in prompt
     assert _PERF_PREAMBLE.strip() in prompt
     assert prompt.index(_NKI_PREAMBLE[:40]) < prompt.index(_PERF_PREAMBLE[:40])
+
+
+# ---------------------------------------------------------------------------
+# BUG #3 — op-aware AUTHORING BUDGET (the attention token wall).
+# The prior state (main ef109764): every op used the provider default 32k
+# max_tokens AND 2 worked examples. On attention Opus-5's adaptive-thinking
+# consumed the whole 32k before any answer — stop_reason='max_tokens', no
+# text, EmptyCompletion. The fix: hard ops (attention / matmul / scan) get
+# more tokens AND fewer worked-example snippets in the enriched section.
+# ---------------------------------------------------------------------------
+def test_op_budget_bumps_hard_ops():
+    # Attention is the observed wall; matmul + scan share the same failure
+    # mode (nc_matmul, large worked examples). All three op FAMILIES must be
+    # classified HARD → (48000, 1). Attention has a catalog spec; matmul and
+    # scan don't, so a lightweight OpSpec-shaped stand-in is used — op_budget
+    # reads only .name / .family / .notes via getattr.
+    from types import SimpleNamespace
+    hard_cases = [
+        catalog()["attn_decode"],                                # attention
+        SimpleNamespace(name="qkv_proj", family="", notes=""),   # matmul
+        SimpleNamespace(name="ssd_scan", family="", notes=""),   # scan
+        SimpleNamespace(name="gated_delta_net", family="",
+                        notes="linear-attention chunked scan"),  # scan (via notes)
+    ]
+    for spec in hard_cases:
+        override, examples = op_budget(spec)
+        assert override == _HARD_MAX_TOKENS, (spec.name, override)
+        assert examples == _HARD_MAX_EXAMPLES, (spec.name, examples)
+
+
+def test_op_budget_leaves_easy_ops_at_default():
+    # Elementwise / normalization / softmax / reduction must NOT get the bump
+    # (they compile inside the 32k default and the 2nd worked example is a
+    # proven correctness lever). Override is None so the provider's factory
+    # default is used unchanged.
+    for name in ("softcap", "rmsnorm", "softmax", "gelu_tanh"):
+        spec = catalog()[name]
+        override, examples = op_budget(spec)
+        assert override is None, (name, override)
+        assert examples == _DEFAULT_MAX_EXAMPLES, (name, examples)
+
+
+def test_prompt_trims_examples_for_hard_op():
+    # A hard op prompt (max_examples=1) must be STRICTLY smaller than the same
+    # op prompt with the default 2 examples — the trim is real, not a no-op.
+    spec = catalog()["attn_decode"]
+    trimmed = build_author_prompt(spec, lessons=None, feedback=None,
+                                  max_examples=_HARD_MAX_EXAMPLES)
+    full = build_author_prompt(spec, lessons=None, feedback=None,
+                               max_examples=_DEFAULT_MAX_EXAMPLES)
+    assert len(trimmed) < len(full), (len(trimmed), len(full))
+    # The trim only drops the SECOND example — the first must still be there
+    # (the retrieved section is still the load-bearing skill lever).
+    assert "Relevant verified techniques & worked examples" in trimmed
+    assert "Worked example(s)" in trimmed
+
+
+def test_prompt_default_max_examples_matches_previous_behavior():
+    # A prompt without an explicit max_examples must be byte-identical to one
+    # passing the previous default (2) — every existing test that does not
+    # touch this kwarg reads the same string it always did.
+    spec = catalog()["softcap"]
+    implicit = build_author_prompt(spec, lessons=None, feedback=None)
+    explicit = build_author_prompt(spec, lessons=None, feedback=None,
+                                   max_examples=_DEFAULT_MAX_EXAMPLES)
+    assert implicit == explicit
+
+
+def test_llm_author_passes_max_tokens_override_for_attention(tmp_path):
+    # The wire: LLMAuthor.author on a HARD op MUST invoke complete_fn with the
+    # max_tokens_override kwarg set to _HARD_MAX_TOKENS. A mock complete_fn
+    # that captures its call args proves the plumbing end-to-end.
+    seen: dict = {}
+
+    def _capture_complete(prompt: str, *, max_tokens_override: int | None = None) -> str:
+        seen["prompt"] = prompt
+        seen["max_tokens_override"] = max_tokens_override
+        return "```python\n@nki.jit\ndef attn_decode_kernel(q, k, v):\n    return v\n```"
+
+    author = LLMAuthor(_capture_complete)
+    author.author(catalog()["attn_decode"])
+    assert seen["max_tokens_override"] == _HARD_MAX_TOKENS
+
+
+def test_llm_author_no_override_for_elementwise(tmp_path):
+    # Symmetric: an easy op must NOT set max_tokens_override — the provider
+    # factory default (32k) applies. LLMAuthor calls the bare positional form
+    # because there is no override to pass.
+    seen: dict = {"called_with_override": False}
+
+    def _capture_complete(prompt: str, *, max_tokens_override: int | None = None) -> str:
+        if max_tokens_override is not None:
+            seen["called_with_override"] = True
+        return "```python\n@nki.jit\ndef softcap_kernel(x):\n    return x\n```"
+
+    author = LLMAuthor(_capture_complete)
+    author.author(catalog()["softcap"])
+    assert seen["called_with_override"] is False
+
+
+def test_llm_author_legacy_complete_fn_still_works(tmp_path):
+    # Backward-compat: a legacy complete_fn of signature `(prompt) -> str` must
+    # STILL WORK on hard ops. LLMAuthor detects the TypeError on the override
+    # form and falls back to the plain positional call — no crash, no missed
+    # authoring round. Simulates every existing mock in this test file.
+    calls: list = []
+
+    def _legacy_complete(prompt: str) -> str:  # NO max_tokens_override kwarg
+        calls.append(prompt)
+        return "```python\n@nki.jit\ndef attn_decode_kernel(q, k, v):\n    return v\n```"
+
+    author = LLMAuthor(_legacy_complete)
+    got = author.author(catalog()["attn_decode"])  # HARD op → tries override first
+    assert len(calls) == 1                          # fell back cleanly, no retry-storm
+    assert got.entry == "attn_decode_kernel"
+    # Second hard-op call: decision is cached, so no TypeError is raised even
+    # once — the fallback fires immediately (still exactly ONE upstream call).
+    author.author(catalog()["attn_decode"])
+    assert len(calls) == 2
 
 
 # ===========================================================================

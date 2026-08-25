@@ -398,6 +398,102 @@ def test_system_preamble_contains_performance_rules():
     assert "reciprocal" in low
 
 
+# ---------------------------------------------------------------------------
+# BUG #3 — the completion function accepts a per-call max_tokens_override so
+# LLMAuthor can spend MORE tokens on hard ops (attention/matmul/scan) that
+# would otherwise exhaust the factory 32k default on Opus-5's thinking pass.
+# ---------------------------------------------------------------------------
+def test_bedrock_complete_fn_accepts_max_tokens_override(monkeypatch):
+    # An override at CALL time replaces the factory default in the request body
+    # AND is honored by the empty-completion guard (the error message names the
+    # actually-used cap, not the factory value).
+    sink: dict = {}
+    _install_fake_boto3(monkeypatch, sink)
+    fn = bedrock_complete_fn(temperature=None, max_tokens=32000)
+    fn("hi def x_kernel(", max_tokens_override=48000)
+    assert sink["body"]["max_tokens"] == 48000
+
+
+def test_bedrock_complete_fn_defaults_when_override_is_none(monkeypatch):
+    # No override → the factory default is used verbatim. Guarantees the
+    # override is opt-in and does not silently change existing behavior.
+    sink: dict = {}
+    _install_fake_boto3(monkeypatch, sink)
+    fn = bedrock_complete_fn(temperature=None, max_tokens=32000)
+    fn("hi def x_kernel(")
+    assert sink["body"]["max_tokens"] == 32000
+
+
+def test_bedrock_override_reflected_in_empty_completion_error(monkeypatch):
+    # When the thinking budget is exhausted at the OVERRIDDEN cap, the raised
+    # EmptyCompletion must name that cap (so a human reading the error knows
+    # the raised budget still was not enough — the fix is bump higher, not the
+    # already-raised 48k).
+    sink: dict = {}
+    _install_fake_boto3_maxtokens(monkeypatch, sink)
+    fn = bedrock_complete_fn(temperature=None, max_tokens=32000)
+    try:
+        fn("author me def attn_decode_kernel(", max_tokens_override=48000)
+    except EmptyCompletion as exc:
+        assert "48000" in str(exc)
+        # And the raised body actually carried 48000, not 32000.
+        assert sink["body"]["max_tokens"] == 48000
+    else:
+        raise AssertionError("expected EmptyCompletion at the overridden cap")
+
+
+def test_anthropic_complete_fn_accepts_max_tokens_override(monkeypatch):
+    # Mirror of the Bedrock test on the anthropic SDK path. The captured request
+    # body's max_tokens is the OVERRIDE, not the factory default.
+    seen: dict = {}
+
+    class _Messages:
+        def create(self, **kw):
+            seen.update(kw)
+
+            class _R:
+                stop_reason = "end_turn"
+                content = [{"type": "text", "text": _FAKE_NKI}]
+
+            return _R()
+
+    class _Anthropic:
+        def __init__(self, *a, **k):
+            self.messages = _Messages()
+
+    fake = types.ModuleType("anthropic")
+    fake.Anthropic = _Anthropic
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+
+    fn = anthropic_complete_fn(max_tokens=32000)
+    fn("author me a kernel", max_tokens_override=48000)
+    assert seen["max_tokens"] == 48000
+
+    fn("author me a kernel")            # no override → default
+    assert seen["max_tokens"] == 32000
+
+
+def test_echo_ignores_max_tokens_override():
+    # echo is offline and has no cap to bump — the extra kwarg must not break it.
+    out = echo_complete_fn("author me def softcap_kernel(",
+                           max_tokens_override=48000)
+    assert "@nki.jit" in out
+    assert "softcap_kernel" in out
+
+
+def test_llm_author_end_to_end_bumps_bedrock_max_tokens_for_attention(monkeypatch):
+    # End-to-end: LLMAuthor + bedrock_complete_fn on a HARD op sends max_tokens
+    # = _HARD_MAX_TOKENS in the invoke_model body — the whole plumbing wires up.
+    from kernel_author import _HARD_MAX_TOKENS  # noqa: PLC0415 — local to keep the pubsurface stable
+    sink: dict = {}
+    _install_fake_boto3(monkeypatch, sink)
+
+    author = LLMAuthor(bedrock_complete_fn(temperature=None))
+    author.author(catalog()["attn_decode"], lessons=None, feedback=None)
+
+    assert sink["body"]["max_tokens"] == _HARD_MAX_TOKENS
+
+
 # ===========================================================================
 # standalone runner (no pytest required)
 # ===========================================================================
