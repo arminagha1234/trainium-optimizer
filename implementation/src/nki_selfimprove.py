@@ -49,6 +49,7 @@ engine measured.
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 import time
@@ -98,6 +99,31 @@ def approach_signature(nki_src: str) -> str:
     """One-line signature of the fingerprint (for prompts / logs)."""
     fp = approach_fingerprint(nki_src)
     return ",".join(fp) if fp else "(empty)"
+
+
+# A candidate whose source overlaps the winning template by LESS than this
+# ratio is treated as a from-scratch REWRITE, not a refinement. Tuned so a
+# real refinement (change one line inside the template) scores ~0.9+ while a
+# structurally-different kernel scores well below — see refinement_ratio.
+_REFINEMENT_MIN_RATIO = 0.6
+
+
+def refinement_ratio(candidate_src: str, best_src: str) -> float:
+    """How much of the WINNING template ``best_src`` the ``candidate_src`` kept
+    — 1.0 = identical, →0.0 = a from-scratch rewrite. A cheap, deterministic
+    ``difflib`` line-similarity ratio (stdlib, no deps).
+
+    Used by the loop to tell a REFINEMENT (the author edited one thing inside
+    the winning structure — the desired behavior once a correct kernel exists)
+    from an OVER-EXPLORING REWRITE (the author threw the winner away and started
+    over, which — since the loop discards any regression — can only waste an
+    iteration). Returns 0.0 when either side is empty (no template to refine
+    against ⇒ nothing to over-explore against)."""
+    a = (candidate_src or "").strip()
+    b = (best_src or "").strip()
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a.splitlines(), b.splitlines()).ratio()
 
 
 def source_excerpt(nki_src: str, max_lines: int = 14) -> str:
@@ -196,6 +222,11 @@ class OpLesson:
     rounds_to_correct: int | None = None    # 1-based iter of FIRST correct kernel
     first_iter_compiled: bool | None = None
     n_attempts: int = 0
+    # How many times the author REWROTE from scratch (low overlap with the
+    # winning template) while a correct best already existed and the rewrite did
+    # NOT beat it — i.e. wasted an iteration over-exploring. Drives the escalating
+    # refinement pressure in render_for_prompt. See refinement_ratio.
+    rewrites_despite_winner: int = 0
     failed_approaches: list[dict] = field(default_factory=list)
     iterations: list[dict] = field(default_factory=list)
     updated: str = ""
@@ -232,6 +263,25 @@ class OpLesson:
                 f"speed will be DISCARDED and this {self.best_speedup:.3f}x "
                 f"kernel kept, so a rewrite can only cost you an iteration."
             )
+            # ESCALATION: the plain keep-winner bias above is not always enough —
+            # the author keeps rewriting from scratch (measured over-exploration).
+            # Once that has happened, make the constraint HARD and name the count,
+            # so the model treats "return the template with one localized edit" as
+            # the actual task, not a suggestion.
+            if self.rewrites_despite_winner > 0:
+                n = self.rewrites_despite_winner
+                times = "once" if n == 1 else f"{n} times"
+                lines.append(
+                    f"    ⚠ OVER-EXPLORATION WARNING: you have already REWRITTEN "
+                    f"this kernel from scratch {times} while this correct "
+                    f"{self.best_speedup:.3f}x kernel existed — every one was "
+                    f"DISCARDED and wasted an iteration. Do NOT do it again. Return "
+                    f"the winning template below VERBATIM except for ONE small, "
+                    f"localized edit (a single line / constant / tile size). A "
+                    f"structurally-different kernel is a wasted round and will be "
+                    f"thrown away — editing the template is the ONLY move that can "
+                    f"improve your score."
+                )
             lines.append(
                 f"    YOUR TARGET: beat {self.best_speedup:.3f}x while staying "
                 f"correct, by refining the template below (not replacing it)."
@@ -331,6 +381,12 @@ class LessonBank:
         if lesson.first_iter_compiled is None:
             lesson.first_iter_compiled = rec.compiled
 
+        # Capture the winner state BEFORE this record can change it: was there a
+        # correct best when THIS kernel was authored, and what was its template?
+        had_winner = lesson.best_correct and lesson.best_speedup is not None
+        prev_best_src = lesson.best_kernel_src
+        set_new_best = False
+
         if rec.correct:
             if lesson.rounds_to_correct is None:
                 lesson.rounds_to_correct = rec.iteration
@@ -343,6 +399,7 @@ class LessonBank:
                 lesson.best_kernel_src = kernel_src
                 lesson.best_entry = entry
                 lesson.best_approach_sig = rec.approach_sig
+                set_new_best = True
         else:
             # A loss is data: bank the failed approach with its class + note.
             note = rec.reason.strip()
@@ -354,6 +411,18 @@ class LessonBank:
                 "approach_sig": rec.approach_sig,
                 "note": note,
             })
+
+        # OVER-EXPLORATION COUNTER: a correct winner already existed when this
+        # kernel was authored, this kernel did NOT beat it (no new best), and it
+        # is structurally a REWRITE of the winning template (low overlap) — i.e.
+        # the author threw the winner away and started over, wasting an iteration
+        # the keep-winner loop then discarded. Count it so render_for_prompt can
+        # escalate the refinement constraint. A refinement that simply didn't win
+        # (high overlap) is NOT penalized — exploring inside the template is fine.
+        if had_winner and not set_new_best and kernel_src and prev_best_src:
+            if refinement_ratio(kernel_src, prev_best_src) < _REFINEMENT_MIN_RATIO:
+                lesson.rewrites_despite_winner += 1
+
         self.save(lesson)
         return lesson
 

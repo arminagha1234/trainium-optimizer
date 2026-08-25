@@ -183,6 +183,97 @@ def test_render_empty_before_any_attempt():
 
 
 # ---------------------------------------------------------------------------
+# OVER-EXPLORATION guard: count rewrites-despite-a-winner + escalate the prompt
+# ---------------------------------------------------------------------------
+_WIN_SRC = ("import nki\n@nki.jit\ndef softmax_kernel(x):\n"
+            "    m = nl.max(x, axis=1, keepdims=True)\n"
+            "    e = nl.exp(x - m)\n"
+            "    s = nl.sum(e, axis=1, keepdims=True)\n"
+            "    return e * nl.reciprocal(s)")
+# A REFINEMENT: same template, one line changed (nl.reciprocal call tweaked).
+_REFINED_SRC = _WIN_SRC.replace("nl.reciprocal(s)", "nl.reciprocal(s + 0.0)")
+# A REWRITE: structurally different kernel, shares almost no lines.
+_REWRITE_SRC = ("import nki\n@nki.jit\ndef softmax_kernel(x):\n"
+                "    a = nisa.activation(nl.exp, x, reduce_op=nl.add)\n"
+                "    b = nisa.nc_matmul(a, ones)\n"
+                "    c = nisa.tensor_reduce(nl.add, b, axis=0)\n"
+                "    return nl.multiply(a, c)")
+
+
+def test_refinement_ratio_separates_refine_from_rewrite():
+    # A one-line edit keeps almost all of the template (high ratio); a from-
+    # scratch rewrite shares little (low ratio). The threshold sits between.
+    refine = SI.refinement_ratio(_REFINED_SRC, _WIN_SRC)
+    rewrite = SI.refinement_ratio(_REWRITE_SRC, _WIN_SRC)
+    assert refine >= SI._REFINEMENT_MIN_RATIO, refine
+    assert rewrite < SI._REFINEMENT_MIN_RATIO, rewrite
+    # Empty either side → nothing to over-explore against → 0.0 (never crashes).
+    assert SI.refinement_ratio("", _WIN_SRC) == 0.0
+    assert SI.refinement_ratio(_WIN_SRC, "") == 0.0
+
+
+def test_rewrite_despite_winner_is_counted():
+    with tempfile.TemporaryDirectory() as d:
+        bank = SI.LessonBank(d)
+        # iter1: the correct 0.40x winner.
+        bank.update("softmax", "sc", _rec(1, correct=True, speedup=0.40,
+                    approach="v-win"), kernel_src=_WIN_SRC, entry="softmax_kernel")
+        assert bank.get("softmax").rewrites_despite_winner == 0
+        # iter2: a from-scratch REWRITE that does NOT beat the winner → counted.
+        bank.update("softmax", "sc", _rec(2, correct=True, speedup=0.35,
+                    approach="v-rewrite"), kernel_src=_REWRITE_SRC)
+        assert bank.get("softmax").rewrites_despite_winner == 1
+        # iter3: a REFINEMENT that does not beat it either → NOT counted (exploring
+        # inside the template is allowed; only throwing the winner away is penalized).
+        bank.update("softmax", "sc", _rec(3, correct=True, speedup=0.38,
+                    approach="v-refine"), kernel_src=_REFINED_SRC)
+        assert bank.get("softmax").rewrites_despite_winner == 1
+
+
+def test_rewrite_that_wins_is_not_penalized():
+    # A rewrite that BEATS the winner is exploration that paid off — it becomes
+    # the new template and must NOT be counted as wasted over-exploration.
+    with tempfile.TemporaryDirectory() as d:
+        bank = SI.LessonBank(d)
+        bank.update("softmax", "sc", _rec(1, correct=True, speedup=0.40,
+                    approach="v-win"), kernel_src=_WIN_SRC, entry="softmax_kernel")
+        bank.update("softmax", "sc", _rec(2, correct=True, speedup=0.90,
+                    approach="v-rewrite-fast"), kernel_src=_REWRITE_SRC)
+        l = bank.get("softmax")
+        assert l.rewrites_despite_winner == 0
+        assert l.best_speedup == 0.90 and l.best_kernel_src == _REWRITE_SRC
+
+
+def test_no_count_before_a_winner_exists():
+    # Before any correct kernel, there is no winner to over-explore against —
+    # a wrong rewrite must not increment the counter.
+    with tempfile.TemporaryDirectory() as d:
+        bank = SI.LessonBank(d)
+        bank.update("softmax", "sc", _rec(1, correct=False, speedup=0.0,
+                    cls="incorrect", approach="bad"), kernel_src=_REWRITE_SRC)
+        assert bank.get("softmax").rewrites_despite_winner == 0
+
+
+def test_render_escalates_after_a_rewrite():
+    # Once a rewrite-despite-winner is recorded, the rendered prompt must carry
+    # the HARD over-exploration warning naming the count — not just the soft bias.
+    with tempfile.TemporaryDirectory() as d:
+        bank = SI.LessonBank(d)
+        bank.update("softmax", "sc", _rec(1, correct=True, speedup=0.40,
+                    approach="v-win"), kernel_src=_WIN_SRC, entry="softmax_kernel")
+        # Before any rewrite: soft bias only, no escalation.
+        assert "over-exploration warning" not in bank.render_for_prompt("softmax").lower()
+        bank.update("softmax", "sc", _rec(2, correct=True, speedup=0.35,
+                    approach="v-rewrite"), kernel_src=_REWRITE_SRC)
+        low = bank.render_for_prompt("softmax").lower()
+        assert "over-exploration warning" in low
+        assert "verbatim except for one" in low
+        assert "once" in low          # count rendered as "once" for n==1
+        # The soft keep-winner directive is still present alongside the escalation.
+        assert "keep-the-winner" in low
+
+
+# ---------------------------------------------------------------------------
 # RETRIEVAL — the load-bearing wiring: lesson injected into authoring
 # ---------------------------------------------------------------------------
 def test_retrieve_injects_selfimprove_lesson_but_not_on_first_attempt():
