@@ -155,6 +155,46 @@ def test_registry_default_unchanged_when_no_library():
     assert reg.library is None
 
 
+# ---------------------------------------------------------------------------
+# BANK-ON-WIN: invent_engine auto-banks a winning kernel's SOURCE to the library
+# ---------------------------------------------------------------------------
+def _win_race():
+    from invent_engine import RaceResult
+    return RaceResult(True, correct=True, correctness_pct=100.0, speedup=1.42,
+                      kernel_ms=0.64, baseline_ms=0.91, reason="mock win")
+
+
+def test_engine_auto_banks_kernel_on_win():
+    from invent_engine import InventEngine
+    from invent_kernels import catalog, AuthoredKernel
+    with tempfile.TemporaryDirectory() as tmp:
+        libroot = Path(tmp) / "lib"
+        lib = KernelLibrary(libroot)
+        eng = InventEngine(out_dir=Path(tmp) / "run", kernel_library=lib, arch="trn2")
+        spec = catalog()["softcap"]
+        author = AuthoredKernel(
+            op=spec.name, origin="invented", numpy_impl=spec.reference,
+            nki_src="import neuronxcc.nki as nki\n@nki.jit\ndef softcap_kernel(x):\n    return x\n",
+            entry="softcap_kernel", pipeline_notes="test")
+        assert eng._bank_kernel_to_library(spec, author, _win_race()) is True
+        lk = KernelLibrary(libroot).lookup(spec.primitive or spec.name)
+        assert lk is not None and lk.entry == "softcap_kernel"
+        assert lk.hw_ready and abs(lk.speedup - 1.42) < 1e-6
+        assert "@nki.jit" in lk.source()
+
+
+def test_engine_no_library_is_noop():
+    from invent_engine import InventEngine
+    from invent_kernels import catalog, AuthoredKernel
+    with tempfile.TemporaryDirectory() as tmp:
+        eng = InventEngine(out_dir=tmp)      # no kernel_library -> default None
+        spec = catalog()["softcap"]
+        author = AuthoredKernel(op=spec.name, origin="invented", numpy_impl=spec.reference,
+                                nki_src="x", entry="softcap_kernel", pipeline_notes="")
+        # no library configured -> returns False, never raises
+        assert eng._bank_kernel_to_library(spec, author, _win_race()) is False
+
+
 # ===========================================================================
 def _run_standalone() -> int:
     import traceback

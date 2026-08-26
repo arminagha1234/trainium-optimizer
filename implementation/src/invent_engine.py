@@ -385,6 +385,8 @@ class InventEngine:
         author: KernelAuthor | None = None,
         max_repair_rounds: int = 1,
         max_perf_rounds: int = 1,
+        kernel_library: "Any" = None,
+        arch: str = "trn2",
     ) -> None:
         # The pluggable authoring seam. Defaults to the recipe table
         # (``RecipeAuthor`` wraps ``invent_kernels.author_kernel``) so behaviour
@@ -423,6 +425,13 @@ class InventEngine:
             from kernel_registry import KernelRegistry
             registry = KernelRegistry()
         self.registry = registry
+        # BANK-ON-WIN: the in-repo validated kernel library (kernel_library.
+        # KernelLibrary). When set, an on-device WIN also stores the kernel SOURCE
+        # here (keep-winner), so a kernel we authored + validated is durably kept
+        # and reused by future runs — not lost. Default None => no library write
+        # (behaviour unchanged); the win still banks its NKI_KERNEL lesson as before.
+        self.kernel_library = kernel_library
+        self.arch = arch
 
     # -- prior-art / Harvest (search before authoring) -----------------------
 
@@ -797,6 +806,37 @@ class InventEngine:
         self.bank.save(lesson)
         return lesson_id
 
+    def _bank_kernel_to_library(self, spec: OpSpec, author, race: RaceResult) -> bool:
+        """On an on-device WIN, store the kernel SOURCE in the in-repo kernel
+        library (keep-winner) so it is durably kept + reused, not re-invented next
+        run. No-op when no library is configured or there is no real source.
+        Never raises into the run — a library failure must not fail the win."""
+        if self.kernel_library is None or not getattr(author, "nki_src", ""):
+            return False
+        try:
+            primitive = getattr(spec, "primitive", "") or spec.name
+            manifest = {
+                "name": f"{spec.name}",
+                "primitive": primitive,
+                "arch": self.arch,
+                "shape_class": spec.shape_class,
+                "entry": author.entry,
+                "status": "passed-on-device",
+                "dtype": getattr(spec, "dtype", "fp32"),
+                "provenance": (f"auto-banked by invent-engine on-device win: "
+                               f"{spec.name} {race.speedup:.2f}x vs {spec.baseline}"),
+                "correctness": {"cosine": 1.0 if race.correct else 0.0,
+                                "correctness_pct": round(race.correctness_pct, 3)},
+                "performance": {"speedup": round(race.speedup, 4),
+                                "baseline": spec.baseline,
+                                "kernel_ms": round(race.kernel_ms, 4),
+                                "baseline_ms": round(race.baseline_ms, 4)},
+                "sdk": {"neuronxcc": self.sdk_version, "backend": "native-pytorch-beta3"},
+            }
+            return bool(self.kernel_library.bank(manifest, author.nki_src))
+        except Exception:  # noqa: BLE001 — a library write must never fail the win
+            return False
+
     def _bank_anti_pattern(self, spec: OpSpec, reason: str,
                            race: RaceResult | None = None,
                            diagnosis: str = "") -> str:
@@ -991,6 +1031,7 @@ class InventEngine:
         is_win = self.guards.is_improvement(race.speedup, 1.0, is_invention=True)
         if is_win:
             lid = self._bank_win(spec, race)
+            self._bank_kernel_to_library(spec, author, race)   # keep-winner source store
             self._record(spec, Status.KEEP, race.speedup, race.correctness_pct,
                          f"WIN: {race.speedup:.3f}x vs {spec.baseline} "
                          f"(>= 5% margin){perf_note}", n_lessons=n)
