@@ -254,6 +254,41 @@ def _lesson_matches(lesson, sig: str, model_id: str) -> bool:
     )
 
 
+# The GatedDeltaNet linear-attention config fields — present on a Qwen3-Next /
+# Qwen3.5 config even when its model_type string is renamed. Mirrors the
+# structural fallback in backends.qwen3_next_rewrites.is_qwen3_next_arch.
+_QWEN3_NEXT_MARKERS = ("linear_key_head_dim", "linear_num_value_heads",
+                       "linear_conv_kernel_dim")
+
+
+def _is_qwen3_next_arch(cfg: Any) -> bool:
+    """True if ``cfg`` is a Qwen3-Next / Qwen3.5 GatedDeltaNet-MoE model — the
+    arch the framework's graph-rewrite bundle handles.
+
+    ``preflight`` works with plain DICT configs (what ``load_hf_config`` returns),
+    while the backend's ``is_qwen3_next_arch`` is written for a config OBJECT
+    (``getattr``). So handle the dict path here directly (``model_type`` contains
+    ``qwen3_next``, in the config or its ``text_config``, else the structural
+    linear-attn markers) and delegate an object to the backend detector. Guarded:
+    any failure -> False, so the gate falls through to the kernel logic rather
+    than breaking."""
+    if isinstance(cfg, dict):
+        def _mt(d: Any) -> str:
+            return str((d or {}).get("model_type", "") or "").lower()
+        if "qwen3_next" in _mt(cfg):
+            return True
+        tc = cfg.get("text_config")
+        if isinstance(tc, dict) and "qwen3_next" in _mt(tc):
+            return True
+        probe = tc if isinstance(tc, dict) else cfg
+        return isinstance(probe, dict) and all(m in probe for m in _QWEN3_NEXT_MARKERS)
+    try:
+        from backends.qwen3_next_rewrites import is_qwen3_next_arch
+        return bool(is_qwen3_next_arch(cfg))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def preflight_check(
     spec: ModelSpec,
     bank: Any = None,
@@ -263,6 +298,7 @@ def preflight_check(
     config: dict[str, Any] | None = None,
     registry: Any = None,
     kernels_wired: bool = False,
+    rewrites_wired: bool = False,
 ) -> tuple[bool, str | None]:
     """Cheap, no-compile gate run before `establish_baseline`.
 
@@ -282,11 +318,30 @@ def preflight_check(
     registered, the model is allowed to PROCEED — the kernel, not the naive
     graph, is the supported path. Defaults (no registry, kernels_wired=False)
     are byte-for-byte the previous behaviour, so callers/tests are unchanged.
+
+    Graph-rewrite path (opt-in, `rewrites_wired`): a Qwen3-Next / Qwen3.5
+    GatedDeltaNet-MoE model is made to COMPILE and be CORRECT by the framework's
+    permanent graph-rewrite bundle (sort->argmax router, tril->const-mask,
+    dense-MoE static dispatch, int64 fp32-sort — installed in
+    `backends.qwen3_next_rewrites`), NOT by a DeltaNet perf-kernel. The kernel is
+    the LARGE-scale PERF path only; at the scales this loop verifies the rewrites
+    alone suffice (see docs/qwen3-next-archproof.md). So when `rewrites_wired`
+    (the backend installs that bundle) AND the model IS qwen3-next, the model is
+    allowed to PROCEED even with no DeltaNet kernel registered — otherwise the
+    gate would skip a model the backend can actually optimize. Off by default, so
+    existing callers/tests are unchanged.
     """
     cfg = config if config is not None else load_hf_config(spec.model_id, config_loader)
 
     # 1. Static detection — fires on the FIRST encounter, from config alone.
     if is_linear_attention_arch(cfg):
+        # Graph-rewrite path: qwen3-next is handled by the wired rewrite bundle
+        # (no kernel needed at these scales) — proceed when the backend installs
+        # it. Checked FIRST so a qwen3-next model is not skipped for lacking a
+        # DeltaNet kernel it does not need. Guarded import so a missing backend
+        # module never breaks the gate (falls through to the kernel logic).
+        if rewrites_wired and _is_qwen3_next_arch(cfg):
+            return True, None
         # Default (no registry, kernels not wired): unchanged skip + reason.
         if registry is None and not kernels_wired:
             return False, LINEAR_ATTN_REASON

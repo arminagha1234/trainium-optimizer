@@ -55,6 +55,22 @@ DELTANET_CFG = {"architectures": ["Qwen3_5GatedDeltaNetForCausalLM"],
                 "model_type": "qwen3_5_gated_deltanet"}
 DENSE_CFG = {"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}
 
+# A realistic Qwen3-Next / Qwen3.5 GatedDeltaNet-MoE config: linear-attention
+# (layer_types names it) AND detectably qwen3-next (model_type + linear markers),
+# so the graph-rewrite bundle applies.
+QWEN3_NEXT_SPEC = ModelSpec(
+    model_id="Qwen/Qwen3.5-0.8B", family="hybrid_attention_causal_lm",
+    param_count=8e8, parent="qwen",
+)
+QWEN3_NEXT_CFG = {
+    "architectures": ["Qwen3NextForCausalLM"],
+    "model_type": "qwen3_next",
+    "layer_types": ["linear_attention", "full_attention"],
+    "linear_key_head_dim": 128,
+    "linear_num_value_heads": 16,
+    "linear_conv_kernel_dim": 4,
+}
+
 
 # -- static detection --------------------------------------------------------
 
@@ -67,6 +83,52 @@ def test_linear_attn_arch_detected():
 def test_deltanet_spec_is_skipped_with_reason():
     loader = _loader({DELTANET_SPEC.model_id: DELTANET_CFG})
     ok, reason = preflight_check(DELTANET_SPEC, config_loader=loader)
+    assert ok is False
+    assert reason == LINEAR_ATTN_REASON
+
+
+# -- qwen3-next graph-rewrite path (rewrites_wired, opt-in) ------------------
+
+def test_is_qwen3_next_arch_detects_dict_config():
+    # preflight works with DICT configs; the detector must handle them (the
+    # backend's object-based detector would miss a dict). model_type OR markers.
+    from preflight import _is_qwen3_next_arch
+    assert _is_qwen3_next_arch(QWEN3_NEXT_CFG)                       # model_type
+    assert _is_qwen3_next_arch(                                      # markers only
+        {"linear_key_head_dim": 128, "linear_num_value_heads": 16,
+         "linear_conv_kernel_dim": 4})
+    assert not _is_qwen3_next_arch(DENSE_CFG)
+    assert not _is_qwen3_next_arch(DELTANET_CFG)   # not qwen3-next-signalled
+    assert not _is_qwen3_next_arch(None)
+
+
+def test_qwen3_next_proceeds_when_rewrites_wired():
+    # The fix: a qwen3-next model is allowed through when the backend installs
+    # the graph-rewrite bundle — the rewrites (not a DeltaNet kernel) are the
+    # supported correctness path at these scales. No registry / kernel needed.
+    loader = _loader({QWEN3_NEXT_SPEC.model_id: QWEN3_NEXT_CFG})
+    ok, reason = preflight_check(QWEN3_NEXT_SPEC, config_loader=loader,
+                                 rewrites_wired=True)
+    assert ok is True, reason
+    assert reason is None
+
+
+def test_qwen3_next_still_skips_without_rewrites_wired():
+    # Opt-in: default (rewrites_wired=False) is unchanged — still a linear-attn
+    # skip, so existing callers/behaviour are untouched.
+    loader = _loader({QWEN3_NEXT_SPEC.model_id: QWEN3_NEXT_CFG})
+    ok, reason = preflight_check(QWEN3_NEXT_SPEC, config_loader=loader)
+    assert ok is False
+    assert reason == LINEAR_ATTN_REASON
+
+
+def test_rewrites_wired_does_not_admit_non_qwen3_next_linear_attn():
+    # rewrites_wired must ONLY admit qwen3-next (the arch the bundle handles) —
+    # a different linear-attn arch the detector does not classify as qwen3-next
+    # must still skip (the rewrites don't apply to it).
+    loader = _loader({DELTANET_SPEC.model_id: DELTANET_CFG})
+    ok, reason = preflight_check(DELTANET_SPEC, config_loader=loader,
+                                 rewrites_wired=True)
     assert ok is False
     assert reason == LINEAR_ATTN_REASON
 
