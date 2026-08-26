@@ -1,0 +1,30 @@
+name: gated_delta_net_chunked_bwd
+primitive: gated_delta_net_bwd
+kernel_family: DeltaNetBwd
+arch: trn2
+shape_class: dk128-dv128-chunk64
+entry: gdn_bwd_full
+dtype: fp32
+status: passed-on-device
+provenance: >-
+  FULL multi-chunk GatedDeltaNet chunked backward — returns dq,dk,dv,dg,dbeta,dS0.
+  Forward re-pass stores per-chunk state; REVERSE chunk loop carries dS running the
+  per-chunk VJP (doubling-inverse backward + gate reverse-cumsum dg=triu@dgc). Built
+  on 3 verified reference layers (autograd oracle, explicit reverse-loop, hand VJP,
+  all exact ~1e-15) then translated to NKI, everything inlined (NKI can't return
+  multi-tile state across helper scopes). With the forward kernel, GDN is a complete
+  trainable fwd+bwd pair — what the ecosystem lacked (nki-library has no GDN; the
+  1169L deltanet_fused_chunked_bwd leaves dg/dbeta/wy-repr stubbed).
+license: Apache-2.0
+correctness:
+  oracle: reference.py::explicit_backward (verified exact vs torch autograd, 0.0 err)
+  cosine: 1.0
+  max_abs_err: 3.4e-5
+  notes: all 5 grads cos 1.000000 vs verified reference at T=128 (n=2) AND T=256 (n=4)
+performance:
+  baseline: (backward; not benchmarked vs torch)
+  speedup: 0.0
+sdk: {nki: "0.6.0", neuronxcc: "2.27.5334", backend: native-pytorch}
+validated_on: trn2.3xlarge
+date: "2026-08-26"
+inputs: "q,k,v [T,128], g,beta [T,1], S0 [128,128], dO [T,128]; T%64==0. Returns dq,dk,dv,dg,dbeta,dS0."
