@@ -1,0 +1,30 @@
+name: causal_conv1d_bwd
+primitive: causal_conv1d_bwd
+kernel_family: CausalConv1dBwd
+arch: trn2
+shape_class: depthwise-k4-p-le128
+entry: causal_conv1d_bwd
+dtype: fp32
+status: passed-on-device
+provenance: >-
+  Backward of the Qwen3.5 GDN depthwise causal conv1d (k=4) + SiLU. Returns
+  dx [C,L] and dweight [C,K]. Recomputes `pre` (strategy-B recompute-in-backward),
+  d_pre = dout*silu'(pre); dw via free-axis reduce of d_pre*xpad per tap; dx via
+  right-padded d_pre with FLIPPED taps. No matmul. FIRST NKI conv1d backward in
+  the tree (survey: a gap everywhere except an aws-neuron seq<=2048 variant).
+license: Apache-2.0
+correctness:
+  oracle: torch.autograd over depthwise conv1d(pad=K-1,groups=C)+silu (fp64 gradcheck-grade)
+  cosine: 1.0
+  max_abs_err: 2.5e-5
+  notes: dx AND dw cos 1.000000 vs torch autograd across C=64/96/128, L=64/256/512
+performance:
+  baseline: (backward; not benchmarked vs torch)
+  speedup: 0.0
+sdk:
+  nki: "0.6.0"
+  neuronxcc: "2.27.5334"
+  backend: native-pytorch
+validated_on: trn2.3xlarge
+date: "2026-08-26"
+inputs: "x, dout : [C<=128, L]; weight : [C, K=4]. Returns (dx [C,L], dweight [C,K])."
