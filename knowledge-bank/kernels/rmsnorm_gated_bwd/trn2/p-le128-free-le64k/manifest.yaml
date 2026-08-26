@@ -1,0 +1,25 @@
+name: rmsnorm_gated_bwd
+primitive: rmsnorm_gated_bwd
+kernel_family: RMSNormGatedBwd
+arch: trn2
+shape_class: p-le128-free-le64k
+entry: rmsnorm_gated_bwd
+dtype: fp32
+status: passed-on-device
+provenance: >-
+  Backward of Qwen3.5 RMSNormGated (norm-before-gate). Returns dx, dweight[1,F],
+  dgate. dweight sums over the partition (token) axis via a ones@(.) matmul; dx
+  combines the direct x*r path with the mean-square dms*2x/F path; dgate = ds*silu'.
+  Completes the all-NKI-kernel trainable GDN mixer (conv1d fwd+bwd, gdn fwd+bwd,
+  RMSNormGated fwd+bwd).
+license: Apache-2.0
+correctness:
+  oracle: torch.autograd over weight*(x*rsqrt(mean(x^2)+eps))*silu(gate)
+  cosine: 1.0
+  max_abs_err: 3.5e-4
+  notes: dx, dweight, dgate all cos 1.000000 vs torch autograd across P=64/128, F=128/512
+performance: {baseline: "(backward)", speedup: 0.0}
+sdk: {nki: "0.6.0", neuronxcc: "2.27.5334", backend: native-pytorch}
+validated_on: trn2.3xlarge
+date: "2026-08-26"
+inputs: "x, gate, dout : [P<=128, F]; weight : [1, F]; ones_1p : [1, P]. Returns dx, dweight[1,F], dgate."
