@@ -1,0 +1,38 @@
+name: gated_delta_net_chunked_fwd
+primitive: gated_delta_net
+kernel_family: DeltaNet
+arch: trn2
+shape_class: dk128-dv128-chunk128
+entry: gdn_chunked_fwd
+dtype: fp32
+status: passed-on-device
+provenance: >-
+  Port of jburtoft deltanet_fused_chunked_fwd_batched (DeltaNet scalar-decay = GDN)
+  to the neuronxcc.nki 0.6.0 return-form stack, plus a transpose-elimination pass
+  (nl.matmul fuses the stationary transpose; ~13 nc_transpose+copy pairs/chunk
+  removed, incl. all 12 Neumann-doubling transposes). Recursive-doubling triangular
+  inverse T=(I+L)(I+L^2)...(I+L^32); cross-chunk gated state carry in SBUF.
+license: Apache-2.0
+correctness:
+  oracle: reference.py::recurrent_gated_delta_rule (numpy, matches per-token recurrence to 1e-16)
+  cosine: 1.0
+  max_abs_err: 5.2e-7
+  notes: exact at fp32 across mild+strong decay (gscale 0.1/1.0/2.0), 1-8 chunks, batched
+performance:
+  baseline: ref-torch-chunk-loop (torch_chunk_gated_delta_rule, 64-iter forward-substitution)
+  speedup: 2.88
+  measured:
+    - {BH: 4,  S: 512,  ms: 1.76, speedup: 3.67}
+    - {BH: 8,  S: 1024, ms: 2.61, speedup: 3.33}
+    - {BH: 16, S: 2048, ms: 4.50, speedup: 2.88}
+  profile: vector-engine-bound (~98% Vector, TE 26%, MFU 3.3%); engine-routing sweep confirmed all-Vector optimal
+sdk:
+  nki: "0.6.0"
+  neuronxcc: "2.27.5334"
+  backend: native-pytorch
+validated_on: trn2.3xlarge
+date: "2026-08-26"
+inputs: >-
+  q (l2-normed AND scaled 1/sqrt(dk)), k (l2-normed), v : [BH,S,128];
+  g_in (raw per-token log-decay), beta_in : [BH,S,1]; initial_state [BH,128,128];
+  lower_mask, identity, lower_mask_diag : [128,128]. S % 128 == 0. gate path fp32.
