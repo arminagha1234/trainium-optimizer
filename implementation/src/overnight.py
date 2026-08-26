@@ -218,6 +218,7 @@ def run_one(
     preflight: bool = True,
     registry: "KernelRegistry | None" = None,
     kernels_wired: bool = False,
+    rewrites_wired: bool = False,
     serve_target: "ServeTarget | None" = None,
 ) -> ModelResult:
     """Optimize a single model. Crashes are caught and returned, never raised,
@@ -245,6 +246,7 @@ def run_one(
             ok, reason = preflight_check(
                 spec, bank=bank, sdk_version=sdk_version,
                 registry=registry, kernels_wired=kernels_wired,
+                rewrites_wired=rewrites_wired,
             )
             if not ok:
                 _record_preflight_skip(
@@ -633,6 +635,14 @@ def main() -> None:
                          "PROCEED instead of skipping. Off by default: default "
                          "still skips, but with a named-kernel reason.")
     ap.set_defaults(kernels_wired=False)
+    ap.add_argument("--rewrites-wired", dest="rewrites_wired", action="store_true",
+                    help="allow a Qwen3-Next / Qwen3.5 GatedDeltaNet-MoE model to "
+                         "PROCEED (instead of skipping as linear-attention) because "
+                         "the backend installs the graph-rewrite bundle "
+                         "(sort->argmax, tril->const-mask, dense-MoE dispatch, "
+                         "int64 fp32-sort) that makes it compile + be correct "
+                         "without a DeltaNet kernel. Off by default.")
+    ap.set_defaults(rewrites_wired=False)
     # --- bank hygiene: re-validate stale verified priors when the SDK changed ---
     ap.add_argument("--revalidate", action="store_true",
                     help="at STARTUP, re-validate verified config-priors whose "
@@ -686,6 +696,7 @@ def main() -> None:
     log(f"=== overnight START: backend={a.backend} instance={instance_type} "
         f"cycles={'forever' if cycles == 0 else cycles} auto_promote={a.auto_promote} "
         f"preflight={a.preflight} kernels_wired={a.kernels_wired} "
+        f"rewrites_wired={a.rewrites_wired} "
         f"kernel_dir={registry.kernel_dir} models={models} ===")
     log(f"    (touch {stop_file} to stop cleanly after the current model)")
 
@@ -728,6 +739,7 @@ def main() -> None:
                     preflight=a.preflight,
                     registry=registry,
                     kernels_wired=a.kernels_wired,
+                    rewrites_wired=a.rewrites_wired,
                     serve_target=serve_target,
                 ))
 
