@@ -1,0 +1,31 @@
+name: causal_conv1d
+primitive: causal_conv1d
+kernel_family: CausalConv1d
+arch: trn2
+shape_class: depthwise-k4-p-le128
+entry: causal_conv1d
+dtype: fp32
+status: passed-on-device
+provenance: >-
+  Qwen3.5 GDN short-conv: depthwise (groups=channels) causal conv1d, kernel_size
+  K=4, no bias, left-pad K-1, output truncated to L, then SiLU (hidden_act). No
+  NKI version existed; reused by the GDN/KDA/Mamba/Qwen3-Next mixer conv. K taps of
+  shift-multiply-accumulate (tensor_scalar per-channel weight + tensor_tensor add),
+  no matmul. Causal pad via memset+dma_copy into xpad[:,K-1:] so each tap reads a
+  clean [C,L] window (avoids an output slice-write).
+license: Apache-2.0
+correctness:
+  oracle: reference.py::causal_conv1d (numpy, matches transformers causal_conv1d_fn)
+  cosine: 1.0
+  max_abs_err: 1.5e-6
+  notes: fp32-exact across C=64/96/128, L=64/512/2048
+performance:
+  baseline: (fusion kernel; conv+silu in one pass; not benchmarked vs torch)
+  speedup: 0.0
+sdk:
+  nki: "0.6.0"
+  neuronxcc: "2.27.5334"
+  backend: native-pytorch
+validated_on: trn2.3xlarge
+date: "2026-08-26"
+inputs: "x : [C<=128, L] (channels on partition); weight : [C, K=4]. Depthwise, causal, +SiLU."

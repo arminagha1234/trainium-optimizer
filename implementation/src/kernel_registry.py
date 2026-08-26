@@ -160,9 +160,15 @@ class KernelRegistry:
     to "no kernel available yet" rather than erroring.
     """
 
-    def __init__(self, kernel_dir: str | os.PathLike | None = None) -> None:
+    def __init__(self, kernel_dir: str | os.PathLike | None = None,
+                 library: Any = None) -> None:
         d = kernel_dir or os.environ.get("TRN_OPT_KERNEL_DIR") or ""
         self.kernel_dir: Path | None = Path(d) if d else None
+        # Optional IN-REPO validated kernel library (kernel_library.KernelLibrary).
+        # Consulted FIRST in for_primitive so a kernel WE wrote+validated is
+        # reused before an external proprietary one and before authoring. Default
+        # None => byte-for-byte the previous (external-only) behaviour.
+        self.library = library
         self._cache: dict[str, KernelSpec | None] = {}
 
     def _manifest_path(self, kernel_name: str) -> Path | None:
@@ -198,7 +204,20 @@ class KernelRegistry:
         return spec
 
     def for_primitive(self, primitive: str) -> KernelSpec | None:
-        """Resolve a primitive descriptor to an available KernelSpec, or None."""
+        """Resolve a primitive descriptor to an available KernelSpec, or None.
+
+        Consult order: the in-repo validated kernel library FIRST (a kernel we
+        wrote + validated, source in this repo), then the external proprietary
+        registry. So "harvest before invent" reuses our own kernels first."""
+        if self.library is not None:
+            try:
+                lk = self.library.lookup(primitive)
+                if lk is not None and lk.usable:
+                    spec = self.library.to_kernel_spec(lk)
+                    if spec is not None:
+                        return spec
+            except Exception:  # noqa: BLE001 — a library miss must never break routing
+                pass
         name = kernel_for_primitive(primitive)
         return self.lookup(name) if name else None
 

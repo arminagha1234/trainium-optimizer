@@ -1,0 +1,31 @@
+name: rmsnorm_gated
+primitive: rmsnorm_gated
+kernel_family: RMSNormGated
+arch: trn2
+shape_class: p-le128-free-le64k
+entry: rmsnorm_gated
+dtype: fp32
+status: passed-on-device
+provenance: >-
+  Fused Qwen3.5 RMSNormGated (norm-before-gate): out = weight * (x *
+  rsqrt(mean(x^2,-1)+eps)) * silu(gate). No NKI version existed anywhere (survey
+  gap); reused by GatedDeltaNet / KDA / Mamba2 / Nemotron-H / Zamba2 gated-linear-
+  attention blocks. Single-pass: square+sum (keepdims) -> rsqrt -> per-row scale ->
+  weight broadcast -> * silu(gate). No matmul; gate path fp32. Tile-level: P<=128
+  (caller tiles tokens), F (normed dim) up to 64K from SBUF.
+license: Apache-2.0
+correctness:
+  oracle: reference.py::rmsnorm_gated (numpy fp64, matches transformers Qwen3_5RMSNormGated)
+  cosine: 1.0
+  max_abs_err: 4.2e-4
+  notes: fp32 kernel vs fp64 reference; cos 1.0 across F=128/2048/4096, P=64/128
+performance:
+  baseline: (not yet benchmarked vs torch; value is the fusion + no NKI existed)
+  speedup: 0.0
+sdk:
+  nki: "0.6.0"
+  neuronxcc: "2.27.5334"
+  backend: native-pytorch
+validated_on: trn2.3xlarge
+date: "2026-08-26"
+inputs: "x, gate : [P<=128, F]; weight : [1, F]. Normalizes over F (free axis)."
