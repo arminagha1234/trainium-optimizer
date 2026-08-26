@@ -29,9 +29,10 @@ def run(seed=0):
     tril = np.tril(np.ones((C, C), np.float32), 0); strict = np.tril(np.ones((C, C), np.float32), -1)
     eye = np.eye(C, dtype=np.float32); J = np.eye(C, dtype=np.float32)[::-1].copy()
     last = np.zeros((C, 1), np.float32); last[C-1, 0] = 1.0
+    triu = np.triu(np.ones((C, C), np.float32), 0)      # upper-tri-inclusive (reverse-cumsum)
     t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(dev)
     outs = gdn_chunk_bwd(t(q), t(k), t(v), t(g), t(beta), t(S), t(do), t(dSn),
-                         t(tril), t(strict), t(eye), t(J), t(last))
+                         t(tril), t(strict), t(eye), t(J), t(last), t(triu))
     xm.mark_step()
     dq, dk, dv, dg, dbeta, dS_in = (o.cpu().numpy() for o in outs)
     got = {"dq": dq, "dk": dk, "dv": dv, "dg": dg[:, 0], "dbeta": dbeta[:, 0], "dS_in": dS_in}

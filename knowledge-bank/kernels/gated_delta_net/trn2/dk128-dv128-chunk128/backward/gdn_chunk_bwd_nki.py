@@ -38,7 +38,7 @@ def _mmt(a, b):
 
 @nki.jit
 def gdn_chunk_bwd(q, k, v, g, beta, S, do, dSn,
-                  tril_incl, strict, eye, revJ, last_mask):
+                  tril_incl, strict, eye, revJ, last_mask, triu_incl):
     # tril_incl/strict/eye [C,C]; revJ [C,C] anti-identity (free-axis flip). g,beta [C,1].
     dq_out = nl.ndarray((C, DK), dtype=nl.float32, buffer=nl.shared_hbm)
     dk_out = nl.ndarray((C, DK), dtype=nl.float32, buffer=nl.shared_hbm)
@@ -50,7 +50,8 @@ def gdn_chunk_bwd(q, k, v, g, beta, S, do, dSn,
     qt = nl.load(q); kt = nl.load(k); vt = nl.load(v)
     gcol = nl.load(g); bcol = nl.load(beta)
     St = nl.load(S); dot = nl.load(do); dSnt = nl.load(dSn)
-    trilm = nl.load(tril_incl); strictm = nl.load(strict); eyem = nl.load(eye); J = nl.load(revJ)
+    trilm = nl.load(tril_incl); strictm = nl.load(strict); eyem = nl.load(eye)
+    J = nl.load(revJ); triu = nl.load(triu_incl)
 
     # ---- forward recompute ----
     # gc = cumsum(g): flip col->row, scan, unflip. g is [C,1]; scan runs on free axis.
@@ -160,12 +161,10 @@ def gdn_chunk_bwd(q, k, v, g, beta, S, do, dSn,
     # add dgl to dgc[-1] via the last-position one-hot mask
     dgl_col = nl.broadcast_to(dgl, shape=(C, 1))
     dgc = nisa.tensor_tensor(dgc, nisa.tensor_tensor(dgl_col, nl.load(last_mask), nl.multiply), nl.add)
-    # gc = cumsum(g) -> dg = reverse-cumsum(dgc): flip(row) -> scan -> flip
-    dgc_row = nisa.tensor_copy(nisa.nc_transpose(dgc))     # [1,C]
-    dgc_flip = _mm(dgc_row, J)                             # reverse along free
-    dg_scan = nisa.tensor_tensor_scan(ones_1c, dgc_flip, zero_11, nl.multiply, nl.add)
-    dg_row = _mm(dg_scan, J)                               # flip back [1,C]
-    dg = nisa.tensor_copy(nisa.nc_transpose(dg_row))       # [C,1]
+    # gc=cumsum(g) -> dg = reverse-cumsum(dgc): dg[s]=sum_{t>=s} dgc[t] = triu_incl @ dgc.
+    # ONE matmul (upper-tri-inclusive ones) — no transposes/flips (which lowered to a
+    # PSUM-sourced DMA and broke the compile).
+    dg = _mm(triu, dgc)                                        # [C,1]
 
     # force SBUF for all outputs (dma_copy cannot read PSUM)
     nisa.dma_copy(dst=dq_out[:, :], src=nisa.tensor_copy(dq))
