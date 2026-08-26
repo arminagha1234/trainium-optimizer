@@ -1,0 +1,39 @@
+name: mamba2_ssd_chunked_bwd
+primitive: mamba2_ssd_bwd
+kernel_family: Mamba-2/SSD
+arch: trn2
+shape_class: p-le128-n-le128-chunk128
+entry: mamba2_ssd_bwd
+dtype: fp32
+status: passed-on-device
+provenance: >-
+  Hand-derived VJP for the Mamba-2 SSD chunked forward, ported to NKI 0.6.0.
+  Two passes in one NEFF: (1) forward-recompute holding each chunk's ENTRY state
+  in a Python list of SBUF tiles (static_range unrolls, so legal); (2) reverse
+  chunk loop applying the VJP. Every step is a matmul (_mm/_tmm/_mmt), tensor_scalar,
+  or the reverse-cumsum d_dtA = tri_ge @ d_cs plus the +d_csl-to-every-row trick
+  (tri_ge @ e_last == ones, since csl = cs[-1]). No triangular solve. The key VJP
+  subtlety: dS_out (grad of a chunk's OUTPUT state) must be captured BEFORE adding
+  the Y_off term C^T@dG, which flows to the INPUT state, not the output state.
+license: Apache-2.0
+correctness:
+  oracle: backward/reference.py::ssd_bwd_hand vs torch autograd through ssd_fwd_torch
+  grads: [dx, ddt, dA, dB, dC, dstate0]
+  cosine: 1.0
+  max_abs_err: 1.4e-2
+  notes: all 6 grads cos 1.000000 on-device vs autograd (fp32) across the 3 shapes;
+    hand VJP matches autograd to ~1e-13 in fp64. ddt has the largest abs err (~1e-2)
+    from magnitude; cosine is exact.
+sdk:
+  nki: "0.6.0"
+  neuronxcc: "2.27.5334"
+  backend: native-pytorch
+validated_on: trn2.3xlarge
+date: "2026-08-26"
+inputs: >-
+  x [L,p]; dt [L,1]; A [1,1]; B,C [L,n]; state0 [n,p]; dy [L,p]; dS_final [n,p];
+  causal [Q,Q] lower-tri incl; tri_ge [Q,Q] upper-tri incl (reverse-cumsum).
+  Returns (dx [L,p], ddt [L,1], dA [1,1], dB [L,n], dC [L,n], dstate0 [n,p]).
+  With the forward kernel, Mamba-2 SSD is a complete trainable fwd+bwd op
+  (see mamba2_ssd_autograd.py -> autograd.Function, end-to-end grads cos 1.0,
+  block trains 45x loss drop).

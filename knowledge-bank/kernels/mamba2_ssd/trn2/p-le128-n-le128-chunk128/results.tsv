@@ -1,0 +1,4 @@
+L	n	p	nki_ms	baseline_ms	speedup	y_cosine	y_max_abs_err	state_cosine	state_max_abs_err
+128	64	128	-	-	-	1.000000	1.26e-04	1.000000	4.76e-06
+256	64	128	-	-	-	1.000000	1.60e-04	1.000000	5.45e-06
+256	128	64	-	-	-	1.000000	2.56e-04	1.000000	3.08e-06
