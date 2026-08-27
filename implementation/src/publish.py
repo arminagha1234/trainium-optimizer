@@ -58,6 +58,7 @@ def publish(
     fork_diff_path: Path | str | None = None,
     config: dict[str, Any] | None = None,
     verified: str = "ungraded",
+    require_verified: bool = False,
 ) -> Path | None:
     """Update the CANONICAL best recipe at optimized_models/<slug>/.
 
@@ -66,6 +67,19 @@ def publish(
     (so a worse/noisy re-run can't clobber a good recipe). The append-only
     HISTORY.tsv is the run-by-run record; this folder is the product. Returns
     the dest path if updated, or None if the existing recipe was kept.
+
+    CORRECTNESS GATE (``require_verified``): the deliverable folder is what a
+    downstream consumer trusts and what feeds the leaderboard. In a
+    no-human-in-the-loop run the search self-reports a speedup on a single
+    probe; only the independent ``trusted_grader.verify_winner`` re-measure
+    (passed in as ``verified``) confirms it reproduces AND stays equivalent to
+    the baseline. When ``require_verified=True`` this REFUSES to publish (returns
+    None, writes nothing) unless ``verified == "verified"`` — so an
+    ``unverified`` (failed re-measure/equivalence) or ``ungraded`` (grader did
+    not run) result can never reach the canonical recipe autonomously. Default
+    False preserves today's behavior (publish regardless, carry the verdict in
+    the recipe) so existing callers and the running loop are unchanged; the
+    autonomous publisher opts in with True.
     """
     import time
 
@@ -74,6 +88,13 @@ def publish(
     best = led.incumbent()
     if base is None or best is None:
         raise SystemExit("run has no baseline or no incumbent — nothing to publish")
+
+    # Correctness gate BEFORE any write: an unverified/ungraded result must not
+    # become the canonical deliverable when the caller demands verification. This
+    # sits ahead of the beat-gate on purpose — a faster-but-unverified run is
+    # refused outright, never allowed to clobber a slower verified recipe.
+    if require_verified and verified != "verified":
+        return None
 
     slug = _slug(model_id)
     dest = Path(out_root) / slug

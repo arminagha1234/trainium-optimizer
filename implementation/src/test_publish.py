@@ -67,6 +67,76 @@ def test_publish_creates_deliverable(tmp_path: Path):
     assert (dest / "reproduce.sh").stat().st_mode & 0o111
 
 
+def _run_with_incumbent(tmp_path: Path):
+    """A completed mock run with a baseline + a winning incumbent, reusable by
+    the correctness-gate tests."""
+    run = tmp_path / "run"
+    orch = Orchestrator(
+        backend=MockBackend(seed=3), bank=_bank(tmp_path / "bank"),
+        guards=Guardrails(), ledger=Ledger(run), sdk_version="2.28.0",
+    )
+    orch.ledger.init()
+    orch.run_stage1_config(ModelSpec(
+        model_id="google/gemma-4-31B", family="dense_causal_lm",
+        param_count=31e9, parent="gemma",
+    ))
+    return run
+
+
+def test_publish_require_verified_refuses_unverified(tmp_path: Path):
+    """require_verified=True refuses to write the deliverable when the grader
+    verdict is not 'verified' — nothing is published."""
+    run = _run_with_incumbent(tmp_path)
+    out = tmp_path / "optimized_models"
+    dest = publish(
+        run_dir=run, out_root=out, model_id="google/gemma-4-31B",
+        backend="mock", toolchain={}, verified="unverified",
+        require_verified=True,
+    )
+    assert dest is None
+    assert not (out / "gemma-4-31b").exists()  # wrote nothing
+
+
+def test_publish_require_verified_refuses_ungraded(tmp_path: Path):
+    """Ungraded (grader never ran) is also refused under require_verified."""
+    run = _run_with_incumbent(tmp_path)
+    out = tmp_path / "optimized_models"
+    dest = publish(
+        run_dir=run, out_root=out, model_id="google/gemma-4-31B",
+        backend="mock", toolchain={}, verified="ungraded",  # the default
+        require_verified=True,
+    )
+    assert dest is None
+    assert not (out / "gemma-4-31b").exists()
+
+
+def test_publish_require_verified_allows_verified(tmp_path: Path):
+    """A verified verdict passes the gate and the deliverable is written."""
+    run = _run_with_incumbent(tmp_path)
+    out = tmp_path / "optimized_models"
+    dest = publish(
+        run_dir=run, out_root=out, model_id="google/gemma-4-31B",
+        backend="mock", toolchain={}, verified="verified",
+        require_verified=True,
+    )
+    assert dest is not None
+    assert (dest / "recipe.json").exists()
+    assert json.loads((dest / "recipe.json").read_text())["verified"] == "verified"
+
+
+def test_publish_default_does_not_enforce(tmp_path: Path):
+    """Backward-compat: with require_verified omitted (False), an unverified
+    result still publishes (verdict carried in the recipe) exactly as before."""
+    run = _run_with_incumbent(tmp_path)
+    out = tmp_path / "optimized_models"
+    dest = publish(
+        run_dir=run, out_root=out, model_id="google/gemma-4-31B",
+        backend="mock", toolchain={}, verified="unverified",
+    )
+    assert dest is not None
+    assert json.loads((dest / "recipe.json").read_text())["verified"] == "unverified"
+
+
 def test_slug():
     assert _slug("google/gemma-4-31B") == "gemma-4-31b"
     assert _slug("Qwen/Qwen3.8-27B") == "qwen3-8-27b"
