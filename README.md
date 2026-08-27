@@ -19,6 +19,16 @@ one paragraph:
 > models and publish a **Neuron-optimized leaderboard** that refreshes on
 > every SDK release.
 
+## Current state (2026-08-27, honest) — Stage-4 hardened + validated end-to-end on silicon
+
+A large hardening pass on the kernel/optimization stage, with **every claim below re-verified on a real NeuronCore** (trn2.3xlarge).
+
+- **%SOL profitability gate is live and device-grounded.** The framework measured its own single-core memory-bandwidth ceiling on-device (streaming-copy sweep → **~385 GB/s/core**) and now computes each authored kernel's **% of speed-of-light** from a device-timed latency. A kernel already ≥80% of SOL **skips the perf loop** (no headroom); a far-from-SOL op is flagged an *opportunity*. The gate **refuses torch-wallclock latencies** — measured on-device, wallclock read ~55 GB/s (6–10× low, pure host overhead) where the device sustains ~385, so %SOL must be device-timed. (`roofline.py`, wired into `_device_race` + the perf gate.)
+- **The `activation_reduce` idiom, fixed across every authoring surface.** On-device testing found the fused sum-of-squares / softmax-denominator reduce was being emitted in a return-form (`nisa.activation(op, reduce_op=)`) that does **not** compile on this stack (NCC_INIC902 / wrong shape). The correct idiom — `nisa.activation_reduce(..., reduce_res=<out-param>)`, harvested from the internal NKI-Autotune reference and validated cos 1.0 (~11% faster) — is now taught consistently in the mutator, the author knowledge base, and the repair-hint map.
+- **The whole Stage-4 pipeline ran end-to-end on hardware.** `author → compile → device-race → correctness-oracle → %SOL → mutator` executed on a real NeuronCore for elementwise, norm, **and attention** ops — including the live **Bedrock Opus-5 author writing a numerically-correct `attn_decode` kernel first try, no repair**. The framework honestly declines to bank a kernel that doesn't beat its baseline.
+- **Honest finding — where the first *win* comes from.** Re-measured on-device, standard small ops (rmsnorm, gelu, attn_decode) are **correct but slower than the compiler baseline** (0.37–0.70×) — hand-written NKI, even LLM-authored, loses on ops the compiler already does well. NKI wins **only in the compiler-weak regime** (long-context attention, sparse, IO-bound), which is exactly where the banked FlashAttention kernel (below) lives. Recipe-authored ops were also *fixed to compile + run correctly* (e.g. the RMSNorm recipe's 1-D-collapse / partition-broadcast / gamma-axis bugs) so they flow cleanly through the pipeline as honest anti-patterns rather than dead rejects.
+- **Compute note.** `trn2.48xlarge` (the full 128-NeuronCore node) is **Capacity-Blocks-only** — confirmed no on-demand capacity in any AZ. Day-to-day optimization runs on `trn2.3xlarge`; a full node needs a reserved Capacity Block.
+
 ## Current state (2026-08-21, honest)
 
 Live and running on **two `trn2.3xlarge` boxes in parallel**, pooling one knowledge bank.
