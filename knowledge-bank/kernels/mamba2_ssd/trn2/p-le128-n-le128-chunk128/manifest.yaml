@@ -1,0 +1,41 @@
+name: mamba2_ssd_chunked_fwd
+primitive: mamba2_ssd
+kernel_family: Mamba-2/SSD
+arch: trn2
+shape_class: p-le128-n-le128-chunk128
+entry: mamba2_ssd_fwd
+dtype: fp32
+status: passed-on-device
+provenance: >-
+  From-scratch NKI 0.6.0 kernel for the Mamba-2 state-space-duality selective scan
+  (a private-customer 34M backbone). Chunk form: per chunk cs=cumsum(dt*A);
+  CB=(C@B^T)*causal; Y_intra=exp(cs)*(CB@(dt*x*exp(-cs))); Y_off=exp(cs)*(C@state);
+  state=exp(cs_last)*state + B^T@(dt*x*exp(cs_last-cs)). Reuses the GDN kernel
+  idioms (in-kernel cumsum via tensor_tensor_scan, _mm/_tmm/_mmt matmul helpers,
+  cross-chunk state carry in SBUF) but has NO triangular solve / Neumann doubling —
+  strictly simpler than GDN. Per-head scalar A is partition-broadcast for tensor_scalar.
+license: Apache-2.0
+correctness:
+  oracle: reference.py::ssd_mamba2_ref (numpy chunk form, matches per-token recurrence)
+  cosine: 1.0
+  max_abs_err: 2.6e-4
+  notes: exact at fp32 for both y and the carried final_state across (L128/n64/p128,
+    L256/n64/p128, L256/n128/p64); err is fp32-vs-fp64 rounding
+performance:
+  baseline: torch chunk reference (ssd_mamba2_ref)
+  notes: forward validated; perf benchmark pending (structure mirrors GDN fwd, ~3x expected)
+sdk:
+  nki: "0.6.0"
+  neuronxcc: "2.27.5334"
+  backend: native-pytorch
+validated_on: trn2.3xlarge
+date: "2026-08-26"
+inputs: >-
+  x [L,p]; dt [L,1]; A [1,1] (per-head scalar, negative); B,C [L,n];
+  state0 [n,p]; causal [Q,Q] lower-tri incl. L % 128 == 0, p<=128, n<=128.
+  Returns (y [L,p], final_state [n,p]). All compute fp32.
+routes_for:
+  - mamba2
+  - ssd
+  - selective_scan
+  - state_space_duality
