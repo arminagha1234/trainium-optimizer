@@ -267,3 +267,32 @@ def _run_standalone() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(_run_standalone())
+
+
+def test_delayed_division_broadcast_form_reciprocals_the_small_tile():
+    """The common softmax form `e / nl.broadcast_to(den, shape=(P,F))` must move
+    the reciprocal INSIDE the broadcast (onto the [P,1] den), not reciprocate the
+    [P,F] result. On-device this is the 1.75x delayed-division win."""
+    src = ("import neuronxcc.nki.language as nl\n"
+           "def k(e, den, P, F):\n"
+           "    o = e / nl.broadcast_to(den, shape=(P, F))\n"
+           "    return o\n")
+    out = KM._delayed_division(src)
+    assert out is not None
+    assert "e * nl.broadcast_to(nl.reciprocal(den), shape=(P, F))" in out
+    assert "e / nl.broadcast_to" not in out
+    ast.parse(out)
+
+
+def test_delayed_division_bare_form_still_works():
+    src = ("def k(e, den):\n"
+           "    o = e / den\n"
+           "    return o\n")
+    out = KM._delayed_division(src)
+    assert out is not None
+    assert "e * nl.reciprocal(den)" in out
+
+
+def test_delayed_division_skips_scalar_divide():
+    src = "def k(t, F):\n    ms = t * (1.0 / F)\n    return ms\n"
+    assert KM._delayed_division(src) is None

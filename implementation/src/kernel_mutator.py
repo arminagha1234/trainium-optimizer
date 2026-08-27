@@ -143,6 +143,14 @@ def _fuse_square_reduce(src: str) -> str | None:
     return src[:m.start()] + repl + src[m.end():]
 
 
+# X / nl.broadcast_to(<den>, shape=...) — the COMMON softmax/norm form: the
+# denominator is a [P,1] tile broadcast to [P,F] before an element-wise divide.
+# The reciprocal must go on the SMALL [P,1] tile (inside the broadcast), not on
+# the full [P,F] result. Tried FIRST (more specific than the bare-name form).
+_DELAYED_DIV_BCAST_RE = re.compile(
+    r"([A-Za-z_]\w*)\s*/\s*nl\.broadcast_to\(\s*([A-Za-z_]\w*)\s*,\s*"
+    r"(shape\s*=\s*\([^)]*\))\s*\)")
+
 # X / <denominator>  where the denominator is a reduced sum / a *den*-named tile
 _DELAYED_DIV_RE = re.compile(
     r"([A-Za-z_]\w*)\s*/\s*(nl\.sum\([^()]*\)|[A-Za-z_]*(?:den|sum)[A-Za-z_]*)")
@@ -150,14 +158,26 @@ _DELAYED_DIV_RE = re.compile(
 
 def _delayed_division(src: str) -> str | None:
     """MEMORY_BOUND lever: turn an element-wise divide by a reduced denominator
-    ``X / den`` into ``X * nl.reciprocal(den)`` — one reciprocal on the small
-    [P,1] denominator + a multiply, instead of a full-tensor divide every
-    element (delayed-softmax-division). Deliberately conservative: only matches a
-    denominator that is an ``nl.sum(...)`` or a ``*den*``/``*sum*``-named tile, so
-    a scalar divide like ``1.0 / F`` is never touched. Only fires on a match."""
-    if not _DELAYED_DIV_RE.search(src):
-        return None
-    return _DELAYED_DIV_RE.sub(r"\1 * nl.reciprocal(\2)", src)
+    into a reciprocal-on-the-small-tile + multiply (delayed-softmax-division).
+    On-device (trn2, 2026-08-27) this is a large win — softmax H=8192 went
+    119us -> 68us (1.75x) — because the reciprocal runs on the [P,1] denominator
+    ONCE instead of a full-tensor divide every element.
+
+    Two forms, most-specific first:
+      1. ``X / nl.broadcast_to(den, shape=S)`` -> ``X * nl.broadcast_to(
+         nl.reciprocal(den), shape=S)`` — the COMMON case. The reciprocal moves
+         INSIDE the broadcast so it acts on the small [P,1] tile, not the [P,F]
+         result (reciprocating the broadcast result would defeat the point).
+      2. ``X / den`` (bare ``nl.sum(...)`` or a ``*den*``/``*sum*``-named tile)
+         -> ``X * nl.reciprocal(den)``.
+    Deliberately conservative — a scalar divide like ``1.0 / F`` is never touched.
+    Only fires on a match."""
+    if _DELAYED_DIV_BCAST_RE.search(src):
+        return _DELAYED_DIV_BCAST_RE.sub(
+            r"\1 * nl.broadcast_to(nl.reciprocal(\2), \3)", src)
+    if _DELAYED_DIV_RE.search(src):
+        return _DELAYED_DIV_RE.sub(r"\1 * nl.reciprocal(\2)", src)
+    return None
 
 
 # Ordered mutation table: (label, fn, bottleneck it targets). Order is the
