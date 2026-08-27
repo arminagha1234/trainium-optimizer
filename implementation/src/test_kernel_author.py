@@ -545,3 +545,36 @@ def _run_standalone() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(_run_standalone())
+
+
+# -- proactive fix leads from banked lessons (_fmt_lessons + match_error) ------
+def _lesson_with_reason(reason, lid="antipattern-invented-rmsnorm-h128"):
+    from bank import Applicability, Lesson
+    from ledger import Layer
+    return Lesson(
+        lesson_id=lid, type=LessonType.ANTI_PATTERN,
+        applicability=Applicability("dense-causal-lm", neuron_sdk_versions=["2.28.*"]),
+        layer=Layer.KERNEL, migration_risk="low", tier=Tier.PROVISIONAL,
+        reason=reason,
+    )
+
+
+def test_banked_lesson_surfaces_known_fix_at_round_one():
+    """A banked anti-pattern whose reason carries a known compiler-error
+    signature surfaces the catalogued rewrite's FIX in the prompt at round 1
+    (no feedback) — the remedy compounds forward, not just the error prose."""
+    spec = catalog()["rmsnorm"]
+    lesson = _lesson_with_reason(
+        "on-device compile failed: NCC_EVRF029: Operation sort is not supported "
+        "on trn2 (MoE router torch.topk lowered to sort)")
+    prompt = build_author_prompt(spec, lessons=[lesson], feedback=None)
+    assert "known fix" in prompt
+    assert "topk-sort-to-argmax" in prompt      # the catalogued remedy name
+    assert "round 1" in prompt                  # still the first authoring attempt
+
+
+def test_banked_lesson_without_known_error_has_no_fix_line():
+    spec = catalog()["rmsnorm"]
+    lesson = _lesson_with_reason("was simply slower than the compiler baseline")
+    prompt = build_author_prompt(spec, lessons=[lesson], feedback=None)
+    assert "known fix" not in prompt
