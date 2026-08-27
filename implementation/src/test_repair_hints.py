@@ -45,6 +45,8 @@ TOO_MANY_POS_ERR = ('device compile failed: RuntimeError("authored kernel not '
 ISFV902_ERR = ('device compile failed: RuntimeError("RunNeuronCCImpl: error '
                'condition error != 0: [INTERNAL_ERROR] [NCC_ISFV902] SFKVectorizer '
                'error: gist(): incompatible function arguments.")')
+INIC902_ERR = ('device compile failed: RuntimeError("[INTERNAL_ERROR] [NCC_INIC902] '
+               "NeuronInstComb error: 'NoneType' object has no attribute 'use_empty'\")")
 
 _SEEDED = {
     "nc_matmul-missing-moving": (NC_MATMUL_ERR,
@@ -52,7 +54,7 @@ _SEEDED = {
     "nc_transpose-missing-data": (NC_TRANSPOSE_ERR,
                                   "nisa.nc_transpose(data=src)"),
     "activation-signature": (ACTIVATION_DTYPE_ERR,
-                             "nisa.activation(nl.square, x"),
+                             "nisa.activation_reduce(op=nl.square"),
     "simplifier-ismp902-host-cast": (ISMP902_ERR, "cast on the HOST"),
     "reduction-collapse-1d": (REDUCTION_1D_ERR, "keepdims=True"),
     "broadcast-to-freefn": (BROADCAST_ERR, "nl.broadcast_to(tile, shape=(P, F))"),
@@ -62,6 +64,8 @@ _SEEDED = {
                                        "nl.store(out[:, a:b], value=tile)"),
     "too-many-positional-return-form": (TOO_MANY_POS_ERR, "RETURN-FORM contract"),
     "sfkvectorizer-gist-isfv902": (ISFV902_ERR, "partition dim >=2"),
+    "activation-reduce-return-form-inic902": (INIC902_ERR,
+                                              "nisa.activation_reduce(op=nl.square"),
 }
 
 
