@@ -96,21 +96,51 @@ def _narrow_tile(src: str) -> str | None:
     return re.sub(r"(?<![\w.])512(?![\w.])", "256", src)
 
 
-# nl.sum(t * t, axis=..., keepdims=True)  -> the mean-square in ONE Scalar pass
-_SQUARE_SUM_RE = re.compile(
-    r"nl\.sum\(\s*([A-Za-z_]\w*)\s*\*\s*\1\s*,\s*axis=\d+\s*,\s*keepdims=True\s*\)")
+# An assignment whose RHS contains ``nl.sum(t * t, ...)`` or ``nl.sum(nl.square(t),
+# ...)`` — the sum-of-squares reduction, possibly as a SUB-expression (e.g.
+# ``ms = nl.sum(t*t, axis=1, keepdims=True) * (1.0/F)``). Captures the indent,
+# the lhs, everything on the RHS before the sum, the squared operand, and
+# everything after — so the reduce can be hoisted to its own statement and the
+# sum replaced inline by a reference to the result.
+_SQUARE_SUM_ASSIGN_RE = re.compile(
+    r"^([ \t]*)([A-Za-z_]\w*)(\s*=\s*)(.*?)"
+    r"nl\.sum\(\s*(?:([A-Za-z_]\w*)\s*\*\s*\5|nl\.square\(\s*([A-Za-z_]\w*)\s*\))"
+    r"\s*,\s*axis=\d+\s*,\s*keepdims=True\s*\)(.*)$",
+    re.MULTILINE)
 
 
 def _fuse_square_reduce(src: str) -> str | None:
-    """MEMORY_BOUND / SINGLE_ENGINE lever: collapse ``nl.sum(t * t, axis=1,
-    keepdims=True)`` (materialize a squared tile, then reduce) into ONE
-    Scalar-engine instruction ``nisa.activation(nl.square, t, reduce_op=nl.add)``
-    (the activation-reduce fusion). Only fires when the square-then-sum pattern
-    is present."""
-    if not _SQUARE_SUM_RE.search(src):
+    """MEMORY_BOUND / SINGLE_ENGINE lever: collapse a sum-of-squares
+    (``nl.sum(t * t, axis=1, keepdims=True)`` or ``nl.sum(nl.square(t), ...)``)
+    into the fused Scalar-engine ``nisa.activation_reduce`` instruction.
+
+    On-device (trn2, neuronx-cc 2.27, 2026-08-27) the fused reduce is BOTH the
+    only compiling form AND ~11% faster (rmsnorm H=16384: 177us -> 160us). NOTE:
+    ``nisa.activation_reduce`` REQUIRES a ``reduce_res=`` out-param (it has NO
+    return form — the earlier ``nisa.activation(nl.square, t, reduce_op=)``
+    return-form emitted here FAILED to compile, NCC_INIC902), so this is a
+    multi-STATEMENT rewrite: allocate a [P,1] SBUF result, run the fused reduce
+    into it, then reference it where the sum was. The exact idiom
+    (``op=nl.square, reduce_op=nl.add, reduce_res=<tmp>[...]``) is harvested from
+    the internal NKI-Autotune ``kernel_library/rmsnorm_linear.py`` and on-device
+    validated (cos 1.0). Only fires when the pattern is present AND the kernel
+    already imports ``nisa`` (else the rewrite would NameError at exec)."""
+    if "nisa" not in src:
         return None
-    return _SQUARE_SUM_RE.sub(
-        r"nisa.activation(nl.square, \1, reduce_op=nl.add)", src)
+    m = _SQUARE_SUM_ASSIGN_RE.search(src)
+    if not m:
+        return None
+    indent, lhs, eq, prefix = m.group(1), m.group(2), m.group(3), m.group(4)
+    operand = m.group(5) or m.group(6)
+    suffix = m.group(7)
+    tmp = f"{lhs}_sq"
+    repl = (
+        f"{indent}{tmp} = nl.ndarray(({operand}.shape[0], 1), dtype=nl.float32, "
+        f"buffer=nl.sbuf)\n"
+        f"{indent}nisa.activation_reduce(op=nl.square, data={operand}, "
+        f"reduce_op=nl.add, reduce_res={tmp}[...])\n"
+        f"{indent}{lhs}{eq}{prefix}{tmp}{suffix}")
+    return src[:m.start()] + repl + src[m.end():]
 
 
 # X / <denominator>  where the denominator is a reduced sum / a *den*-named tile
