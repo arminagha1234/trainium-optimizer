@@ -205,10 +205,24 @@ class KernelRegistry:
 
     def for_primitive(self, primitive: str) -> KernelSpec | None:
         """Resolve a primitive descriptor to an available KernelSpec, or None.
+        Back-compat shim; delegates to :meth:`for_signature` (which adds a safe
+        near-miss fallback but resolves an exact hit identically)."""
+        return self.for_signature(primitive)
+
+    def for_signature(self, primitive: str, op_name: str = "") -> KernelSpec | None:
+        """Resolve a primitive descriptor (optionally aided by the op NAME) to an
+        available KernelSpec, or None.
 
         Consult order: the in-repo validated kernel library FIRST (a kernel we
         wrote + validated, source in this repo), then the external proprietary
-        registry. So "harvest before invent" reuses our own kernels first."""
+        registry. So "harvest before invent" reuses our own kernels first.
+
+        Name resolution uses ``op_signature.resolve_kernel_name`` — an EXACT
+        ``kernel_for_primitive`` hit first (byte-identical to before), then a
+        longest-embedded-descriptor fallback on the primitive and, last, on the
+        op name. This makes cross-model reuse robust to a near-miss spelling
+        (e.g. ``"qwen3next_gated_delta"``) that the exact map would miss, without
+        ever changing an existing exact hit."""
         if self.library is not None:
             try:
                 lk = self.library.lookup(primitive)
@@ -218,7 +232,11 @@ class KernelRegistry:
                         return spec
             except Exception:  # noqa: BLE001 — a library miss must never break routing
                 pass
-        name = kernel_for_primitive(primitive)
+        try:
+            from op_signature import resolve_kernel_name
+            name = resolve_kernel_name(primitive, op_name)
+        except Exception:  # noqa: BLE001 — fall back to the exact map if unavailable
+            name = kernel_for_primitive(primitive)
         return self.lookup(name) if name else None
 
     def available(self, kernel_name: str) -> bool:
