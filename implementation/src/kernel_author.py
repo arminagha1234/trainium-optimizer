@@ -288,15 +288,31 @@ kernel is a loss):
 
 
 def _fmt_lessons(lessons: list | None) -> str:
+    """Render retrieved bank lessons for the prompt. For each lesson, if its
+    recorded reason carries a KNOWN compiler-error signature (a prior failure was
+    banked with the raw error in its ``reason``), surface the catalogued rewrite's
+    FIX right under it — so a failure learned on an earlier model carries its
+    remedy forward to ROUND 1 of authoring THIS op, instead of the author only
+    seeing the error prose and re-deriving the fix. This is the author-time analogue
+    of the repair-loop's error->fix mapping (``_fmt_feedback``), applied
+    proactively to banked lessons before the first compile."""
     if not lessons:
         return "(none retrieved)"
     out = []
     for l in lessons:
         lid = getattr(l, "lesson_id", "?")
-        reason = (getattr(l, "reason", "") or "").strip()
-        if len(reason) > 300:
-            reason = reason[:297] + "..."
+        full_reason = (getattr(l, "reason", "") or "").strip()
+        reason = full_reason[:297] + "..." if len(full_reason) > 300 else full_reason
         out.append(f"  - [{lid}] {reason}")
+        # Proactive fix lead: match the FULL reason (before truncation) against the
+        # rewrite catalog. One line per matched rewrite (name + summary) — the full
+        # fix body is reserved for the repair loop to avoid round-1 prompt bloat.
+        seen: set[str] = set()
+        for r in match_error(full_reason):
+            if r.name in seen:
+                continue
+            seen.add(r.name)
+            out.append(f"      known fix [{r.name}]: {r.summary}")
     return "\n".join(out)
 
 
