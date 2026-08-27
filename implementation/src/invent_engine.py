@@ -481,7 +481,21 @@ class InventEngine:
         # engine has no hard dependency on the routing layer.
         if registry is None:
             from kernel_registry import KernelRegistry
-            registry = KernelRegistry()
+            # Default the kernel registry to the IN-REPO validated kernels dir
+            # (implementation/src/kernels/) when $TRN_OPT_KERNEL_DIR is unset, so
+            # harvest-before-invent fires WITHOUT any manual env: a model whose
+            # primitive matches a banked kernel (e.g. flash_attention ->
+            # kernels/FlashAttention, on-device-validated) reuses it automatically
+            # instead of re-authoring. $TRN_OPT_KERNEL_DIR still overrides (point
+            # it at an external/proprietary kernel tree). Falls back to no dir
+            # (empty registry, unchanged behavior) if the in-repo dir is absent.
+            env_kdir = os.environ.get("TRN_OPT_KERNEL_DIR")
+            if env_kdir:
+                kdir: str | None = env_kdir
+            else:
+                _repo_kernels = Path(__file__).resolve().parent / "kernels"
+                kdir = str(_repo_kernels) if _repo_kernels.is_dir() else None
+            registry = KernelRegistry(kernel_dir=kdir)
         self.registry = registry
         # BANK-ON-WIN: the in-repo validated kernel library (kernel_library.
         # KernelLibrary). When set, an on-device WIN also stores the kernel SOURCE

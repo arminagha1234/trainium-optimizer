@@ -1047,3 +1047,30 @@ def test_device_race_default_profit_verdict_empty():
     # gate's fail-open 'unknown' path handles that (never skips on missing data).
     rr = RaceResult(False, reason="off-device")
     assert rr.sol == 0.0 and rr.profit_verdict == ""
+
+
+# -- default registry auto-harvest wiring (TRN_OPT_KERNEL_DIR) ----------------
+def test_default_registry_harvests_from_kernel_dir(tmp_path, monkeypatch):
+    """With TRN_OPT_KERNEL_DIR set, InventEngine's DEFAULT registry (registry=None)
+    harvests a banked kernel by primitive — no manual registry wiring. This is
+    what makes flash_attention auto-reuse the on-device FlashAttention kernel."""
+    kd = tmp_path / "kernels" / "FlashAttention"
+    kd.mkdir(parents=True)
+    (kd / "kernel.json").write_text(
+        '{"name":"FlashAttention","status":"passed-on-device",'
+        '"entry":"adapter:build_flash_forward","path":"FlashAttention/adapter.py",'
+        '"variants":["flash_attention"]}')
+    monkeypatch.setenv("TRN_OPT_KERNEL_DIR", str(tmp_path / "kernels"))
+    from invent_kernels import flash_attention_spec
+    eng = InventEngine(out_dir=tmp_path / "run")          # registry=None -> default
+    ks = eng._prior_art(flash_attention_spec())
+    assert ks is not None and ks.name == "FlashAttention" and ks.usable and ks.hw_ready
+
+
+def test_env_kernel_dir_overrides_and_absent_dir_is_empty(tmp_path, monkeypatch):
+    # a non-existent TRN_OPT_KERNEL_DIR yields an empty registry (no harvest,
+    # unchanged behavior) rather than erroring.
+    monkeypatch.setenv("TRN_OPT_KERNEL_DIR", str(tmp_path / "nope"))
+    from invent_kernels import flash_attention_spec
+    eng = InventEngine(out_dir=tmp_path / "run2")
+    assert eng._prior_art(flash_attention_spec()) is None
