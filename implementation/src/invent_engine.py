@@ -187,6 +187,13 @@ class RaceResult:
     bottleneck: str = ""                # "memory_bound" | "compute_bound" | ""
     roofline_ratio: float = 0.0         # arithmetic_intensity / bf16 ridge point
     mfu: float = -1.0                   # best-effort model-FLOPs-utilization ceiling; -1 == unknown
+    # MEASURED %SOL against the real trn2 single-core roofline (roofline.py peak
+    # constants), computed from the device-timed kernel latency + the op's
+    # bytes/flops. 0.0 when off-device / unmeasured. ``profit_verdict`` is the
+    # profitability read: "opportunity" | "marginal" | "near_sol" | "unknown".
+    # Trailing + defaulted so every existing RaceResult construction is unchanged.
+    sol: float = 0.0
+    profit_verdict: str = ""
 
 
 @dataclass
@@ -330,6 +337,45 @@ def _analytic_roofline(spec: OpSpec) -> tuple[float, str, float]:
     ratio = ai / _BF16_RIDGE_FLOPS_PER_BYTE
     bottleneck = "memory_bound" if ai < _BF16_RIDGE_FLOPS_PER_BYTE else "compute_bound"
     return ai, bottleneck, ratio
+
+
+def _op_bytes_flops(spec: OpSpec) -> tuple[float, float]:
+    """The op's HBM traffic (bytes moved: one load per input + one store of the
+    output) and flop count, from shapes alone — the raw inputs a %SOL computation
+    needs (``roofline.sol_memory_bound``/``sol_compute_bound``). Same accounting
+    as ``_analytic_roofline`` (which only returns the ratio); factored out here so
+    the achieved-vs-peak %SOL can be computed from a device-timed latency. Never
+    raises — returns (0.0, 0.0) on any shape/reference failure, which routes the
+    roofline gate to its fail-open ``unknown`` verdict."""
+    nbytes = _dtype_bytes(spec.dtype)
+    try:
+        inp = spec.real_inputs()
+        if not isinstance(inp, dict):
+            inp = {}
+    except Exception:  # noqa: BLE001
+        inp = {}
+    arrays = [np.asarray(v) for v in inp.values()]
+    in_elems = int(sum(a.size for a in arrays))
+    try:
+        out_elems = int(np.asarray(spec.reference(inp)).size)
+    except Exception:  # noqa: BLE001
+        out_elems = max((a.size for a in arrays), default=0)
+    bytes_moved = float((in_elems + out_elems) * nbytes)
+    if bytes_moved <= 0:
+        return 0.0, 0.0
+    name = (spec.name or "").lower()
+    if any(tok in name for tok in _MATMUL_TOKENS):
+        twod = sorted((a for a in arrays if a.ndim >= 2),
+                      key=lambda a: a.size, reverse=True)
+        if twod:
+            m, k = twod[0].shape[0], twod[0].shape[-1]
+            n = twod[1].shape[-1] if len(twod) > 1 else 1
+            flops = 2.0 * float(m) * float(n) * float(k)
+        else:
+            flops = _flops_per_elem(name) * float(in_elems)
+    else:
+        flops = _flops_per_elem(name) * float(in_elems)
+    return bytes_moved, flops
 
 
 # ---------------------------------------------------------------------------
@@ -797,10 +843,25 @@ class InventEngine:
                 return RaceResult(False, reason=(
                     f"fair on-device timing failed (kernel={kernel_ms:.3f}ms, "
                     f"baseline={baseline_ms:.3f}ms) — deferred"), **_perf)
+            # %SOL against the real trn2 roofline (roofline.py measured peaks),
+            # from the device-timed kernel latency + the op's bytes/flops. This is
+            # the PROFITABILITY signal: a kernel already near SOL leaves no room to
+            # optimize further (the perf gate reads profit_verdict). device_s uses
+            # the SAME synchronized on-device latency as the speedup, not a naive
+            # host loop. Never raises — a roofline failure just leaves sol at 0.0.
+            sol, profit_verdict = 0.0, ""
+            try:
+                import roofline  # noqa: PLC0415 — optional, self-contained
+                _bytes, _flops = _op_bytes_flops(spec)
+                _prof = roofline.profitability(
+                    _bytes, _flops, kernel_ms / 1000.0, bottleneck)
+                sol, profit_verdict = _prof.sol, _prof.verdict
+            except Exception:  # noqa: BLE001 — %SOL is advisory; never break the race
+                pass
             return RaceResult(True, correct, corr_pct, speedup,
                               kernel_ms, baseline_ms,
                               reason=f"correct={correct} speedup={speedup:.3f}x [{oracle_note}]",
-                              **_perf)
+                              sol=sol, profit_verdict=profit_verdict, **_perf)
         except Exception as e:  # noqa: BLE001 — device errors are data
             return RaceResult(True, False, 0.0, 0.0,
                               reason=f"device race error: {e!r}", **_perf)
@@ -1074,8 +1135,19 @@ class InventEngine:
         # behaviour is byte-for-byte today's single race.
         perf_note = ""
         if self.max_perf_rounds and self.max_perf_rounds > 1:
-            author, race, perf_note = self._optimize_perf(
-                spec, author, race, lessons, race_fn)
+            # PROFITABILITY GATE: if the correct kernel is ALREADY near the
+            # hardware roofline (>=80% of measured single-core SOL), further
+            # optimization cannot meaningfully help — skip the perf loop and its
+            # authoring cost. Fail-open: only a POSITIVE near_sol reading skips;
+            # "opportunity"/"marginal"/"unknown" all still optimize (we never skip
+            # an op on a missing/low measurement). See roofline.py.
+            if getattr(race, "profit_verdict", "") == "near_sol":
+                perf_note = (f" [perf loop skipped: near_sol "
+                             f"(sol={race.sol*100:.0f}% of roofline) — already "
+                             f"near the hardware ceiling, no headroom to optimize]")
+            else:
+                author, race, perf_note = self._optimize_perf(
+                    spec, author, race, lessons, race_fn)
 
         # Correct — now the speed race with the 5% invention margin.
         is_win = self.guards.is_improvement(race.speedup, 1.0, is_invention=True)

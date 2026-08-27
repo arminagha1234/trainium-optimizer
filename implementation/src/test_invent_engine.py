@@ -1000,3 +1000,50 @@ def test_retrieve_lessons_finds_op_across_model_families(tmp_path):
     ids = [l.lesson_id for l in eng._retrieve_lessons(catalog()["rmsnorm"])]
     assert "invented-rmsnorm-rmsnorm-h128" in ids  # found despite MoE-vs-dense mismatch
     assert "invented-softmax-sm128" not in ids      # wrong op-family, correctly excluded
+
+
+# -- roofline %SOL profitability gate wiring ---------------------------------
+def _near_sol_win(_a, _s):
+    return RaceResult(True, correct=True, correctness_pct=100.0, speedup=1.30,
+                      kernel_ms=0.70, baseline_ms=0.91, reason="near sol",
+                      bottleneck="memory_bound", roofline_ratio=0.3, mfu=0.3,
+                      sol=0.86, profit_verdict="near_sol")
+
+
+def _opportunity_win(_a, _s):
+    return RaceResult(True, correct=True, correctness_pct=100.0, speedup=1.30,
+                      kernel_ms=0.70, baseline_ms=0.91, reason="opportunity",
+                      bottleneck="memory_bound", roofline_ratio=0.3, mfu=0.3,
+                      sol=0.20, profit_verdict="opportunity")
+
+
+def test_perf_loop_skipped_when_near_sol(tmp_path):
+    """A correct kernel already near the roofline (profit_verdict=near_sol) must
+    SKIP the perf loop — the profitability gate — even with max_perf_rounds>1."""
+    eng = InventEngine(out_dir=tmp_path, max_perf_rounds=4)
+    res = eng.run_op(catalog()["rmsnorm"], race_fn=_near_sol_win)
+    assert res.status == "win"
+    assert "skipped: near_sol" in res.detail
+    assert "perf loop (" not in res.detail          # the optimize loop did NOT run
+
+
+def test_perf_loop_runs_when_opportunity(tmp_path):
+    """A far-from-SOL kernel (opportunity) still enters the perf loop."""
+    eng = InventEngine(out_dir=tmp_path, max_perf_rounds=4)
+    res = eng.run_op(catalog()["rmsnorm"], race_fn=_opportunity_win)
+    assert res.status == "win"
+    assert "perf loop (" in res.detail              # the optimize loop DID run
+    assert "skipped: near_sol" not in res.detail
+
+
+def test_op_bytes_flops_positive_for_real_op():
+    from invent_engine import _op_bytes_flops
+    b, f = _op_bytes_flops(catalog()["rmsnorm"])
+    assert b > 0 and f >= 0
+
+
+def test_device_race_default_profit_verdict_empty():
+    # A deferred/off-device race carries no %SOL (empty verdict, sol 0) — the
+    # gate's fail-open 'unknown' path handles that (never skips on missing data).
+    rr = RaceResult(False, reason="off-device")
+    assert rr.sol == 0.0 and rr.profit_verdict == ""
