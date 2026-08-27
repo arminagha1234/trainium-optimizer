@@ -246,11 +246,17 @@ def bedrock_complete_fn(model_id: str = "anthropic.claude-opus-5",
             "Bedrock provider needs an AWS region: pass region=... or set "
             "AWS_REGION (or AWS_DEFAULT_REGION) in the environment."
         )
-    # Long read_timeout: Opus-5's thinking pass exceeds boto3's 60s default and
-    # was timing out mid-authoring. connect_timeout + bounded retries keep a
-    # transient network blip from failing the whole round.
-    boto_config = _BotoConfig(read_timeout=600, connect_timeout=15,
-                              retries={"max_attempts": 3})
+    # Long read_timeout + SINGLE attempt. Opus-5's thinking pass on a HARD op
+    # (flash attention at 48k tokens) exceeds 10 min — observed on-device
+    # 2026-08-27: with read_timeout=600 + max_attempts=3 the call hit the 600s
+    # read timeout and boto SILENTLY RETRIED, each retry starting a FRESH ~10-min
+    # generation (Bedrock does not resume), so the round could never converge and
+    # burned ~30 min. Fix: read_timeout=1800 (30 min — comfortably covers the
+    # longest thinking pass) and max_attempts=1 (NO silent retry cascade — a
+    # genuine timeout surfaces immediately instead of tripling the wall-clock on
+    # the exact op we most need to author).
+    boto_config = _BotoConfig(read_timeout=1800, connect_timeout=15,
+                              retries={"max_attempts": 1})
     client = boto3.client("bedrock-runtime", region_name=resolved_region,
                           config=boto_config)
 
