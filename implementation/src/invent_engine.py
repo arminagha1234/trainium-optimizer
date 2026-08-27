@@ -512,8 +512,17 @@ class InventEngine:
         the invent loop itself writes to — a loss banked on op A of a run should
         inform a later authoring of the same op/shape-class in the SAME run,
         without waiting on weekly human promotion (the compounding the framework
-        is built on). Relevance is filtered by ``_lesson_relevant``. Never
-        raises — a broken bank must not stop authoring."""
+        is built on). Relevance is filtered by ``_lesson_relevant``.
+
+        Finally, steps (1)-(3) are all keyed by the MODEL architecture family, so
+        a kernel/rewrite learned for the SAME op on a DIFFERENT model family is
+        never surfaced — the compounding leaks across families. Step (4) closes
+        that with ``KnowledgeBank.query_by_op`` (op-family + shape_class keyed,
+        model-family agnostic); its results are added DIRECTLY, since it has
+        already filtered by op-family and the ``_lesson_relevant`` substring test
+        would wrongly drop a same-family-different-op-name match (e.g. a
+        ``layernorm`` lesson for an ``rmsnorm`` query). Never raises — a broken
+        bank must not stop authoring."""
         sdk = self.sdk_version
         found: dict[str, Lesson] = {}
 
@@ -523,6 +532,12 @@ class InventEngine:
                     continue
                 if self._lesson_relevant(l, spec):
                     found[l.lesson_id] = l
+
+        def _add_direct(lessons: list[Lesson] | None) -> None:
+            # Trust the caller's own relevance filter (query_by_op's op-family
+            # match); do NOT re-apply _lesson_relevant, which is op-NAME based.
+            for l in lessons or []:
+                found.setdefault(l.lesson_id, l)
 
         # (1) family anti-patterns (verified) — the real bank pruning index.
         try:
@@ -548,6 +563,17 @@ class InventEngine:
             _add([l for l in self.bank.load_all(Tier.PROVISIONAL)
                   if l.type in (LessonType.ANTI_PATTERN, LessonType.NKI_KERNEL)
                   and _fam_ok(l)])
+        except Exception:  # noqa: BLE001
+            pass
+        # (4) op-family-keyed retrieval ACROSS model families — a kernel/rewrite
+        #     for the SAME op (or same op-family + shape-class) learned on ANY
+        #     model family is relevant to authoring this op. Both tiers, since an
+        #     invented kernel is banked provisional first. Added directly (see
+        #     _add_direct): query_by_op already filtered by op-family.
+        try:
+            for _tier in (Tier.VERIFIED, Tier.PROVISIONAL):
+                _add_direct(self.bank.query_by_op(
+                    spec.name, spec.shape_class, tier=_tier))
         except Exception:  # noqa: BLE001
             pass
         return list(found.values())

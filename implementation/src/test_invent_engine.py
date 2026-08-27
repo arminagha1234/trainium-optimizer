@@ -967,3 +967,36 @@ def _run_standalone() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(_run_standalone())
+
+
+# -- op-family cross-model-family lesson retrieval (query_by_op wiring) -------
+def test_retrieve_lessons_finds_op_across_model_families(tmp_path):
+    """A kernel lesson banked for `rmsnorm` on a MoE model must be retrieved
+    when authoring `rmsnorm` on a DENSE model — the compounding query_by_op
+    unlocks. The old family-keyed retrieval (steps 1-3) missed it entirely."""
+    from bank import Applicability, Confidence, Lesson
+    from ledger import Layer
+
+    bank = KnowledgeBank(tmp_path / "knowledge-bank")
+    bank.save(Lesson(
+        lesson_id="invented-rmsnorm-rmsnorm-h128",
+        type=LessonType.NKI_KERNEL,
+        applicability=Applicability("moe-causal-lm", neuron_sdk_versions=["2.28.*"]),
+        layer=Layer.KERNEL, migration_risk="low", tier=Tier.VERIFIED,
+        intervention={"spec": {"nki_kernel": "rmsnorm", "shape_class": "rmsnorm-h128"}},
+        confidence=Confidence(n_models_validated=2), last_reverified_sdk="2.28.0",
+    ))
+    # A different op-family (softmax) on another model family must NOT surface.
+    bank.save(Lesson(
+        lesson_id="invented-softmax-sm128",
+        type=LessonType.NKI_KERNEL,
+        applicability=Applicability("moe-causal-lm", neuron_sdk_versions=["2.28.*"]),
+        layer=Layer.KERNEL, migration_risk="low", tier=Tier.VERIFIED,
+        intervention={"spec": {"nki_kernel": "softmax", "shape_class": "sm128"}},
+        confidence=Confidence(n_models_validated=2), last_reverified_sdk="2.28.0",
+    ))
+
+    eng = InventEngine(out_dir=tmp_path)          # rmsnorm spec.family = dense_causal_lm
+    ids = [l.lesson_id for l in eng._retrieve_lessons(catalog()["rmsnorm"])]
+    assert "invented-rmsnorm-rmsnorm-h128" in ids  # found despite MoE-vs-dense mismatch
+    assert "invented-softmax-sm128" not in ids      # wrong op-family, correctly excluded
