@@ -463,6 +463,68 @@ class KnowledgeBank:
         ]
         return sorted(hits, key=lambda l: l.confidence.score(), reverse=True)
 
+    def query_by_op(
+        self,
+        op_name: str,
+        shape_class: str = "",
+        op_family: str = "",
+        *,
+        tier: Tier = Tier.VERIFIED,
+        types: tuple[LessonType, ...] = (
+            LessonType.NKI_KERNEL,
+            LessonType.OP_REWRITE,
+        ),
+        backend: str | None = None,
+    ) -> list[Lesson]:
+        """Retrieve op-structured lessons keyed by the OP, not the model family.
+
+        The existing ``query_interventions`` / ``query_symptom`` are keyed by
+        MODEL architecture family (dense-causal-lm, moe-causal-lm, ...), so a
+        kernel authored for an op on one model family is NOT found for the SAME
+        op on a model of a DIFFERENT family — the compounding leaks. This query
+        closes that: it matches on the OP-FAMILY (``nki_knowledge.classify_op``)
+        + shape_class carried in the lesson's ``intervention["spec"]``, ignoring
+        the model family entirely, so an ``rmsnorm`` kernel learned on a MoE
+        model is reused for ``rmsnorm`` on a dense model.
+
+        Only lessons that carry a structured op identity
+        (``intervention["spec"]["nki_kernel"]`` or ``["op"]``) participate —
+        model-class priors/anti-patterns without an op spec are unaffected and
+        remain served by the family-keyed queries above.
+
+        Ranked most-relevant first:
+          3. exact op name (and shape_class, when given),
+          2. same op-family AND same shape_class,
+          1. same op-family (any shape),
+        then by confidence. ``backend`` filters by execution stack exactly as the
+        other queries; None never filters.
+        """
+        from nki_knowledge import classify_op  # local: keep bank torch/knowledge-free at import
+
+        q_family = op_family or classify_op(op_name)
+        scored: list[tuple[int, float, Lesson]] = []
+        for l in self.load_all(tier):
+            if l.type not in types:
+                continue
+            if backend is not None and not _backend_matches(l, backend):
+                continue
+            spec = l.intervention.get("spec", {}) if isinstance(l.intervention, dict) else {}
+            l_op = str(spec.get("nki_kernel") or spec.get("op") or "")
+            if not l_op:
+                continue  # no structured op identity — out of scope for this query
+            l_sc = str(spec.get("shape_class", ""))
+            if l_op == op_name and (not shape_class or l_sc == shape_class):
+                rank = 3
+            elif classify_op(l_op) == q_family and shape_class and l_sc == shape_class:
+                rank = 2
+            elif classify_op(l_op) == q_family:
+                rank = 1
+            else:
+                continue
+            scored.append((rank, l.confidence.score(), l))
+        scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+        return [l for _, _, l in scored]
+
     def antipatterns(
         self, family: str, sdk_version: str,
     ) -> list[Lesson]:
