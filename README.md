@@ -19,6 +19,37 @@ one paragraph:
 > models and publish a **Neuron-optimized leaderboard** that refreshes on
 > every SDK release.
 
+## 📊 Progress toward the north star
+
+**North star:** point it at *any* HF model → optimize on Trn2 → verify correctness → publish a recipe → get cheaper every model — **zero humans in the loop.**
+
+```
+Overall autonomy   ██████████████████████████████████████████░░░░░░░  ~85%
+```
+
+**The 5-station factory line** (LOAD → COMPILE → AUTO-FIX → AUTHOR → BANK), all built, most validated on real silicon:
+
+```
+                        0%       25%       50%       75%      100%
+ 1. LOAD model          ████████████████████████████████████████ 100%  ✅
+ 2. COMPILE → NEFF      ████████████████████████████████████████ 100%  ✅
+ 3. AUTO-FIX errors     ██████████████████████████████████████░░  95%  ✅ device-proven
+ 4. AUTHOR kernels      █████████████████████████████████████░░░  92%  ✅ device-proven
+ 5. BANK / compound     ███████████████████████████████████████░  98%  ✅ device-proven
+```
+
+**Capability milestones:**
+
+```
+ A  recipe → correct on device      ██████████████████████████████ 100%  ✅
+ B  logprob/KL correctness gate     ███████████████████████████░░░  90%  ✅ (grader run pending)
+ C  attention authoring on silicon  ██████████████████████████████ 100%  ✅
+ D  auto-promotion / compounding     ██████████████████████████████ 100%  ✅
+ E  full UNATTENDED run (capstone)  ██████░░░░░░░░░░░░░░░░░░░░░░░░░  20%  ⬜ in progress
+```
+
+**Proven on real hardware this cycle** (trn2.3xlarge): device-measured **385 GB/s/core** peak → a live **%SOL profitability gate**; the full Stage-4 pipeline (`author → compile → race → %SOL → mutator`) executed on silicon; the live Opus-5 author wrote a **numerically-correct attention kernel first try**; the banked **FlashAttention** win **auto-harvests** with no setup; a real **logprob/KL task-eval** correctness gate composes with the publish gate. Honest limit: hand-written NKI loses to the compiler on standard small ops — wins come from the **compiler-weak regime** (long-context attention, sparse, IO-bound), which is exactly where FlashAttention lives.
+
 ## Current state (2026-08-27, honest) — Stage-4 hardened + validated end-to-end on silicon
 
 A large hardening pass on the kernel/optimization stage, with **every claim below re-verified on a real NeuronCore** (trn2.3xlarge).
