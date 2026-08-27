@@ -452,11 +452,23 @@ class InventEngine:
         or None. This is the Harvest step of Harvest -> Borrow -> Invent, and the
         AutoFixer 'search prior art before authoring' rule: never re-invent a
         kernel the corpus already has. Only kernels at >= simulate-correct rank
-        are returned (a failed-compile attempt is not prior art to reuse)."""
-        if not getattr(spec, "primitive", ""):
+        are returned (a failed-compile attempt is not prior art to reuse).
+
+        Resolution is by primitive descriptor AND (as a fallback) the op name,
+        via the registry's signature-aware lookup — so a model whose ``primitive``
+        field is empty or a near-miss spelling ("qwen3next_gated_delta") still
+        harvests the corpus kernel it should, instead of silently re-inventing."""
+        prim = getattr(spec, "primitive", "") or ""
+        op_name = getattr(spec, "name", "") or ""
+        if not prim and not op_name:
             return None
         try:
-            kspec = self.registry.for_primitive(spec.primitive)
+            # Prefer the signature-aware lookup (primitive + op-name fallback);
+            # degrade to the primitive-only API for a registry/mock without it.
+            if hasattr(self.registry, "for_signature"):
+                kspec = self.registry.for_signature(prim, op_name)
+            else:
+                kspec = self.registry.for_primitive(prim) if prim else None
         except Exception:  # noqa: BLE001 — a broken registry must not stop authoring
             return None
         return kspec if (kspec and kspec.usable) else None
