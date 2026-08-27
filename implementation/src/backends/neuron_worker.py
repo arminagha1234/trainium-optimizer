@@ -503,12 +503,42 @@ def main() -> None:
 
     # First forward: triggers NEFF compile in compile-mode (and lazy graph
     # build in eager). Time it separately -> that is our compile_s proxy.
+    #
+    # REWRITE-DISPATCH AUTOPILOT: wrap the first forward in the compile-error ->
+    # graph-rewrite retry loop. On the happy path (compile succeeds) this is a
+    # single call with an empty attempt list — byte-identical to a bare forward.
+    # On a compile FAILURE whose neuronx-cc error signature matches a catalogued
+    # rewrite (kernel_rewrites.REWRITES), the dispatcher installs the matching
+    # graph rewrite and retries — so a model the pre-emptive arch-gates above did
+    # NOT recognize still self-heals if its failure is a known one. A failure
+    # with no matching signature re-raises after one try, exactly as before (no
+    # infinite loop, no behavior change for non-catalogued errors). The rewrites
+    # are resolved at call time, so installing between attempts takes effect on
+    # the already-instantiated (and, in compile-mode, re-traced) model.
+    try:
+        from backends.rewrite_dispatcher import compile_with_rewrite_retry
+    except Exception:  # noqa: BLE001
+        import os as _os, sys as _sys
+        _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+        from backends.rewrite_dispatcher import compile_with_rewrite_retry
+
+    def _first_forward():
+        with torch.no_grad():
+            o = model(ids)
+        _sync(o.logits)  # force compile + device completion; raises on compile fail
+        return o
+
     t0 = time.time()
-    with torch.no_grad():
-        out = model(ids)
-    _sync(out.logits)
+    out, _rw_attempts = compile_with_rewrite_retry(_first_forward, _log, max_rounds=3)
     first_s = time.time() - t0
     compile_s = first_s if a.compile else 0.0
+    rewrite_dispatch = [
+        {"matched": ra.matched, "applied": ra.applied, "pending": ra.pending}
+        for ra in _rw_attempts
+    ]
+    if _rw_attempts:
+        _log(f"rewrite-dispatch recovered compile after {len(_rw_attempts)} "
+             f"round(s): applied={[ra.applied for ra in _rw_attempts]}")
     _log(f"first forward {first_s:.1f}s (compile_s={compile_s:.1f})")
 
     # EQUIVALENCE SIGNATURE: top-1 predicted token id at the last K positions.
@@ -586,6 +616,7 @@ def main() -> None:
         "top1_tokens": eq_tokens,   # equivalence signature (last-K argmax)
         "moe_kernel_swap": moe_swap,  # Stage-3 borrow status (audit trail)
         "kernel_inject": kernel_inject,  # generic-injection status (audit trail)
+        "rewrite_dispatch": rewrite_dispatch,  # compile-error auto-rewrite rounds
     })
 
     sys.stdout.flush()
