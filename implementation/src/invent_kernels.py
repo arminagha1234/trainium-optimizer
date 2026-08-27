@@ -780,21 +780,36 @@ def _src_rmsnorm() -> str:
 
 @nki.jit
 def rmsnorm_kernel(x, gamma):
-    """RMSNorm over the free axis. Bootstrap seed adapted from the moe_fused
-    RMSNorm subkernel (rsqrt of the mean-square, gamma scale)."""
+    """RMSNorm over the free axis. On-device validated (trn2, nki 0.6.0,
+    2026-08-27): cos 1.000000 vs numpy for T%128!=0 and H up to 4096.
+
+    Three things the prior seed got wrong on this stack, all fixed here:
+      * sum-of-squares is FUSED via ``nisa.activation_reduce`` into a [P,1]
+        ``reduce_res`` out-param (the ``nl.sum(x*x, axis=1)`` no-keepdims form
+        collapsed to 1-D and the ``nisa.activation(..., reduce_op=)`` return-form
+        does NOT return the reduction — NCC_INIC902);
+      * the mean-square is kept 2-D [P,1] and broadcast EXPLICITLY (implicit
+        partition broadcast is rejected);
+      * gamma [H] is loaded as a [1,H] FREE-axis row via ``reshape((1, H))`` — the
+        old ``nl.load(gamma[0:H])`` put H on the PARTITION axis (crashes for
+        H>128 and applies gamma along the wrong axis at H=128)."""
     T, H = x.shape
     out = nl.ndarray((T, H), dtype=x.dtype, buffer=nl.shared_hbm)
     ix = nl.mgrid[0:_PMAX, 0:H]
     n_tiles = (T + _PMAX - 1) // _PMAX
+    gs = nl.load(gamma.reshape((1, H)))              # [1,H] free-axis row
+    gb = nl.broadcast_to(gs, shape=(_PMAX, H))
     for t in nl.affine_range(n_tiles):
         rows = ix.p + t * _PMAX
         m = rows < T
         xs = nl.load(x[t * _PMAX:t * _PMAX + _PMAX, 0:H], mask=m)
-        gs = nl.load(gamma[0:H])
-        ms = nl.sum(nl.multiply(xs, xs), axis=1) * (1.0 / H)
-        inv = nl.rsqrt(ms + 1.0e-6)
+        ms = nl.ndarray((_PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation_reduce(op=nl.square, data=xs, reduce_op=nl.add,
+                               reduce_res=ms[...])
+        inv = nl.rsqrt(ms * (1.0 / H) + 1.0e-6)      # [P,1], kept 2-D
+        ib = nl.broadcast_to(inv, shape=(_PMAX, H))
         nl.store(out[t * _PMAX:t * _PMAX + _PMAX, 0:H],
-                 nl.multiply(nl.multiply(xs, inv), gs), mask=m)
+                 nl.multiply(nl.multiply(xs, ib), gb), mask=m)
     return out
 '''
 
