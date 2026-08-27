@@ -1,6 +1,6 @@
 """mamba2_ssd_fwd.py — Mamba-2 SSD (selective-scan) chunked forward, NKI 0.6.0.
 
-The Lumos-34M backbone scan (real, SISO). Chunk form (from nki-library ssd_torch /
+A 34M private-customer backbone scan (real, SISO). Chunk form (from nki-library ssd_torch /
 mamba3_ssd_torch_ref.ssd_mamba2_ref) — no triangular solve, so simpler than GDN:
   per chunk (Q tokens): cs=cumsum(dt*A); CB=(C@B^T)*causal; Xs=dt*x*exp(-cs);
   Y_intra=exp(cs)*(CB@Xs); Y_off=exp(cs)*(C@state); y=Y_intra+Y_off(+D*x);

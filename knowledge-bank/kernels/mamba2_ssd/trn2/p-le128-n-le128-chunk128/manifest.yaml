@@ -8,7 +8,7 @@ dtype: fp32
 status: passed-on-device
 provenance: >-
   From-scratch NKI 0.6.0 kernel for the Mamba-2 state-space-duality selective scan
-  (the Lumos-34M backbone). Chunk form: per chunk cs=cumsum(dt*A);
+  (a private-customer 34M backbone). Chunk form: per chunk cs=cumsum(dt*A);
   CB=(C@B^T)*causal; Y_intra=exp(cs)*(CB@(dt*x*exp(-cs))); Y_off=exp(cs)*(C@state);
   state=exp(cs_last)*state + B^T@(dt*x*exp(cs_last-cs)). Reuses the GDN kernel
   idioms (in-kernel cumsum via tensor_tensor_scan, _mm/_tmm/_mmt matmul helpers,
