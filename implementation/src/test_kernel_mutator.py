@@ -81,9 +81,21 @@ def softmax_kernel(x):
 def test_fuse_square_reduce_fires_on_pattern():
     out = KM._fuse_square_reduce(_RMSNORM)
     assert out is not None
-    assert "nisa.activation(nl.square, t, reduce_op=nl.add)" in out
+    # the validated fused form: activation_reduce with a reduce_res out-param
+    assert "nisa.activation_reduce(op=nl.square, data=t, reduce_op=nl.add" in out
+    assert "reduce_res=ms_sq[...]" in out
+    assert "ms_sq = nl.ndarray((t.shape[0], 1)" in out
     assert "nl.sum(t * t" not in out
+    # the surrounding expression (* (1.0 / F)) is preserved, now over the temp
+    assert "ms_sq * (1.0 / F)" in out
     ast.parse(out)
+
+
+def test_fuse_square_reduce_skips_without_nisa_import():
+    # a kernel that does not import nisa must NOT get an activation_reduce (would
+    # NameError at exec) — the mutation declines rather than emit a broken kernel.
+    no_nisa = _RMSNORM.replace("import neuronxcc.nki.isa as nisa\n", "")
+    assert KM._fuse_square_reduce(no_nisa) is None
 
 
 def test_fuse_square_reduce_none_without_pattern():
@@ -216,7 +228,7 @@ def test_perf_loop_adopts_a_rewarded_mutation():
     # Mock measure: the fused-square variant is FAST (0.40 ms), everything else
     # is no better than the seed. The loop must adopt the fused variant.
     def measure(kernel):
-        if "nisa.activation(nl.square" in kernel.nki_src:
+        if "nisa.activation_reduce(op=nl.square" in kernel.nki_src:
             return _Race(0.40)
         return _Race(0.80)
 
@@ -225,7 +237,7 @@ def test_perf_loop_adopts_a_rewarded_mutation():
                        seed_kernel=seed_kernel, seed_race=seed_race)
 
     assert outcome.ok
-    assert "nisa.activation(nl.square" in outcome.kernel.nki_src   # refined winner
+    assert "nisa.activation_reduce(op=nl.square" in outcome.kernel.nki_src   # refined winner
     assert outcome.best_ms == 0.40
     # The adopted kernel is a refinement of the seed, not a rewrite.
     assert refinement_ratio(outcome.kernel.nki_src, _RMSNORM) >= _REFINEMENT_MIN_RATIO
