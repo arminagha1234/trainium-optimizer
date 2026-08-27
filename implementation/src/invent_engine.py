@@ -385,6 +385,7 @@ class InventEngine:
         author: KernelAuthor | None = None,
         max_repair_rounds: int = 1,
         max_perf_rounds: int = 1,
+        perf_use_mutator: bool = True,
         kernel_library: "Any" = None,
         arch: str = "trn2",
     ) -> None:
@@ -405,6 +406,17 @@ class InventEngine:
         # a correct-but-slow kernel is re-authored with measured PerfFeedback
         # until it is fast, converges, or the loop honestly gives up.
         self.max_perf_rounds = max_perf_rounds
+        # Who drives the re-author step of that PERF loop. Default True routes it
+        # to the STRUCTURAL mutator (``kernel_mutator.MutatingAuthor``): keep the
+        # winning template and change ONE mechanical lever per round. This is the
+        # on-device finding (2026-08-25) — a Bedrock LLM author RE-WRITES the
+        # template every call (source overlap 0.13-0.24 with the winner), so
+        # "refine, don't rewrite" is not a promptable behavior; it must be done
+        # structurally. Set False to keep the legacy LLM-author-in-loop path (the
+        # author re-authored from scratch with perf feedback each round). Only
+        # affects runs with ``max_perf_rounds > 1`` (the perf loop is off by
+        # default), so the default single-race path is byte-for-byte unchanged.
+        self.perf_use_mutator = perf_use_mutator
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         # Default the bank under the run dir so an experiment never pollutes the
@@ -1075,19 +1087,44 @@ class InventEngine:
             min_utilization=self.guards.min_utilization)
         measure = race_fn or self._device_race
 
-        def author_fn(perf_trail: list[PerfFeedback]) -> AuthoredKernel:
-            # Re-author with the accumulated perf feedback (analogous to the repair
-            # loop's ``feedback``). No repair feedback here — the kernel already
-            # compiled and ran correctly; the open problem is speed.
-            return self.author.author(spec, lessons, [], perf_feedback=perf_trail)
+        # WHO re-authors each round. Default: the STRUCTURAL mutator — keep the
+        # winning template, change ONE mechanical lever (wider tile, delayed
+        # division, activation-reduce fusion), routed by the loop's diagnosed
+        # bottleneck. This is the on-device finding: an LLM author re-derives from
+        # scratch every call, so refinement must be structural (see kernel_mutator
+        # docstring + self.perf_use_mutator). The mutator only PROPOSES; the
+        # loop's measure_fn re-validates correct+faster, so a bad variant is
+        # cheaply rejected with NO wasted LLM round, and an exhausted variant
+        # queue hands back the seed unchanged -> the loop stops honestly (no_gain).
+        # Falls back to the LLM author when disabled OR when the seed kernel has no
+        # source to mutate (a NO-AUTHOR from-scratch op).
+        use_mutator = self.perf_use_mutator and bool(getattr(author, "nki_src", ""))
+        if use_mutator:
+            from kernel_mutator import MutatingAuthor
+            _mutator = MutatingAuthor(
+                seed_src=author.nki_src, entry=author.entry,
+                op=spec.name, reference=author.numpy_impl)
+
+            def author_fn(perf_trail: list[PerfFeedback]) -> AuthoredKernel:
+                # Next template-preserving variant, prioritized by the latest
+                # diagnosed bottleneck in perf_trail. No LLM call.
+                return _mutator.author_fn(perf_trail)
+        else:
+            def author_fn(perf_trail: list[PerfFeedback]) -> AuthoredKernel:
+                # Legacy path: re-author with the accumulated perf feedback
+                # (analogous to the repair loop's ``feedback``). No repair feedback
+                # here — the kernel already compiled and ran correctly; the open
+                # problem is speed.
+                return self.author.author(spec, lessons, [], perf_feedback=perf_trail)
 
         def measure_fn(kernel: AuthoredKernel) -> RaceResult:
             return measure(kernel, spec)
 
         outcome: PerfOutcome = loop.run(
             author_fn, measure_fn, seed_kernel=author, seed_race=race)
-        note = (f" [perf loop: {outcome.reason} in {outcome.rounds} round(s); "
-                f"latency {outcome.trajectory_str}]")
+        driver = "structural-mutator" if use_mutator else "llm-author"
+        note = (f" [perf loop ({driver}): {outcome.reason} in "
+                f"{outcome.rounds} round(s); latency {outcome.trajectory_str}]")
         best_kernel = outcome.kernel if outcome.kernel is not None else author
         best_race = outcome.race if outcome.race is not None else race
         return best_kernel, best_race, note
