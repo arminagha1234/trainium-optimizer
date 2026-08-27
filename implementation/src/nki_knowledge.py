@@ -78,12 +78,21 @@ TECHNIQUES: dict[str, str] = {
         "in SBUF, one store of the output — never round-trip a temporary through "
         "HBM (there is no HW cache; a spilled intermediate is pure loss).",
     "activation-reduce-fusion":
-        "nisa.activation(op, data, *, bias, scale, reduce_op) computes "
-        "op(scale*data+bias) AND a fused free-axis reduce in ONE Scalar-engine "
-        "instruction. rmsnorm: `nisa.activation(nl.square, x, reduce_op=nl.add)` "
-        "gets mean-square in one pass; softmax: `nisa.activation(nl.exp, x, "
-        "bias=neg_rowmax, reduce_op=nl.add)` gives exp(x-max) + the denominator "
-        "at once. Don't materialize a squared/exp tile then sum it separately.",
+        "nisa.activation_reduce(op, data, *, reduce_op, reduce_res, bias, scale) "
+        "computes op(scale*data+bias) AND a fused free-axis reduce in ONE Scalar-"
+        "engine instruction, WRITING the [P,1] reduction into the ``reduce_res=`` "
+        "out-param (it has NO return form — allocate reduce_res first). "
+        "rmsnorm: `ms = nl.ndarray((P,1), dtype=nl.float32, buffer=nl.sbuf); "
+        "nisa.activation_reduce(op=nl.square, data=x, reduce_op=nl.add, "
+        "reduce_res=ms[...])` gets the sum-of-squares in one pass; softmax: "
+        "`nisa.activation_reduce(op=nl.exp, data=x, bias=neg_rowmax, "
+        "reduce_op=nl.add, reduce_res=den[...])` gives the denominator at once. "
+        "Don't materialize a squared/exp tile then sum it separately, and do NOT "
+        "use `nisa.activation(..., reduce_op=)` (return-form) for the reduce — on "
+        "trn2/neuronx-cc 2.27 that returns the FULL activation, not the reduction "
+        "(NCC_INIC902 / store-shape error); the reduce MUST go through "
+        "``activation_reduce`` with ``reduce_res=`` (on-device validated 2026-08-27, "
+        "idiom per internal NKI-Autotune kernel_library/rmsnorm_linear.py).",
     "delayed-softmax-division":
         "Reduce to a [P,1] denominator, take its reciprocal ONCE (nisa.reciprocal "
         "or nl.reciprocal), and multiply the result at the END — never divide "
@@ -200,9 +209,12 @@ SIGNATURES: dict[str, str] = {
         "nisa.nc_transpose(data, *, mask=None, dtype=None) -> tile   # [P,F]->[F,P], "
         "P,F<=128; RETURNS the tile (no dst=). nl.transpose(x) is a simpler alias.",
     "activation":
-        "nisa.activation(op, data, *, bias=None, scale=1.0, reduce_op=None, "
-        "dtype=None) -> tile   # returns op(scale*data+bias) (+ fused free-axis "
-        "reduce if reduce_op set); op FIRST, data SECOND, rest keyword-only.",
+        "nisa.activation(op, data, *, bias=None, scale=1.0, dtype=None) -> tile   "
+        "# returns op(scale*data+bias); op FIRST, data SECOND, rest keyword-only. "
+        "For a FUSED free-axis reduce use nisa.activation_reduce(op, data, *, "
+        "reduce_op, reduce_res, bias=, scale=) which writes the [P,1] reduction "
+        "into the reduce_res OUT-PARAM (no return form) — the activation(reduce_op=) "
+        "return-form does NOT return the reduction on trn2.",
     "reduce":
         "nl.sum(x, axis=1, keepdims=True) / nl.max(x, axis=1, keepdims=True) -> "
         "[P,1]  (keep 2-D). nisa.tensor_reduce(op=, data=, axis=) is the ISA form.",
@@ -249,9 +261,13 @@ def rmsnorm_kernel(a, gamma):
     o   = t * nl.broadcast_to(inv, shape=(P, F))             # explicit broadcast
     nl.store(out[:, :], value=o * nl.broadcast_to(g, shape=(P, F)))
     return out""",
-    "VERIFIED on trn2 (idiom 7, max_err 5.48e-05). Perf lever: replace "
-    "`nl.sum(t*t,...)` with `nisa.activation(nl.square, t, reduce_op=nl.add)` to "
-    "get the mean-square in ONE Scalar-engine pass (activation-reduce-fusion).",
+    "VERIFIED on trn2 (idiom 7, max_err 5.48e-05). Perf lever (on-device "
+    "validated, ~11% faster): replace `nl.sum(t*t,...)` with a fused reduce — "
+    "`ms = nl.ndarray((P,1), dtype=nl.float32, buffer=nl.sbuf); "
+    "nisa.activation_reduce(op=nl.square, data=t, reduce_op=nl.add, "
+    "reduce_res=ms[...])` — ONE Scalar-engine pass. Use activation_REDUCE with a "
+    "reduce_res out-param, NOT `nisa.activation(..., reduce_op=)` (that return-form "
+    "does not return the reduction on trn2).",
 )
 
 _EX_TILED_MATMUL = WorkedExample(
@@ -293,9 +309,13 @@ def softmax_kernel(x):
     "Structure from nki-samples attn_fwd_v1 softmax (row_max -> exp -> sum -> "
     "reciprocal -> mul), translated to 0.6.0 return-form. PERF lever: fuse the "
     "max-subtract into the exp via `nisa.activation(nl.exp, t, bias=neg_rowmax)` "
-    "(bias is the [P,1] -row-max) and add `reduce_op=nl.add` to accumulate the "
-    "denominator in the SAME Scalar-engine pass (activation-reduce-fusion), then "
-    "reciprocal once and multiply (delayed-softmax-division).",
+    "(bias is the [P,1] -row-max). To also fuse the denominator, use a fused "
+    "reduce with an out-param — `den = nl.ndarray((P,1), dtype=nl.float32, "
+    "buffer=nl.sbuf); nisa.activation_reduce(op=nl.exp, data=t, bias=neg_rowmax, "
+    "reduce_op=nl.add, reduce_res=den[...])` (activation-reduce-fusion) — then "
+    "reciprocal once and multiply (delayed-softmax-division). Do NOT expect "
+    "`nisa.activation(..., reduce_op=)` to return the denominator; the reduce goes "
+    "through activation_reduce's reduce_res.",
 )
 
 _EX_ATTENTION = WorkedExample(
@@ -306,7 +326,7 @@ def attn_decode_kernel(q, k, v):
     qs = nl.load(q[:, :]); ks = nl.load(k[:, :]); vs = nl.load(v[:, :])
     qk = nisa.nc_matmul(stationary=qs, moving=ks)            # [1,S] RETURN-form, no dst
     mx = nl.max(qk, axis=1, keepdims=True)                   # [1,1] keepdims
-    e  = nisa.activation(nl.exp, qk, bias=nl.multiply(mx, -1.0), reduce_op=nl.add)
+    e  = nisa.activation(nl.exp, qk, bias=nl.multiply(mx, -1.0))  # exp(qk-mx), return-form
     sm = nl.sum(e, axis=1, keepdims=True)                    # denominator [1,1]
     p  = e * nl.broadcast_to(nl.reciprocal(sm), shape=e.shape)   # delayed division
     # PV: contract over S -> transpose p to [S,1] so S is the partition axis.
