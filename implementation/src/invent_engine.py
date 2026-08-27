@@ -1693,6 +1693,17 @@ def _torch_baseline(op: str, inp: dict, device=None):
     if op == "attn_decode":
         q, k, v = t("q"), t("k"), t("v")
         return F.scaled_dot_product_attention(q[None], k[None], v[None])[0]
+    if op == "flash_attention":
+        # Dense (materialized-scores) attention matching _flash_attention_reference:
+        # q,k,v are [d_head, S]; scores = qᵀ@k [S,S] UNSCALED; out = softmax(scores)@vᵀ
+        # [S, d_head]. On torch_xla this lowers to the COMPILER's fused dense
+        # attention — the honest bar a streaming/flash NKI kernel must beat (the
+        # dense form materializes [S,S], so at long S it is far from SOL / OOMs,
+        # which is exactly where a flash kernel wins).
+        q, k, v = t("q"), t("k"), t("v")
+        scores = q.transpose(-1, -2) @ k                  # [S, S]
+        p = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
+        return p @ v.transpose(-1, -2)                    # [S, d_head]
     if op == "rmsnorm":
         x, g = t("x"), t("gamma")
         ms = x.pow(2).mean(-1, keepdim=True)
