@@ -271,3 +271,73 @@ def test_stats(tmp_path: Path):
     assert s["by_type"]["config_prior"] == 1
     assert s["by_type"]["anti_pattern"] == 1
     assert s["human_verified_ratio"] == 1.0
+
+
+# --- query_by_op: op-family-keyed retrieval (cross model-family reuse) --------
+
+def _nki_kernel_lesson(op, shape_class, model_family, tier=Tier.VERIFIED,
+                       lid=None) -> Lesson:
+    """A banked NKI-kernel lesson carrying a structured op identity (as
+    invent_engine._bank_win writes it)."""
+    return Lesson(
+        lesson_id=lid or f"invented-{op}-{shape_class}",
+        type=LessonType.NKI_KERNEL,
+        applicability=Applicability(
+            architecture_family=model_family, neuron_sdk_versions=["2.28.*"]),
+        layer=Layer.KERNEL, migration_risk="low", tier=tier,
+        intervention={"spec": {"nki_kernel": op, "shape_class": shape_class}},
+        confidence=Confidence(n_models_validated=2), last_reverified_sdk="2.28.0",
+    )
+
+
+def test_query_by_op_exact_and_cross_model_family(tmp_path: Path):
+    bank = KnowledgeBank(tmp_path)
+    # An rmsnorm kernel learned on a MoE model, and one on a dense model.
+    bank.save(_nki_kernel_lesson("rmsnorm", "p-le128", "moe-causal-lm"))
+    bank.save(_nki_kernel_lesson("add_rmsnorm", "p-le128", "dense-causal-lm"))
+    bank.save(_nki_kernel_lesson("softmax", "p-le128", "dense-causal-lm"))
+
+    # Query for rmsnorm on a DENSE model — must find the MoE-learned rmsnorm
+    # (exact, rank 3) AND the add_rmsnorm (same NORMALIZATION family, rank 1),
+    # but NOT softmax (different op-family).
+    hits = bank.query_by_op("rmsnorm", shape_class="p-le128")
+    ops = [h.intervention["spec"]["nki_kernel"] for h in hits]
+    assert "rmsnorm" in ops and "add_rmsnorm" in ops
+    assert "softmax" not in ops
+    # exact match ranks first
+    assert ops[0] == "rmsnorm"
+
+
+def test_query_by_op_shape_class_ranking(tmp_path: Path):
+    bank = KnowledgeBank(tmp_path)
+    bank.save(_nki_kernel_lesson("layernorm", "p-le128", "dense-causal-lm",
+                                 lid="invented-layernorm-small"))
+    bank.save(_nki_kernel_lesson("groupnorm", "p-le128", "dense-causal-lm",
+                                 lid="invented-groupnorm-match"))
+    bank.save(_nki_kernel_lesson("rmsnorm", "p-gt128", "dense-causal-lm",
+                                 lid="invented-rmsnorm-otsc"))
+    # Query rmsnorm@p-le128: groupnorm@p-le128 (same family+shape → rank 2) must
+    # outrank rmsnorm@p-gt128 (same family, different shape → rank 1).
+    hits = bank.query_by_op("rmsnorm", shape_class="p-le128")
+    ops = [h.intervention["spec"]["nki_kernel"] for h in hits]
+    assert ops.index("groupnorm") < ops.index("rmsnorm")
+
+
+def test_query_by_op_ignores_non_op_lessons(tmp_path: Path):
+    bank = KnowledgeBank(tmp_path)
+    # A config prior (no op identity) must never surface in query_by_op.
+    bank.save(_config_prior())
+    bank.save(_nki_kernel_lesson("rmsnorm", "p-le128", "dense-causal-lm"))
+    hits = bank.query_by_op("rmsnorm")
+    assert len(hits) == 1
+    assert hits[0].intervention["spec"]["nki_kernel"] == "rmsnorm"
+
+
+def test_query_by_op_tier_scoped(tmp_path: Path):
+    bank = KnowledgeBank(tmp_path)
+    bank.save(_nki_kernel_lesson("rmsnorm", "p-le128", "moe-causal-lm",
+                                 tier=Tier.PROVISIONAL))
+    # Default reads VERIFIED only — a provisional lesson is not returned...
+    assert bank.query_by_op("rmsnorm") == []
+    # ...unless the caller explicitly asks for the provisional tier.
+    assert len(bank.query_by_op("rmsnorm", tier=Tier.PROVISIONAL)) == 1
