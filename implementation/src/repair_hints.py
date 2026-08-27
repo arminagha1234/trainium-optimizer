@@ -114,10 +114,14 @@ HINTS: tuple[RepairHint, ...] = (
             "                           reduce_op=None, dtype=None, ...) -> tile.\n"
             "`op` is FIRST and `data` (the input tile) is SECOND (the only two\n"
             "positionals; the rest are keyword-only). It RETURNS `op(scale*data +\n"
-            "bias)` — ASSIGN it. `dtype=` IS a valid kwarg. Use `reduce_op=` for a\n"
-            "fused free-axis reduce. Example:\n"
-            "    ms = nisa.activation(nl.square, x, reduce_op=nl.add)   # use `ms`\n"
-            "Pass op and data (do NOT pass a `dst`)."
+            "bias)` — ASSIGN it. `dtype=` IS a valid kwarg. Example:\n"
+            "    e = nisa.activation(nl.exp, x, bias=neg_rowmax)   # use `e`\n"
+            "Pass op and data (do NOT pass a `dst`). For a FUSED free-axis reduce do\n"
+            "NOT use activation(reduce_op=) — that return-form does NOT return the\n"
+            "reduction on trn2; use nisa.activation_reduce with a reduce_res OUT-param:\n"
+            "    ms = nl.ndarray((P,1), dtype=nl.float32, buffer=nl.sbuf)\n"
+            "    nisa.activation_reduce(op=nl.square, data=x, reduce_op=nl.add,\n"
+            "                           reduce_res=ms[...])   # ms gets the [P,1] reduce"
         ),
     ),
     RepairHint(
@@ -233,6 +237,28 @@ HINTS: tuple[RepairHint, ...] = (
             "return it. (b) nisa.nc_matmul(stationary, moving) and\n"
             "nisa.nc_transpose(data=...) take NO dst - a 3rd/2nd positional overflows.\n"
             "ASSIGN their RETURN value."
+        ),
+    ),
+    RepairHint(
+        key="activation-reduce-return-form-inic902",
+        title="NCC_INIC902 NeuronInstComb crash from activation(reduce_op=) return-form",
+        patterns=(
+            r"NCC_INIC902",
+            r"NeuronInstComb",
+            r"use_empty",
+        ),
+        fix=(
+            "This neuronx-cc NeuronInstComb crash (NCC_INIC902 / 'use_empty') is the\n"
+            "fused-reduce return-form trap: `x = nisa.activation(op, data, reduce_op=)`\n"
+            "does NOT return the reduction on trn2 (it returns the FULL activation\n"
+            "tile), and the dangling reduce fails to combine. Use activation_REDUCE\n"
+            "with a reduce_res OUT-param instead (on-device validated):\n"
+            "    acc = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)\n"
+            "    nisa.activation_reduce(op=nl.square, data=x, reduce_op=nl.add,\n"
+            "                           reduce_res=acc[...])   # acc gets [P,1] sum\n"
+            "For softmax use op=nl.exp (+ bias=neg_rowmax). If you only need the\n"
+            "elementwise activation (no reduce), drop reduce_op entirely:\n"
+            "    e = nisa.activation(nl.exp, x, bias=neg_rowmax)   # no reduce_op"
         ),
     ),
     RepairHint(
