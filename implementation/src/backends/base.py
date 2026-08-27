@@ -111,6 +111,16 @@ class Measurements:
     # a fixed deterministic prompt. The orchestrator compares a candidate's
     # signature against the Stage-0 baseline's to gate correctness for real.
     top1_tokens: list = field(default_factory=list)
+    # Per-position top-k (token_id, logprob) at the last K positions on the same
+    # deterministic prompt — the DISTRIBUTION, not just the argmax. Enables a
+    # task-level correctness gate (logprob/KL agreement vs baseline) that catches
+    # a kernel which preserves top-1 but distorts the distribution — the reward-
+    # hack surface top1_tokens alone misses. See task_eval.py. Each element is a
+    # position: {"ids": [int,...], "logprobs": [float,...]} (aligned, descending).
+    # EMPTY by default: additive, and a backend/worker that does not populate it
+    # simply yields no task-eval signal (the gate fails closed). Filled by the
+    # worker from the same last-K logits it uses for top1_tokens.
+    top_logprobs: list = field(default_factory=list)
     # Serving-latency fields (populated by the vllm-serve backend; left at their
     # defaults by every other backend, so this is additive and changes no
     # existing behavior). TTFT already has a home above (ttft_ms_*); these make
