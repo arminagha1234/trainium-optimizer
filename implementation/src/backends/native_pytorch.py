@@ -325,6 +325,7 @@ class NativePyTorchBackend:
             shape=shape, batch=batch,
             warmup_iters=3, measured_iters=10,
             top1_tokens=data.get("top1_tokens", []),
+            top_logprobs=data.get("top_logprobs", []),   # task_eval distribution gate
             # Real compile time from the worker (first-forward JIT under
             # torch.compile). 0.0 for eager runs — the worker only sets compile_s
             # when --compile is on. This is what makes the orchestrator's

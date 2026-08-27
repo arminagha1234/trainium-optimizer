@@ -553,6 +553,20 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             pass
     eq_tokens = lg[0, -EQ_K:, :].argmax(-1).detach().cpu().tolist()
+    # Per-position top-k logprobs at the same last-K positions — the DISTRIBUTION,
+    # not just the argmax — for the task-level correctness gate (task_eval.py:
+    # logprob/KL agreement vs baseline, catches a kernel that keeps top-1 but
+    # distorts the distribution). Additive: same last-K logits as eq_tokens.
+    top_logprobs = []
+    try:
+        _K = min(5, lg.shape[-1])
+        _lp = torch.log_softmax(lg[0, -EQ_K:, :].float(), dim=-1)
+        _tk = _lp.topk(_K, dim=-1)
+        _ids, _vals = _tk.indices.cpu().tolist(), _tk.values.cpu().tolist()
+        top_logprobs = [{"ids": _ids[i], "logprobs": _vals[i]}
+                        for i in range(len(_ids))]
+    except Exception:  # noqa: BLE001 — logprob capture is advisory; never fail the run
+        top_logprobs = []
 
     # Remaining warmup.
     with torch.no_grad():
@@ -614,6 +628,7 @@ def main() -> None:
         "params_est": params,
         "world_size": world,
         "top1_tokens": eq_tokens,   # equivalence signature (last-K argmax)
+        "top_logprobs": top_logprobs,  # last-K top-k distribution (task_eval gate)
         "moe_kernel_swap": moe_swap,  # Stage-3 borrow status (audit trail)
         "kernel_inject": kernel_inject,  # generic-injection status (audit trail)
         "rewrite_dispatch": rewrite_dispatch,  # compile-error auto-rewrite rounds
