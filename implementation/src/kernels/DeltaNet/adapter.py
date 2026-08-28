@@ -159,7 +159,26 @@ def build_gdn_forward(module: Any) -> Callable:
                 out = entry(qp, kp, value.contiguous().to(torch.float32),
                             g_in, beta_in, init, lm, iden, lmd)
                 return out[0], out[1]
-            # torch inputs but not the chunked-prefill case -> host-convert and
+            # ---- DECODE device fast-path (S==1, cached) --------------------
+            # The autoregressive per-token HOT path. Same numpy bug: host
+            # round-trip ran the tkg kernel via sim/recompile (~1656ms). Device
+            # path: ~1.65ms steady-state, ~1002x, cos=1.0 (validated on trn2).
+            if query.shape[-1] == DK and S == 1 and initial_state is not None:
+                entry = state.get("decode")
+                if entry is None:
+                    entry = _load(_DECODE, "deltanet_tkg_batched_bh")
+                    state["decode"] = entry
+                qn = query / (query.norm(dim=-1, keepdim=True) + 1e-6)
+                kn = key / (key.norm(dim=-1, keepdim=True) + 1e-6)
+                q3 = (qn * (DK ** -0.5)).permute(0, 2, 1).contiguous()   # (BH,D,1)
+                k3 = kn.permute(0, 2, 1).contiguous()
+                v3 = value.permute(0, 2, 1).contiguous().to(torch.float32)
+                g3 = g.reshape(BH, 1, 1).expand(BH, DK, 1).contiguous().to(torch.float32)
+                b3 = beta.reshape(BH, 1, 1).expand(BH, DK, 1).contiguous().to(torch.float32)
+                st = initial_state.contiguous().to(torch.float32)
+                o, state_out = entry(q3, k3, v3, g3, b3, st)
+                return o.permute(0, 2, 1), state_out            # (BH,1,D), state
+            # torch inputs but not a device-fast-path shape -> host-convert and
             # fall through to the numpy path (existing behaviour).
 
         import numpy as np  # noqa: PLC0415 - device-only
