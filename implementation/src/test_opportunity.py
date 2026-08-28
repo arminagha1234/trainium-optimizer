@@ -63,12 +63,27 @@ def test_batched_multihead_attention_ranks_high_but_measure_only():
     assert "MEASURE" in t.reason
 
 
-def test_attention_never_auto_selected_analytically():
+def test_attention_below_oom_not_auto_selected_analytically():
     from invent_kernels import mha_attention_spec, flash_attention_spec
-    # no attention op is authored on the analytic signal alone (any size)
-    specs = [flash_attention_spec(seqlen=8192, d_head=128),
-             mha_attention_spec(batch=8, heads=32, seqlen=2048, d_head=128)]
-    assert select_targets(specs) == []          # measured %SOL is the sole authority
+    # below the OOM regime, no attention op is authored on the analytic signal
+    # alone (compiler is competitive -> measured %SOL is the authority)
+    specs = [flash_attention_spec(seqlen=8192, d_head=128),          # 6.7e7 elems
+             mha_attention_spec(batch=8, heads=32, seqlen=2048, d_head=128)]  # 1.07e9
+    assert select_targets(specs) == []
+
+
+def test_attention_oom_regime_is_certain_worth():
+    from invent_kernels import mha_attention_spec
+    # B8/H16/S8192 -> 8*16*8192^2 = 8.6e9 elems (~34GB fp32) >= OOM threshold:
+    # dense OOMs on trn2 (measured), flash is the ONLY path -> worth WITHOUT a race
+    t = analytic_opportunity(mha_attention_spec(batch=8, heads=16, seqlen=8192,
+                                                d_head=128))
+    assert t.worth_authoring and t.score >= 0.8
+    assert "OOM" in t.reason or "ONLY path" in t.reason
+    # and it IS selected analytically (the one attention regime that is)
+    assert [x.op for x in select_targets(
+        [mha_attention_spec(batch=8, heads=16, seqlen=8192, d_head=128)])] \
+        == ["mha_attention"]
 
 
 def test_measured_low_sol_selects_attention():

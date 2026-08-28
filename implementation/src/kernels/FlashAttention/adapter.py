@@ -56,6 +56,7 @@ _KERNEL_FILE = _HERE / "flash_nki_opt.py"
 _ENTRY_NONCAUSAL_BF16 = "flash_fwd"
 _ENTRY_NONCAUSAL_FP32 = "flash_fwd_fp32"
 _ENTRY_CAUSAL_BF16 = "flash_fwd_causal"
+_ENTRY_BATCHED_BF16 = "flash_fwd_batched"
 
 
 def _load_kernel_module():
@@ -111,6 +112,32 @@ def build_flash_forward(module: Any) -> Callable:
         d_head, seqlen = q.shape
         out = torch.zeros((seqlen, d_head), dtype=q.dtype, device=q.device)
         jit(q, k, v, out)          # output-as-arg (torch_neuronx.nki_jit)
+        return out
+
+    return forward
+
+
+def build_flash_batched_forward(module: Any = None) -> Callable:
+    """Forward-factory for the BATCHED multi-head flash entry — the regime where
+    flash beats the compiler (dense [B,H,S,S] OOMs). Returns ``forward(q, k, v)``
+    with ``q,k,v`` of shape ``(BH, d_head, seqlen)`` (BH = batch*heads) and output
+    ``(BH, seqlen, d_head)``; ONE nki_jit dispatch loops the heads on-device.
+    Validated on trn2 (cos=1.0; ran at B8/H16/S8192 where dense OOM'd)."""
+    state: dict[str, Any] = {}
+
+    def forward(q, k, v):
+        import torch  # noqa: PLC0415 - device-only
+        import torch_neuronx  # noqa: PLC0415 - device-only
+
+        jit = state.get("jit")
+        if jit is None:
+            kmod = _load_kernel_module()
+            jit = torch_neuronx.nki_jit(getattr(kmod, _ENTRY_BATCHED_BF16))
+            state["jit"] = jit
+
+        BH, d_head, seqlen = q.shape
+        out = torch.zeros((BH, seqlen, d_head), dtype=q.dtype, device=q.device)
+        jit(q, k, v, out)          # output-as-arg; kernel loops the BH heads
         return out
 
     return forward

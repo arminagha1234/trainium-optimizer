@@ -65,6 +65,14 @@ _DEFAULT_ANALYTIC = 0.20  # unknown family -> mild, low-priority opportunity
 # kernel has real headroom (higher opportunity), with a marginal band between.
 _ATTN_ELEMS_LOW = 2.5e8
 _ATTN_ELEMS_HIGH = 1.0e9
+# OOM regime: when the dense fp32 score intermediate (B*H*S*S*4 bytes) exceeds
+# trn2's ~24GB HBM, the compiler CANNOT materialize it — it OOMs (NCC_EOOM001) and
+# a streaming flash kernel is the ONLY path. This is analytically CERTAIN worth
+# (you cannot even measure an OOMing baseline), no device race needed. Calibrated
+# on-device 2026-08-28: batched B8/H32/S4096 (4.3e9 elems, 17GB) RAN (compiler
+# tiled it, ~tie with flash); B8/H16/S8192 (8.6e9 elems, 34GB) OOM'd on dense
+# while the (validated) batched flash kernel ran. Threshold set between them.
+_ATTN_ELEMS_OOM = 6.0e9   # ~24GB fp32 scores — dense OOMs, flash-only
 
 
 @dataclass(frozen=True)
@@ -162,6 +170,16 @@ def _attention_opportunity(spec: Any) -> OpTarget:
         return OpTarget(op, 0.15, False, "analytic",
                         f"attention scores ~{elems:.2e} elems (< {_ATTN_ELEMS_LOW:.0e}) "
                         "— compiler's dense attention wins here (measured); skip")
+    if elems >= _ATTN_ELEMS_OOM:
+        # The dense score matrix would exceed HBM -> the COMPILER OOMs (can't
+        # materialize [B,H,S,S]); a streaming flash kernel is the ONLY path. This
+        # is analytically CERTAIN worth — no %SOL race needed (the baseline can't
+        # run). Validated on-device: dense OOM'd at B8/H16/S8192 while the batched
+        # flash kernel ran.
+        return OpTarget(op, 0.85, True, "analytic",
+                        f"attention scores ~{elems:.2e} elems (>= {_ATTN_ELEMS_OOM:.0e}, "
+                        "~24GB fp32) — dense OOMs on trn2; a streaming flash kernel is "
+                        "the ONLY path (measured) — author it")
     if elems >= _ATTN_ELEMS_HIGH:
         # Large score matrix ranks HIGH-PRIORITY-TO-MEASURE, but is NOT auto-worth
         # on the analytic signal: on-device evidence (2026-08-28) shows the Neuron
