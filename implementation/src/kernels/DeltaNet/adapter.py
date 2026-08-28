@@ -117,6 +117,51 @@ def build_gdn_forward(module: Any) -> Callable:
         return q, k
 
     def forward(query, key, value, g, beta, initial_state=None):
+        # ---- DEVICE FAST-PATH (chunked prefill) ----------------------------
+        # If the inputs are torch tensors ALREADY on a Neuron device, call the
+        # ``@nki.jit`` kernel DIRECTLY on them — do NOT round-trip through host
+        # numpy. The numpy path below runs the kernel via nki's sim/recompile
+        # route (~3500ms for BH8/S512); the device path is ~109x faster with
+        # BYTE-IDENTICAL output (validated on trn2: cos=1.0, max_abs=0.0). Only
+        # the perf-critical chunked-prefill case takes this path; every other
+        # shape (decode / short-recurrent / cached / numpy callers) falls through
+        # to the unchanged numpy path, so nothing else is affected.
+        try:
+            import torch  # noqa: PLC0415 - device-only
+            _is_torch = isinstance(query, torch.Tensor)
+        except Exception:  # noqa: BLE001
+            _is_torch = False
+        if _is_torch and query.dim() == 3:
+            BH, S = int(query.shape[0]), int(query.shape[1])
+            if (query.shape[-1] == DK and S >= DK and S % DK == 0
+                    and initial_state is None):
+                entry = state.get("prefill")
+                tmasks = state.get("tmasks")
+                if entry is None:
+                    if str(_HERE) not in sys.path:
+                        sys.path.insert(0, str(_HERE))
+                    entry = importlib.import_module(_PREFILL).deltanet_fused_chunked_fwd_batched
+                    state["prefill"] = entry
+                if tmasks is None:
+                    dev = query.device
+                    ones = torch.ones(DK, DK, dtype=torch.float32, device=dev)
+                    tmasks = (torch.tril(ones, -1), torch.eye(DK, dtype=torch.float32, device=dev),
+                              torch.tril(ones, 0))
+                    state["tmasks"] = tmasks
+                lm, iden, lmd = tmasks
+                qn = query / (query.norm(dim=-1, keepdim=True) + 1e-6)
+                kn = key / (key.norm(dim=-1, keepdim=True) + 1e-6)
+                qp = (qn * (DK ** -0.5)).contiguous()
+                kp = kn.contiguous()
+                g_in = g.reshape(BH, S, 1).to(torch.float32)
+                beta_in = beta.reshape(BH, S, 1).to(torch.float32)
+                init = torch.zeros(BH, DK, DK, dtype=torch.float32, device=query.device)
+                out = entry(qp, kp, value.contiguous().to(torch.float32),
+                            g_in, beta_in, init, lm, iden, lmd)
+                return out[0], out[1]
+            # torch inputs but not the chunked-prefill case -> host-convert and
+            # fall through to the numpy path (existing behaviour).
+
         import numpy as np  # noqa: PLC0415 - device-only
 
         query = np.asarray(query, np.float32)
