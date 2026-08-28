@@ -150,3 +150,20 @@ def flash_fwd_fp32(q, k, v, out):
 
 def flash_fwd_causal(q, k, v, out):
     _flash_causal(q, k, v, out, BK=512, downcast=True)
+
+
+# ---- BATCHED multi-head (single dispatch, all B*H heads on-device) ----------
+# The regime where flash BEATS the compiler: at batched-multi-head long context
+# the dense [B,H,S,S] score matrix exceeds HBM and the compiler OOMs
+# (NCC_EOOM001) — this streaming kernel never materializes [S,S], so it is the
+# ONLY path. q,k,v are [BH, d_head, seqlen]; out is [BH, seqlen, d_head]; one
+# nki_jit dispatch loops the heads (no per-head host round-trip — the fix that
+# made flash competitive vs the ~0.7ms/head dispatch of looping single-head).
+# Validated on-device 2026-08-28: cos=1.0 at BH=4/S=512; ran at BH=256/S=4096
+# (~tie w/ dense) and at BH=128/S=8192 where dense OOM'd. NOTE the ``affine_range``
+# batch loop UNROLLS — compile time grows with BH; a tiled/looped batch dim is a
+# follow-up for very large BH.
+def flash_fwd_batched(q, k, v, out):
+    BH = q.shape[0]
+    for bh in nl.affine_range(BH):
+        _flash_nc(q[bh], k[bh], v[bh], out[bh], BK=512, downcast=True)
