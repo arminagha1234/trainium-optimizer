@@ -163,10 +163,17 @@ def _attention_opportunity(spec: Any) -> OpTarget:
                         f"attention scores ~{elems:.2e} elems (< {_ATTN_ELEMS_LOW:.0e}) "
                         "— compiler's dense attention wins here (measured); skip")
     if elems >= _ATTN_ELEMS_HIGH:
-        return OpTarget(op, 0.70, True, "analytic",
+        # Large score matrix ranks HIGH-PRIORITY-TO-MEASURE, but is NOT auto-worth
+        # on the analytic signal: on-device evidence (2026-08-28) shows the Neuron
+        # compiler tiles dense attention internally (never OOMs, through 65k
+        # single-head AND batched-multi-head to 17GB nominal scores) and beats the
+        # harvested flash kernel at every measured size — so a flash win is
+        # UNPROVEN even here. Only MEASURED %SOL may select attention (a device
+        # race showing the compiler far from SOL); never a guess.
+        return OpTarget(op, 0.55, False, "analytic",
                         f"attention scores ~{elems:.2e} elems (>= {_ATTN_ELEMS_HIGH:.0e}) "
-                        "— large score matrix (long-context / batched-multi-head); a "
-                        "streaming flash kernel has real headroom")
+                        "— large; MEASURE %SOL before authoring (compiler is strong "
+                        "on trn2 attention at every size measured; flash win unproven)")
     return OpTarget(op, 0.40, False, "analytic",
                     f"attention scores ~{elems:.2e} elems — marginal; measure %SOL")
 
