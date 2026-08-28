@@ -19,23 +19,55 @@ class _Spec:
 
 # --- analytic (device-free) --------------------------------------------------
 
-def test_analytic_ranks_compiler_weak_families_first():
-    specs = [_Spec("rmsnorm"), _Spec("flash_attention"), _Spec("gelu_tanh"),
-             _Spec("gated_delta_rule"), _Spec("qkv_matmul")]
-    ranked = rank_targets(specs)  # no sol_fn -> analytic
-    top2 = {t.op for t in ranked[:2]}
-    assert top2 == {"flash_attention", "gated_delta_rule"}   # attention + scan
-    # standard ops are worth_authoring=False (compiler near-SOL)
-    verdicts = {t.op: t.worth_authoring for t in ranked}
-    assert verdicts["flash_attention"] and verdicts["gated_delta_rule"]
+def test_scan_is_the_compiler_weak_family():
+    # scan (GDN) stays auto-worth; attention is NOT auto-worth without shape/%SOL
+    # (2026-08-28 calibration: single-head dense attention is compiler-strong).
+    specs = [_Spec("rmsnorm"), _Spec("gelu_tanh"), _Spec("gated_delta_rule"),
+             _Spec("qkv_matmul")]
+    verdicts = {t.op: t.worth_authoring for t in rank_targets(specs)}
+    assert verdicts["gated_delta_rule"]                      # scan: compiler-weak
     assert not verdicts["rmsnorm"] and not verdicts["gelu_tanh"]
 
 
+def test_attention_shape_unknown_is_moderate_not_auto_worth():
+    # a bare attention spec with no inferable shape -> "measure it", NOT auto-worth
+    t = analytic_opportunity(_Spec("flash_attention"))
+    assert not t.worth_authoring
+    assert "compiler-strong" in t.reason or "measure" in t.reason
+
+
 def test_select_targets_drops_standard_ops():
-    specs = [_Spec("rmsnorm"), _Spec("gelu_tanh"), _Spec("flash_attention"),
-             _Spec("gated_delta_rule")]
+    specs = [_Spec("rmsnorm"), _Spec("gelu_tanh"), _Spec("gated_delta_rule")]
     targets = [t.op for t in select_targets(specs)]
-    assert set(targets) == {"flash_attention", "gated_delta_rule"}
+    assert set(targets) == {"gated_delta_rule"}   # only the scan op is auto-worth
+
+
+# --- attention shape-aware calibration (the 2026-08-28 fix) ------------------
+
+def test_single_head_attention_compiler_strong_low_opportunity():
+    from invent_kernels import flash_attention_spec
+    # single-head S=2048 -> ~4.2M score elems (well below LOW) -> compiler wins
+    t = analytic_opportunity(flash_attention_spec(seqlen=2048, d_head=128))
+    assert not t.worth_authoring and t.score <= 0.2
+    assert "wins" in t.reason
+
+
+def test_batched_multihead_attention_is_opportunity():
+    from invent_kernels import mha_attention_spec
+    # B=8,H=16,S=2048 -> 8*16*2048^2 ~= 5.4e8... push to clearly-high regime
+    t = analytic_opportunity(mha_attention_spec(batch=8, heads=32, seqlen=2048,
+                                                d_head=128))
+    # 8*32*2048^2 = 1.07e9 >= HIGH -> worth authoring (flash's regime)
+    assert t.worth_authoring and t.score >= 0.6
+    assert "headroom" in t.reason
+
+
+def test_measured_sol_overrides_attention_analytic():
+    from invent_kernels import mha_attention_spec
+    spec = mha_attention_spec(batch=8, heads=32, seqlen=2048, d_head=128)
+    # even a "big" attention op is skipped if MEASURED %SOL says near-SOL
+    ranked = rank_targets([spec], sol_fn=lambda s: (0.92, "compute_bound"))
+    assert not ranked[0].worth_authoring and ranked[0].source == "measured"
 
 
 def test_select_targets_max_cap():
@@ -67,7 +99,7 @@ def test_measured_sol_overrides_analytic_and_higher_sol_ranks_lower():
 
 
 def test_sol_fn_failure_falls_back_to_analytic():
-    specs = [_Spec("flash_attention")]
+    specs = [_Spec("gated_delta_rule")]   # scan: auto-worth on the analytic signal
     def broken(_s):
         raise RuntimeError("no device")
     ranked = rank_targets(specs, sol_fn=broken)

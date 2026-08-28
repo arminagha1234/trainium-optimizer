@@ -546,6 +546,50 @@ def flash_attention_spec(seqlen: int = 2048, d_head: int = 128) -> OpSpec:
               "the dense compiler OOMs")
 
 
+# ---- batched MULTI-HEAD attention (the regime where flash actually wins) -----
+# On-device calibration (2026-08-28): SINGLE-head dense attention is
+# compiler-STRONG on trn2 (compiler beats/ties the flash kernel S=8k-32k, no OOM
+# through 65k). The score-matrix pressure that makes the compiler fall from SOL is
+# TOTAL B*H*S*S — reached by BATCH x HEADS, not single-head length alone. This
+# spec builds that regime so the opportunity sweep / roofline can probe where a
+# streaming flash kernel has real headroom. Inputs are [B,H,S,d]; scores [B,H,S,S].
+def _mha_attention_reference(inp: Inputs) -> np.ndarray:
+    """Batched multi-head attention. q,k,v [B,H,S,d]; out [B,H,S,d].
+    out = softmax(q@k^T / sqrt(d)) @ v (scaled, numerically stabilized)."""
+    q, k, v = inp["q"], inp["k"], inp["v"]
+    d = q.shape[-1]
+    scores = (q @ np.swapaxes(k, -1, -2)) / np.sqrt(d)     # [B,H,S,S]
+    return _softmax(scores, axis=-1) @ v                    # [B,H,S,d]
+
+
+def _mha_attention_inputs(B: int, H: int, S: int, d: int, seed: int) -> Inputs:
+    g = _rng(seed)
+    return {
+        "q": g.standard_normal((B, H, S, d)).astype(np.float32),
+        "k": g.standard_normal((B, H, S, d)).astype(np.float32),
+        "v": g.standard_normal((B, H, S, d)).astype(np.float32),
+    }
+
+
+def mha_attention_spec(batch: int = 4, heads: int = 8, seqlen: int = 2048,
+                       d_head: int = 128) -> OpSpec:
+    """OpSpec for BATCHED MULTI-HEAD attention — the [B,H,S,S] regime where the
+    compiler's dense materialization grows large enough that a streaming flash
+    kernel can win (single-head is compiler-strong; see the calibration note).
+    ``primitive="flash_attention"`` so it routes to the flash kernel corpus.
+    Harvest/probe-only; not in the built-in author catalog."""
+    return OpSpec(
+        "mha_attention", "dense_causal_lm",
+        f"mha-b{batch}-h{heads}-s{seqlen}-hd{d_head}", "bf16",
+        _mha_attention_reference,
+        lambda: _mha_attention_inputs(1, 2, 256, d_head, 31),
+        lambda: _mha_attention_inputs(batch, heads, seqlen, d_head, 32),
+        baseline="torch-eager SDPA (batched multi-head)", origin="invented",
+        primitive="flash_attention",
+        notes=f"batched multi-head attention B={batch} H={heads} S={seqlen} "
+              f"d={d_head}; total score elems B*H*S*S -> the compiler-weak regime")
+
+
 # ---- gated delta rule (GatedDeltaNet / Qwen3.6 linear-attention mixer) ------
 # A COMPILER-WEAK op: a sequential recurrence over the sequence the compiler
 # cannot parallelize well (it either unrolls T-deep and stalls, or diverges via
