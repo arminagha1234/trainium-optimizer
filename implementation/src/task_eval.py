@@ -44,29 +44,29 @@ _ABSENT_LOGPROB = -20.7  # ln(1e-9)
 def _kl_over_baseline_topk(base_ids, base_lp, cand_ids, cand_lp) -> float:
     """KL(P_base || P_cand) over the baseline's top-k support (nats).
 
-    ``P_base`` is the baseline's top-k renormalized to sum to 1. For each of
-    those tokens, ``P_cand`` is the candidate's probability from its OWN top-k
-    (or the absent-floor). Returns 0.0 for empty/degenerate input (no signal is
-    not divergence — the caller's fail-closed default handles missing data)."""
+    Both sides are renormalized over the SAME support (the baseline's top-k
+    tokens) so the divergence is a proper KL — and KL(P||P) == 0 exactly, even
+    though a real model's top-k logprobs do NOT sum to 1 (they're a subset of the
+    full vocab). The candidate's raw prob for each baseline token comes from its
+    own top-k, or an absent-floor when the candidate dropped that token (which
+    then shows up as real divergence after renormalization). Returns 0.0 for
+    empty/degenerate input (missing data is handled fail-closed by the caller)."""
     if not base_ids or not base_lp:
         return 0.0
     cand = {int(i): float(lp) for i, lp in zip(cand_ids or [], cand_lp or [])}
-    # Renormalize the baseline top-k to a proper distribution.
-    bp = [math.exp(float(x)) for x in base_lp]
-    z = sum(bp)
-    if z <= 0:
+    # Raw probs for the baseline top-k tokens on BOTH sides (cand floored if the
+    # token is absent from its top-k), then renormalize each over this support.
+    bp_raw = [math.exp(float(x)) for x in base_lp]
+    cp_raw = [math.exp(cand.get(int(tok), _ABSENT_LOGPROB)) for tok in base_ids]
+    zb, zc = sum(bp_raw), sum(cp_raw)
+    if zb <= 0 or zc <= 0:
         return 0.0
-    bp = [p / z for p in bp]
     kl = 0.0
-    for tok, p_base in zip(base_ids, bp):
-        if p_base <= 0:
-            continue
-        lp_cand = cand.get(int(tok), _ABSENT_LOGPROB)
-        # KL term: p_base * (ln p_base - ln p_cand). ln p_base from the
-        # renormalized baseline prob; ln p_cand is the candidate's raw top-k
-        # logprob (already a log-PROB, not renormalized — a candidate that spread
-        # mass away from this token has a lower logprob here, raising KL).
-        kl += p_base * (math.log(p_base) - lp_cand)
+    for b, c in zip(bp_raw, cp_raw):
+        pb = b / zb
+        pc = c / zc
+        if pb > 0 and pc > 0:
+            kl += pb * math.log(pb / pc)
     return max(0.0, kl)
 
 
