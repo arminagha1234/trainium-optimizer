@@ -1074,3 +1074,39 @@ def test_env_kernel_dir_overrides_and_absent_dir_is_empty(tmp_path, monkeypatch)
     from invent_kernels import flash_attention_spec
     eng = InventEngine(out_dir=tmp_path / "run2")
     assert eng._prior_art(flash_attention_spec()) is None
+
+
+# -- opportunity-sweep wired into run() (autonomous target selection) --------
+def test_run_select_targets_prunes_standard_ops(tmp_path):
+    """run(select_targets_first=True) authors only the compiler-weak ops and
+    records the standard ones as skipped_near_sol (honest, not silent)."""
+    from invent_kernels import gated_delta_rule_spec, flash_attention_spec
+    eng = InventEngine(out_dir=tmp_path)
+    specs = [catalog()["rmsnorm"], catalog()["gelu_tanh"],
+             gated_delta_rule_spec(64, 128, 128), flash_attention_spec(512, 128)]
+    res = eng.run(specs, race_fn=_win_race, select_targets_first=True)
+    by = {r.op: r.status for r in res}
+    assert by["rmsnorm"] == "skipped_near_sol"
+    assert by["gelu_tanh"] == "skipped_near_sol"
+    # compiler-weak ops were selected for authoring (not skipped)
+    assert by["gated_delta_rule"] != "skipped_near_sol"
+    assert by["flash_attention"] != "skipped_near_sol"
+
+
+def test_run_default_authors_all(tmp_path):
+    # default (select_targets_first=False) is unchanged: every spec authored
+    eng = InventEngine(out_dir=tmp_path)
+    specs = [catalog()["rmsnorm"], catalog()["gelu_tanh"]]
+    res = eng.run(specs, race_fn=_win_race)
+    assert not any(r.status == "skipped_near_sol" for r in res)
+    assert {r.op for r in res} == {"rmsnorm", "gelu_tanh"}
+
+
+def test_run_max_targets_caps_authored(tmp_path):
+    from invent_kernels import gated_delta_rule_spec, flash_attention_spec
+    eng = InventEngine(out_dir=tmp_path)
+    specs = [gated_delta_rule_spec(64, 128, 128), flash_attention_spec(512, 128),
+             catalog()["attn_decode"]]
+    res = eng.run(specs, race_fn=_win_race, select_targets_first=True, max_targets=1)
+    authored = [r for r in res if r.status != "skipped_near_sol"]
+    assert len(authored) == 1     # only the single highest-opportunity op authored
