@@ -200,7 +200,11 @@ def _deliverable_from_recipe(
         metric_label=recipe.get("metric_label", "tok/s"),
         config=config,
         config_summary=_config_summary(config),
-        hardware=toolchain.get("instance_type", "trn2.3xlarge"),
+        hardware=str(
+            recipe.get("instance_type")
+            or toolchain.get("instance_type")
+            or "trn2.3xlarge"
+        ),
         verified="verified",
         rel_dir=str(source_dir.relative_to(optimized_models_dir)),
         source_dir=source_dir,
@@ -215,22 +219,29 @@ def collect_verified(optimized_models_dir: Path | str) -> list[Deliverable]:
     unverified / failed / 0.0-speedup recipes are skipped (the showcase is
     *successes*). Recurses so it works for both the flat ``<slug>/`` layout the
     loop writes and any legacy nested ``<family>/<model>/`` layout. If the same
-    ``model_id`` appears twice, the faster recipe wins (mirrors publish.py's
-    beat-gate).
+    ``model_id`` appears twice **on the same hardware**, the faster recipe wins
+    (mirrors publish.py's beat-gate). The same model on *different* hardware
+    yields one row per instance type.
     """
     root = Path(optimized_models_dir)
     if not root.exists():
         return []
-    best_by_model: dict[str, Deliverable] = {}
+    best_by_model: dict[tuple[str, str], Deliverable] = {}
     for recipe_path in sorted(root.rglob("recipe.json")):
         d = _deliverable_from_recipe(recipe_path, root)
         if d is None:
             continue
-        prev = best_by_model.get(d.model_id)
+        # Key on (model, hardware), not model alone. A model optimized on two
+        # instance types yields two independent results — speedup is relative to
+        # that box's eager baseline — so both deserve a row. Keying on model
+        # alone silently dropped whichever box scored lower, which hid the
+        # trn2.48xlarge numbers entirely behind the trn2.3xlarge ones.
+        key = (d.model_id, d.hardware)
+        prev = best_by_model.get(key)
         if prev is None or d.speedup > prev.speedup or (
             d.speedup == prev.speedup and d.best > prev.best
         ):
-            best_by_model[d.model_id] = d
+            best_by_model[key] = d
     return sorted(
         best_by_model.values(), key=lambda x: (x.speedup, x.best), reverse=True
     )
@@ -297,9 +308,14 @@ def render_leaderboard(deliverables: list[Deliverable]) -> str:
     lines = [
         "# Trainium Optimizer — Leaderboard",
         "",
-        "Verified optimized models, one row per model, sorted by speedup over the "
-        "eager baseline on real Trainium hardware (`native-pytorch-beta3`). "
-        "Auto-published by the optimizer loop — do not edit by hand.",
+        "Verified optimized models, **one row per model per hardware target**, "
+        "sorted by speedup over the eager baseline on real Trainium hardware "
+        "(`native-pytorch-beta3`). Auto-published by the optimizer loop — do not "
+        "edit by hand.",
+        "",
+        "Speedup is relative to the eager baseline **on the same instance**, so "
+        "rows for different hardware are each internally consistent but are **not "
+        "comparable to one another** — a bigger box can score a lower multiple.",
         "",
         "Recipes and trajectory charts live under "
         "[`optimized_models/`](./optimized_models/) — each folder holds "
@@ -320,7 +336,9 @@ def render_leaderboard(deliverables: list[Deliverable]) -> str:
         )
     lines += [
         "",
-        f"{len(deliverables)} verified model(s). "
+        f"{len(deliverables)} verified result(s) across "
+        f"{len({d.model_id for d in deliverables})} model(s) and "
+        f"{len({d.hardware for d in deliverables})} hardware target(s). "
         "Speedup is measured against the eager baseline on the same instance and "
         "probe shape. See [`HISTORY.tsv`](./HISTORY.tsv) for the append-only record.",
         "",

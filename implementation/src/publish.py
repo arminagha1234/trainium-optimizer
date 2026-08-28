@@ -20,12 +20,39 @@ This module reads the former and writes the latter.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ledger import Ledger, Row
+
+
+_HW_RE = re.compile(r"^(trn|inf)\d[a-z0-9]*\.[a-z0-9]+$", re.IGNORECASE)
+
+
+def _is_hardware(instance_type: str) -> bool:
+    """True for a real Neuron instance type like ``trn2.48xlarge`` / ``inf2.xlarge``.
+
+    Guards against sentinel stamps ("mock", "", "cpu") so only genuine hardware
+    gets its own per-instance deliverable folder.
+    """
+    return bool(_HW_RE.match(instance_type or ""))
+
+
+def _copy(src: Path, dst: Path) -> None:
+    """Copy a file, tolerating filesystems without extended-attribute support.
+
+    ``shutil.copy2`` also copies xattrs, which raises ``OSError: [Errno 524]``
+    (ENOTSUPP) on S3/FUSE-backed mounts — e.g. a Kaizen desktop ``$HOME``. That
+    turned every publish into a crash and made a whole run report ``0/N ok``.
+    Metadata is a nice-to-have here; the bytes are the deliverable.
+    """
+    try:
+        shutil.copy2(src, dst)
+    except OSError:
+        shutil.copy(src, dst)
 
 
 @dataclass
@@ -43,6 +70,7 @@ class Recipe:
     kernels: list[dict[str, Any]] = field(default_factory=list)  # provenance per kernel
     measurements: dict[str, Any] = field(default_factory=dict)   # per-shape, per-batch
     verified: str = "ungraded"          # trusted-grader verdict for this recipe
+    instance_type: str = ""             # box this was measured on — rows are per (model, hw)
     generated_at: str = ""
 
 
@@ -97,7 +125,23 @@ def publish(
         return None
 
     slug = _slug(model_id)
-    dest = Path(out_root) / slug
+    # Hardware-namespaced canonical recipe. The same model optimized on a
+    # different instance type is a DIFFERENT deliverable: speedup is measured
+    # against the eager baseline *on that box*, so a trn2.48xlarge result must
+    # not be beat-gated against a trn2.3xlarge one (they are not comparable, and
+    # the flat layout silently discarded whichever box scored lower). Falls back
+    # to the flat legacy layout when the backend does not stamp an instance type.
+    instance_type = str(toolchain.get("instance_type", "") or "").strip()
+    # Only namespace on a REAL Neuron instance type (trn*/inf*). Sentinel stamps
+    # from non-hardware backends (e.g. the mock backend reports "mock") must keep
+    # the flat legacy layout — otherwise every mock run would mint a junk
+    # optimized_models/<slug>/mock/ folder and the deliverable path contract
+    # would change out from under existing callers.
+    dest = (
+        Path(out_root) / slug / instance_type
+        if _is_hardware(instance_type)
+        else Path(out_root) / slug
+    )
 
     # Beat-gate: keep the better recipe. Only replace if this run is faster than
     # the one already published (canonical current-best).
@@ -124,6 +168,7 @@ def publish(
         kernels=kernel_provenance or [],
         measurements=full_measurements or {},
         verified=verified,
+        instance_type=instance_type,
         generated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     )
 
@@ -138,11 +183,11 @@ def publish(
     for artifact in ("optimization_timeline.png", "trajectory.png", "results.tsv"):
         src = Path(run_dir) / artifact
         if src.exists():
-            shutil.copy2(src, dest / artifact)
+            _copy(src, dest / artifact)
 
     # 4. the backend fork diff, if provided (the actual code changes)
     if fork_diff_path and Path(fork_diff_path).exists():
-        shutil.copy2(fork_diff_path, dest / "backend.diff")
+        _copy(Path(fork_diff_path), dest / "backend.diff")
 
     # 5. a human-readable summary
     (dest / "RECIPE.md").write_text(_recipe_markdown(recipe))
