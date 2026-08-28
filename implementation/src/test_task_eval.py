@@ -160,3 +160,26 @@ def test_task_eval_composes_with_trusted_grader():
     assert verdict["reproduced"] and verdict["equivalence_ok"]   # coarse checks pass
     assert verdict["task_ok"] is False                           # task gate rejects
     assert verdict["verdict"] == "unverified"
+
+
+# --- regression: real-model top-k does NOT sum to 1 (bug caught on-device) ---
+def _raw_pos(ids, logprobs):
+    """A per-position top-k with RAW logprobs that do NOT sum to 1 (as a real
+    model's top-k subset of the full vocab)."""
+    return {"ids": list(ids), "logprobs": list(logprobs)}
+
+
+def test_identical_nonnormalized_topk_is_zero_kl():
+    # top-5 logprobs summing to ~0.38 prob mass (realistic) — KL(P||P) must be 0
+    p = _raw_pos([1, 2, 3, 4, 5], [-1.0, -2.0, -2.5, -3.0, -3.5])
+    kl = _kl_over_baseline_topk(p["ids"], p["logprobs"], p["ids"], p["logprobs"])
+    assert kl < 1e-9, kl                       # regression: was ~0.98 before the fix
+    a = agreement([p], [p])
+    assert a["mean_kl"] < 1e-9 and a["top1_match"] == 1.0
+
+
+def test_nonnormalized_flattened_is_divergent():
+    base = _raw_pos([1, 2, 3, 4, 5], [-1.0, -2.0, -2.5, -3.0, -3.5])
+    flat = _raw_pos([1, 2, 3, 4, 5], [-1.5, -1.6, -1.7, -1.8, -1.9])  # same top-1, flat
+    kl = _kl_over_baseline_topk(base["ids"], base["logprobs"], flat["ids"], flat["logprobs"])
+    assert kl > 0.05
