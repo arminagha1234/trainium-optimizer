@@ -60,6 +60,37 @@ def _shape_input_len(shape: str) -> int:
         return int(tok)
 
 
+_ERR_TAIL_CHARS = 4000
+
+# Ordered, most-specific-first. Recognising the common shapes turns an opaque
+# metric=0.0 into an actionable line without needing the full log.
+_ERR_SIGNATURES: tuple[tuple[str, str], ...] = (
+    ("out of memory", "OOM: device ran out of HBM"),
+    ("HBM", "OOM / HBM pressure"),
+    ("nrt_tensor_allocate", "runtime allocation failed (cores held by another process?)"),
+    ("nrt_init", "Neuron runtime failed to initialise"),
+    ("No module named", "missing Python dependency in the worker env"),
+    ("KeyError: 'architectures'", "model config has no architectures field"),
+    ("Dynamic shape is not supported", "dynamic shape reached the compiler "
+                                       "(set dynamic=False / pin the batch)"),
+    ("not supported", "unsupported architecture/op for this backend"),
+    ("CUDA", "worker tried a CUDA path on a Neuron device"),
+    ("torch.distributed", "collective/TP initialisation failed"),
+    ("Killed", "worker was killed (OOM-killer / host memory)"),
+)
+
+
+def _worker_failure_reason(rc: int | None, err_tail: str) -> str:
+    """Turn a dead worker into one actionable line, keeping the raw tail."""
+    tail = (err_tail or "").strip()
+    if not tail:
+        return f"worker exited rc={rc} with no stderr"
+    label = next((lbl for pat, lbl in _ERR_SIGNATURES if pat.lower() in tail.lower()), "")
+    last = [ln for ln in tail.splitlines() if ln.strip()][-1] if tail.splitlines() else ""
+    head = f"{label}: " if label else ""
+    return f"{head}rc={rc}: {last[:400]}"
+
+
 class NativePyTorchBackend:
     """Native PyTorch (TorchNeuron, Beta 3) backend — drives real hardware."""
 
@@ -293,24 +324,44 @@ class NativePyTorchBackend:
         env = {**os.environ,
                "HF_HUB_DISABLE_PROGRESS_BARS": "1",
                "TOKENIZERS_PARALLELISM": "false"}
+        # Capture the worker's stderr instead of discarding it. Every silent
+        # metric=0.0 below used to be indistinguishable -- an OOM, an unsupported
+        # architecture, a missing dependency and a plain import error all looked
+        # identical -- which made bringing up a new/large model a guessing game.
+        # Bounded tail only, so a chatty compiler cannot balloon memory.
+        _err_tail = ""
         try:
-            subprocess.run(cmd, env=env, timeout=_COMPILE_TIMEOUT_S,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           check=False)
+            _proc = subprocess.run(cmd, env=env, timeout=_COMPILE_TIMEOUT_S,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.PIPE, check=False)
+            _err_tail = (_proc.stderr or b"").decode("utf-8", "replace")[-_ERR_TAIL_CHARS:]
+            _rc = _proc.returncode
         except subprocess.TimeoutExpired:
             # Compile/run blew past the 30-min wall. Record it as a compile that
             # hit the ceiling (compile_seconds = the timeout) rather than a
             # silent 0.0, so the ledger shows WHY this candidate was discarded.
             return Measurements(metric=0.0, shape=shape, batch=batch,
                                 hbm_peak_gb=999, hbm_available_gb=48,
-                                compile_seconds=float(_COMPILE_TIMEOUT_S))
+                                compile_seconds=float(_COMPILE_TIMEOUT_S),
+                                failure_reason=(
+                                    f"timeout: exceeded the {_COMPILE_TIMEOUT_S}s "
+                                    f"compile/run wall"))
 
         if not out_f.exists():
-            return Measurements(metric=0.0, shape=shape, batch=batch)
+            # Worker never wrote its JSON: it died before reporting. This is the
+            # case that matters most for new-model bring-up.
+            reason = _worker_failure_reason(_rc, _err_tail)
+            print(f"[measure] worker produced no result (rc={_rc}): {reason}",
+                  file=sys.stderr, flush=True)
+            return Measurements(metric=0.0, shape=shape, batch=batch,
+                                failure_reason=reason)
         data = json.loads(out_f.read_text())
         out_f.unlink(missing_ok=True)
         if not data.get("ok"):
-            return Measurements(metric=0.0, shape=shape, batch=batch)
+            reason = str(data.get("error") or "").strip() or _worker_failure_reason(_rc, _err_tail)
+            print(f"[measure] worker reported not-ok: {reason}", file=sys.stderr, flush=True)
+            return Measurements(metric=0.0, shape=shape, batch=batch,
+                                failure_reason=reason)
 
         return Measurements(
             metric=data["tok_s"],
