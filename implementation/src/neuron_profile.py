@@ -1,0 +1,287 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""neuron_profile.py — PROFILE-GUIDED bottleneck diagnosis for the perf loop.
+
+Today ``kernel_perf.classify_bottleneck`` diagnoses a slow kernel from the
+ANALYTIC roofline alone: a shape-derived ``memory_bound``/``compute_bound`` label
++ arithmetic-intensity ratio. That is a *guess* — it says "this op *should* be
+memory-bound", not "on THIS silicon the DMA engine was 71% busy while the PE sat
+at 9%". The on-device finding that motivates this module: the real profiler
+(``neuron-profile``) knows exactly which engine (PE / Act / Pool / DMA) dominated
+the measured latency, and feeding THAT to the author turns perf-tuning from
+guessing into surgery ("your K-tile DMA is 60% of latency → double-buffer it").
+
+This module is the seam between a real per-engine profile and the perf loop's
+existing bottleneck vocabulary. ``kernel_perf.classify_bottleneck`` already scans
+``race.reason`` for the keywords ``dma`` / ``bandwidth`` / ``single`` / ``serial``
+/ ``engine`` / ``spill`` BEFORE falling back to the analytic label — so the
+integration is: profile the measured kernel, ``summarize`` the per-engine busy
+fractions into a ``reason`` string carrying the right keyword, and attach it to
+the ``RaceResult``. The analytic path stays as the fail-open fallback when no
+profiler is available (off-device, or ``neuron-profile`` absent) — this module
+NEVER raises and returns ``None`` when it cannot profile, so the loop degrades to
+today's analytic behaviour rather than breaking.
+
+The valuable, load-bearing part — ``summarize`` (per-engine busy → dominant
+bottleneck + human reason) and ``parse_profile_json`` (tolerant extraction of
+engine busy fractions from a ``neuron-profile`` summary) — is PURE and
+unit-testable off-device. Only ``profile_kernel`` (which actually shells out to
+``neuron-profile`` / uses the profiling API) touches the device, and it is fully
+guarded.
+
+The canonical bottleneck labels match ``kernel_perf`` exactly
+(``memory_bound`` / ``single_engine`` / ``dma_blocked``) so a caller can route on
+``ProfileReport.dominant`` directly, while ``ProfileReport.reason`` carries the
+keyword form for the grep path already wired in ``classify_bottleneck``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+# Canonical bottleneck labels — kept identical to kernel_perf's constants so a
+# ProfileReport.dominant can be consumed there without translation.
+MEMORY_BOUND = "memory_bound"
+SINGLE_ENGINE = "single_engine"
+DMA_BLOCKED = "dma_blocked"
+
+# The Trainium2 compute/movement engines a neuron-profile reports a busy fraction
+# for. Keys are the normalized names this module uses; ``parse_profile_json``
+# maps the many spellings a profiler emits (PE/Per/TensorE, Act/Scalar,
+# Pool/Vector, DMA/DVE/SP) onto them.
+_COMPUTE_ENGINES = ("pe", "act", "pool")   # the three on-core compute engines
+_MOVEMENT_ENGINES = ("dma",)               # off-core data movement
+
+# A compute engine is "dominant" (one engine serializes the pipeline) when it is
+# the busiest AND no engine is near-saturated — i.e. the kernel is latency-bound
+# on a single serial engine while the rest sit idle. If the busiest engine is
+# itself near-saturated the kernel is simply compute-bound on that engine (still
+# routed to SINGLE_ENGINE guidance: fuse + overlap), so this threshold only
+# separates "serialized" from "genuinely saturated" for the REASON prose.
+_SATURATED = 0.80
+# A compute engine must be at least this busy to count as "the pipeline serializes
+# on it". Below this floor NOTHING is meaningfully busy — the device is starved
+# waiting on data (memory-bound), not serialized on an engine. Without this floor
+# a kernel where every engine sits at ~15% would be mislabelled single-engine
+# just because one compute engine edged out the others.
+_SERIALIZE_MIN = 0.30
+# DMA counts as the bottleneck when it is the busiest engine by at least this
+# margin over the busiest compute engine (a clear data-movement bind, not a tie).
+_DMA_MARGIN = 1.10
+
+
+@dataclass(frozen=True)
+class ProfileReport:
+    """A per-engine profile of one measured kernel, reduced to the perf loop's
+    bottleneck vocabulary.
+
+    ``engine_busy`` maps normalized engine name -> busy fraction (0..1) of the
+    measured window. ``dominant`` is the canonical bottleneck label
+    (``memory_bound`` / ``single_engine`` / ``dma_blocked``) matching
+    ``kernel_perf``. ``reason`` is the human, keyword-bearing string the perf
+    loop's ``classify_bottleneck`` greps (so the analytic fallback is bypassed in
+    favour of this real measurement). ``device_us`` is the profiled device
+    latency in microseconds (0.0 if the profiler did not report one)."""
+
+    engine_busy: dict = field(default_factory=dict)
+    dominant: str = MEMORY_BOUND
+    reason: str = ""
+    device_us: float = 0.0
+
+    @property
+    def measured(self) -> bool:
+        """True when this report carries real per-engine data (not an empty /
+        fail-open placeholder)."""
+        return bool(self.engine_busy)
+
+
+def _busiest(engine_busy: dict, names: tuple) -> tuple[str, float]:
+    """(name, busy) of the busiest engine among ``names`` present in
+    ``engine_busy`` — ("", 0.0) if none are present."""
+    best_name, best = "", 0.0
+    for n in names:
+        v = float(engine_busy.get(n, 0.0) or 0.0)
+        if v > best:
+            best_name, best = n, v
+    return best_name, best
+
+
+def summarize(engine_busy: dict, device_us: float = 0.0) -> ProfileReport:
+    """Reduce a per-engine busy map to a ``ProfileReport`` — the PURE core.
+
+    Decision (best-first, mirrors the physical bind):
+      * DMA the clear busiest engine (>= ``_DMA_MARGIN`` over the busiest compute
+        engine) -> ``dma_blocked``: the load/store path is the limiter; the fix is
+        double-buffering + wider tiles.
+      * one compute engine busiest but NOTHING near-saturated -> ``single_engine``:
+        the pipeline serializes on one engine while the others sit idle; the fix
+        is activation-fusion + engine overlap.
+      * otherwise (all engines lightly used, or a compute engine saturated with
+        low arithmetic intensity) -> ``memory_bound``: the op is bandwidth-bound;
+        the fix is fusion + hoisting invariant loads.
+
+    Empty input -> a fail-open ``memory_bound`` report with ``measured=False`` so
+    the caller falls back to the analytic label rather than trusting an empty
+    profile. Never raises."""
+    if not engine_busy:
+        return ProfileReport({}, MEMORY_BOUND,
+                             "no per-engine profile — analytic fallback", device_us)
+    busy = {k: float(v or 0.0) for k, v in engine_busy.items()}
+    dma_name, dma = _busiest(busy, _MOVEMENT_ENGINES)
+    ce_name, ce = _busiest(busy, _COMPUTE_ENGINES)
+    peak = max(busy.values(), default=0.0)
+
+    if dma > 0.0 and dma >= ce * _DMA_MARGIN and dma >= ce:
+        return ProfileReport(
+            busy, DMA_BLOCKED,
+            f"dma-blocked: DMA engine {dma*100:.0f}% busy vs compute "
+            f"{ce_name.upper() or 'PE'} {ce*100:.0f}% — data movement is the "
+            f"limiter (double-buffer + widen tiles)", device_us)
+
+    if ce >= _SERIALIZE_MIN and peak < _SATURATED and ce >= dma:
+        idle = ", ".join(f"{n.upper()} {busy.get(n, 0.0)*100:.0f}%"
+                         for n in _COMPUTE_ENGINES if n != ce_name)
+        return ProfileReport(
+            busy, SINGLE_ENGINE,
+            f"single-engine serialize: {ce_name.upper()} {ce*100:.0f}% busy while "
+            f"{idle or 'other engines'} sit idle — no engine saturated, the "
+            f"pipeline serializes on one engine (activation-fuse + overlap)",
+            device_us)
+
+    return ProfileReport(
+        busy, MEMORY_BOUND,
+        f"memory-bound: busiest engine only {peak*100:.0f}% busy — bandwidth-bound, "
+        f"likely spilling an intermediate through HBM (fuse + hoist invariant "
+        f"loads)", device_us)
+
+
+# ---------------------------------------------------------------------------
+# tolerant parse of a neuron-profile summary
+# ---------------------------------------------------------------------------
+# neuron-profile emits engine names in several spellings across SDK versions; map
+# each onto this module's normalized {pe, act, pool, dma}. Substring match, first
+# hit wins, so "PE utilization" / "TensorEngine" both land on "pe".
+_ENGINE_ALIASES = (
+    ("dma", ("dma", "dve", " sp ", "sp_", "movement", "hbm", "bandwidth")),
+    ("pe", ("pe", "tensor", "matmul", "pooling_matmul")),
+    ("act", ("act", "scalar", "activation")),
+    ("pool", ("pool", "vector", "gpsimd")),
+)
+
+
+def _normalize_engine(name: str) -> str:
+    """Map a profiler's engine name onto {pe, act, pool, dma}; "" if unknown."""
+    n = f" {(name or '').lower()} "
+    for norm, aliases in _ENGINE_ALIASES:
+        if any(a in n for a in aliases):
+            return norm
+    return ""
+
+
+def _as_fraction(v: Any) -> float:
+    """Coerce a busy value to a 0..1 fraction. Accepts a fraction (0.71), a
+    percentage (71.0 -> 0.71), or a string ("71%" / "0.71"). Non-numeric -> 0.0."""
+    try:
+        if isinstance(v, str):
+            v = v.strip().rstrip("%")
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    if f > 1.0:            # a percentage
+        f = f / 100.0
+    return max(0.0, min(1.0, f))
+
+
+def parse_profile_json(obj: Any) -> dict:
+    """Extract a normalized ``{engine: busy_fraction}`` map from a neuron-profile
+    summary object (already JSON-parsed). Tolerant of the several shapes the
+    profiler emits — a flat ``{"PE busy %": 71, ...}``, a nested
+    ``{"engines": {"TensorEngine": {"utilization": 0.71}}}``, or a list of
+    ``{"name":..., "busy":...}`` records — because the exact schema drifts across
+    SDK versions and a strict parse would fail-closed on every bump. Unknown /
+    unparseable input -> ``{}`` (which ``summarize`` treats as fail-open). Never
+    raises."""
+    out: dict = {}
+
+    def _put(name: str, val: Any) -> None:
+        eng = _normalize_engine(name)
+        if eng:
+            out[eng] = max(out.get(eng, 0.0), _as_fraction(val))
+
+    try:
+        if isinstance(obj, dict):
+            # nested {"engines": {...}} takes precedence if present
+            engines = obj.get("engines") or obj.get("engine_utilization")
+            if isinstance(engines, dict):
+                for name, rec in engines.items():
+                    if isinstance(rec, dict):
+                        _put(name, rec.get("utilization", rec.get("busy",
+                             rec.get("busy_pct", 0.0))))
+                    else:
+                        _put(name, rec)
+            elif isinstance(engines, list):
+                for rec in engines:
+                    if isinstance(rec, dict):
+                        _put(rec.get("name", ""), rec.get("utilization",
+                             rec.get("busy", rec.get("busy_pct", 0.0))))
+            else:
+                # flat dict of "<engine> ..." -> value
+                for name, val in obj.items():
+                    if isinstance(val, (int, float, str)):
+                        _put(name, val)
+        elif isinstance(obj, list):
+            for rec in obj:
+                if isinstance(rec, dict):
+                    _put(rec.get("name", ""), rec.get("utilization",
+                         rec.get("busy", rec.get("busy_pct", 0.0))))
+    except Exception:  # noqa: BLE001 — a parse failure must fall back to analytic
+        return {}
+    return out
+
+
+# ---------------------------------------------------------------------------
+# the device path (guarded)
+# ---------------------------------------------------------------------------
+def profile_kernel(run_fn: Callable[[], Any], device: Any = None, *,
+                   profiler: Callable[[Callable], dict] | None = None
+                   ) -> ProfileReport | None:
+    """Profile one measured kernel run and return a ``ProfileReport``, or ``None``
+    when profiling is unavailable (off-device / no ``neuron-profile``) so the
+    caller falls back to the analytic bottleneck.
+
+    ``profiler`` is the INJECTED seam: a callable ``(run_fn) -> engine_busy_dict``
+    (or a dict already parsed) that actually invokes the profiler. Injected so
+    this function is unit-testable with a fake profiler and so the real
+    ``neuron-profile`` integration lives in exactly one place (the caller wires
+    it). With no ``profiler`` injected this returns ``None`` (there is no default
+    device profiler here — the honest "cannot profile" signal), NEVER a fabricated
+    report. Never raises: a profiler that throws degrades to ``None``."""
+    if profiler is None:
+        return None
+    try:
+        raw = profiler(run_fn)
+    except Exception:  # noqa: BLE001 — a broken profiler is "cannot profile", not a crash
+        return None
+    if raw is None:
+        return None
+    busy = raw if _looks_normalized(raw) else parse_profile_json(raw)
+    device_us = 0.0
+    if isinstance(raw, dict):
+        try:
+            device_us = float(raw.get("device_us", raw.get("total_us", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            device_us = 0.0
+    if not busy:
+        return None
+    return summarize(busy, device_us)
+
+
+def _looks_normalized(d: Any) -> bool:
+    """True when ``d`` is already a normalized ``{pe|act|pool|dma: fraction}`` map
+    (so we skip ``parse_profile_json`` and use it directly)."""
+    if not isinstance(d, dict) or not d:
+        return False
+    keys = set(d.keys())
+    return keys.issubset({"pe", "act", "pool", "dma"}) and bool(
+        keys & {"pe", "act", "pool", "dma"})
