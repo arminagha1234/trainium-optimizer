@@ -160,10 +160,15 @@ def flash_fwd_causal(q, k, v, out):
 # nki_jit dispatch loops the heads (no per-head host round-trip — the fix that
 # made flash competitive vs the ~0.7ms/head dispatch of looping single-head).
 # Validated on-device 2026-08-28: cos=1.0 at BH=4/S=512; ran at BH=256/S=4096
-# (~tie w/ dense) and at BH=128/S=8192 where dense OOM'd. NOTE the ``affine_range``
-# batch loop UNROLLS — compile time grows with BH; a tiled/looped batch dim is a
-# follow-up for very large BH.
+# (~tie w/ dense) and at BH=128/S=8192 where dense OOM'd. The batch loop uses
+# ``nl.sequential_range`` so it LOOPS the heads (compact graph) rather than
+# UNROLLING them (``affine_range`` unrolled B*H copies of the flash body -> the
+# compile never finished at BH=256 in 20+min; sequential loops it: BH=64/S=4096 in
+# ~88s (cos 0.99987), BH=256/S=4096 in ~419s — from "never compiles" to "compiles").
+# Heads run one-at-a-time on a single NeuronCore regardless, so serial execution
+# costs nothing here — only the compile shrinks. (Large-B*H compile is still
+# costly; a tiled batch dim avoiding per-head graph nodes is the follow-up.)
 def flash_fwd_batched(q, k, v, out):
     BH = q.shape[0]
-    for bh in nl.affine_range(BH):
+    for bh in nl.sequential_range(BH):
         _flash_nc(q[bh], k[bh], v[bh], out[bh], BK=512, downcast=True)
