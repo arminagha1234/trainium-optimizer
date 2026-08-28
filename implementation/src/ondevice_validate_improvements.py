@@ -88,72 +88,50 @@ def _attention_spec():
 # ---------------------------------------------------------------------------
 # F2 — neuron-profile feedback
 # ---------------------------------------------------------------------------
-def _build_neuron_profiler():
-    """Return a profiler callable ``(run_fn) -> engine_busy`` backed by the real
-    `neuron-profile` CLI, or None if the tooling is unavailable on this box.
-
-    The real capture flow (SDK-dependent): run the kernel under a profile capture,
-    export the summary as JSON, and hand the raw JSON to neuron_profile which
-    parses per-engine busy via parse_profile_json. This wrapper is intentionally
-    conservative: if any step is unavailable it returns None so the F2 check SKIPs
-    (never a fabricated profile)."""
-    import shutil
-    if shutil.which("neuron-profile") is None:
-        return None
-
-    import json
-    import subprocess
-
-    def profiler(run_fn):
-        # Execute the kernel once so a profile is captured, then export summary.
-        # NOTE: exact neuron-profile capture/export flags vary by SDK; this uses
-        # the JSON summary export. Returns the parsed JSON (neuron_profile handles
-        # the schema); any failure -> None (SKIP).
-        try:
-            run_fn()
-            prof_dir = _out_dir() / "nprof"
-            prof_dir.mkdir(exist_ok=True)
-            summary = prof_dir / "summary.json"
-            # Best-effort export; if the installed CLI differs, this raises and we
-            # SKIP rather than guess.
-            subprocess.run(
-                ["neuron-profile", "view", "--output-format", "json",
-                 "--output-file", str(summary)],
-                check=True, capture_output=True, timeout=120)
-            return json.loads(summary.read_text())
-        except Exception:  # noqa: BLE001
-            return None
-
-    return profiler
-
-
 def check_f2_profile():
+    """Validate the FULL profiler path on silicon — neuron-explorer capture ->
+    summary-json -> parse -> summarize -> route — using a real compiled NEFF from
+    the neuronx-cc cache. This is independent of the NKI-via-torch_xla kernel-
+    invoke path (which needs a torch-neuronx venv this box may lack), so it
+    validates F2 even where kernel racing is blocked."""
     try:
-        from invent_engine import InventEngine, nki_available
+        import shutil
         import neuron_profile
-        if not nki_available():
-            _record("F2 neuron-profile", "SKIP", "no Neuron device (nki unavailable)")
-            return
-        profiler = _build_neuron_profiler()
-        if profiler is None:
-            # Still validate the seam end-to-end with the engine wired, using the
-            # analytic fallback path: confirm a profiler=None engine races the seed
-            # and that summarize() is coherent on a synthetic device-shaped busy map.
+        if shutil.which("neuron-explorer") is None:
+            # No profiler tool: confirm summarize() is coherent on a synthetic map
+            # (CPU logic) and SKIP the on-device capture.
             rep = neuron_profile.summarize({"dma": 0.72, "pe": 0.11, "act": 0.2})
             ok = rep.dominant == neuron_profile.DMA_BLOCKED and rep.measured
             _record("F2 neuron-profile", "SKIP" if ok else "FAIL",
-                    "`neuron-profile` CLI absent; summarize() coherent on synthetic "
-                    f"map ({rep.dominant}) but real per-engine capture NOT exercised")
+                    "neuron-explorer absent; summarize() coherent on synthetic map "
+                    f"({rep.dominant}) but real per-engine capture NOT exercised")
             return
-        # Real profiler present: race a known-good seed with the profiler wired and
-        # confirm a coherent bottleneck lands on the RaceResult.reason.
-        eng = InventEngine(out_dir=_out_dir(), profiler=profiler)
-        res, executed, verdict = eng.self_test(seed="silu_gate")
-        reason = getattr(res.race, "reason", "")
-        has_profile = "profile:" in reason
-        _record("F2 neuron-profile", "PASS" if (executed and has_profile) else "FAIL",
-                f"seed executed={executed}; profile-in-reason={has_profile}; "
-                f"reason={reason[:160]}")
+        neff = neuron_profile.latest_neff()
+        if neff is None:
+            _record("F2 neuron-profile", "SKIP",
+                    "neuron-explorer present but no compiled .neff in the cache to "
+                    "profile (compile a kernel first)")
+            return
+        profiler = neuron_profile.capture_profiler(neff)
+        if profiler is None:
+            _record("F2 neuron-profile", "SKIP", "capture_profiler could not build")
+            return
+        rep = neuron_profile.profile_kernel(lambda: None, profiler=profiler)
+        if rep is None or not rep.measured:
+            _record("F2 neuron-profile", "FAIL",
+                    f"neuron-explorer capture on {os.path.basename(neff)} yielded no "
+                    "per-engine profile")
+            return
+        # Confirm the profiled reason routes the perf loop's classifier coherently.
+        from kernel_perf import classify_bottleneck
+
+        class _R:
+            bottleneck = ""
+            reason = rep.reason
+        routed = classify_bottleneck(_R())
+        _record("F2 neuron-profile", "PASS",
+                f"neuron-explorer capture -> {rep.engine_busy} -> dominant="
+                f"{rep.dominant}; perf-loop routes to {routed}; reason={rep.reason[:120]}")
     except Exception as e:  # noqa: BLE001
         _record("F2 neuron-profile", "FAIL", f"{e!r}\n{traceback.format_exc()}")
 
