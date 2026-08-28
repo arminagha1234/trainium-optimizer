@@ -1891,6 +1891,15 @@ def _torch_baseline(op: str, inp: dict, device=None):
         return F.silu(x[..., :f]) * x[..., f:]
     if op == "softmax":
         return torch.softmax(t("x"), dim=-1)
+    if any(tok in op for tok in ("matmul", "gemm")) or op.endswith("_mm"):
+        # Generic matmul-family baseline: contract the first two 2-D inputs (in
+        # declared order) — the torch-eager GEMM the compiler already lowers near
+        # SOL. Without this branch a matmul op raised KeyError -> the baseline
+        # timed 0.0 -> the race DEFERRED even a CORRECT kernel (its speed could
+        # never be judged). Handles the common a@b / lhs@rhs shape.
+        mats = [t(k) for k in inp if np.asarray(inp[k]).ndim >= 2]
+        if len(mats) >= 2:
+            return mats[0] @ mats[1]
     raise KeyError(op)
 
 
