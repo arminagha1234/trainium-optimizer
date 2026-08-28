@@ -142,6 +142,37 @@ TECHNIQUES: dict[str, str] = {
         "`nl.max(logits, axis=1, keepdims=True)` + argmax-via-iota, masking the "
         "winner to -inf before the next pass. Cheaper than a full sort and keeps "
         "every tile 2-D.",
+    # --- harvested from AWShtokoyo/vllm-neuron (see docs/vllm-neuron-harvest.md) ---
+    "sequential-range-for-scan":
+        "A loop-carried read-modify-write (a scan's recurrent state, a flash "
+        "running max/denominator) MUST use `nl.sequential_range`, NOT "
+        "`nl.affine_range`: affine_range lets the compiler REORDER iterations, "
+        "which is 'valid-ranged but WRONG' for a dependency chain. sequential_range "
+        "for the carry loop; affine_range only for truly independent tiles.",
+    "sequential-gdn-not-chunked":
+        "On this neuronx-cc, a GatedDeltaNet/linear-attention scan is best done as "
+        "the SEQUENTIAL recurrence (nl.sequential_range over T), NOT the chunked "
+        "(I-M)^-1 Neumann-doubling form: the chunked bf16 values DIFFER from the "
+        "recurrence enough to perturb a downstream MoE top-8 routing (and over-run "
+        "its dispatch buffer), and a Python T-deep unroll hangs the compiler. Keep "
+        "head_dim on the partition axis, T on the free axis (<=32767).",
+    "paged-32bit-safe-addressing":
+        "For a paged KV / recurrent-state slab, NEVER form a flat int32 offset "
+        "`block * page_stride` (it overflows at >=2^31 and silently caps the cache "
+        "~16383 blocks). Pass block_id and in-block position SEPARATELY, use `.ap "
+        "offset=0`, and let the DMA engine scale in >32-bit space.",
+    "negated-max-online-softmax":
+        "Flash/online softmax: store the running max as its NEGATIVE (-max) and "
+        "apply it via the activation `bias=` arg; fuse exp+row-reduce in ONE "
+        "`nisa.activation(op=exp, bias=neg_max, reduce_op=add, "
+        "reduce_cmd=reset_reduce)`; NaN-guard the running buffers with a 1e30 "
+        "sentinel + a min-clamp so an all-masked row does not poison the max.",
+    "fp8-row-dequant-in-kernel":
+        "Store weights as e4m3 + a per-output-channel scale `[1,out]`; dequant IN "
+        "the kernel by expanding the scale `[1,D] -> [P_MAX=128, D]` at forward "
+        "(token-generation), or dequant transiently to BF16 for a compute-bound "
+        "prefill (no resident second copy). Shape FP8 scale buffers `[128, .]` "
+        "(P_MAX) so ONE buffer serves both the [1,.] prefill and [128,.] decode.",
 }
 
 
@@ -194,6 +225,26 @@ LANDMINES: dict[str, str] = {
     "topk-k-limit":
         "Router top-K is designed for K <= 8, experts E <= 512, hidden H a "
         "multiple of 128 — outside that the sort-free K-pass approach degrades.",
+    # --- harvested from AWShtokoyo/vllm-neuron (see docs/vllm-neuron-harvest.md) ---
+    "rmsnormgated-plain-weight":
+        "A GATED RMSNorm (GatedDeltaNet) applies the PLAIN learnable weight "
+        "(ones-initialized), NOT `(1 + weight)` like Gemma-style norms — using "
+        "(1+weight) DOUBLES the GDN output. Know which norm convention the arch uses.",
+    "fp8-e4m3-240-not-448":
+        "trn2's legacy e4m3 max is 240, but OCP e4m3 max is 448 — out-of-range OCP "
+        "codes read back inf -> NaN. BYTE-SATURATE oob codes onto the +-240 grid "
+        "(`if (b&0x7F) >= 0x78: b = (b&0x80)|0x77`), exact for in-range codes. Do "
+        "NOT rescale by 240/448 (that shifts EVERY element off the fp8 grid).",
+    "packed-axis-dma-alias":
+        "Many single-slice `nisa.dma_copy` calls keyed by a SCALAR loop index "
+        "collapse to the FIRST index under torch-xla — aliasing every head/expert to "
+        "index 0 (silent wrong output, compiles clean). Do ONE multi-partition DMA "
+        "(the varying axis on the partition dim) + an on-chip nc_transpose instead.",
+    "partial-rope-zero-freq":
+        "Partial RoPE (only the first r dims rotate): the inv_freq denominator is "
+        "still the FULL head_dim; the non-rotary tail gets zero-frequency "
+        "pass-through (cos=1, sin=0) so a sliding-window and a global head can share "
+        "ONE rope code path. head_dim here can exceed 128 (256/512) — tile it.",
 }
 
 
@@ -482,22 +533,27 @@ KNOWLEDGE: dict[str, KnowledgeEntry] = {
         "never materializes.",
         ("isa-return-form", "tile-to-hw-limits", "delayed-softmax-division",
          "activation-reduce-fusion", "psum-native-accumulation",
-         "downcast-before-transpose"),
+         "downcast-before-transpose", "negated-max-online-softmax",
+         "sequential-range-for-scan"),
         ("nc_matmul", "nc_transpose", "activation", "reduce", "reciprocal"),
         ("no-dst-param", "moving-free-512", "no-1d-collapse", "partition-le-128",
-         "size-1-partition", "attn-scores-on-partition"),
+         "size-1-partition", "attn-scores-on-partition", "packed-axis-dma-alias",
+         "partial-rope-zero-freq"),
         (_EX_ATTENTION, _EX_SOFTMAX),
     ),
     SCAN: KnowledgeEntry(
         SCAN,
-        "SSM / linear-attention / GatedDeltaNet-KDA: a sequential recurrence made "
-        "parallel by CHUNKING — intra-chunk matmul + a small SBUF-resident state "
-        "carried across chunks.",
-        ("chunked-scan", "isa-return-form", "tile-to-hw-limits",
+        "SSM / linear-attention / GatedDeltaNet-KDA: a recurrence over the sequence. "
+        "Two forms: a CHUNKED parallel form (intra-chunk matmul + SBUF state carried "
+        "across chunks) and a SEQUENTIAL form (nl.sequential_range over T). On this "
+        "neuronx-cc the SEQUENTIAL form is preferred for GatedDeltaNet — see "
+        "sequential-gdn-not-chunked.",
+        ("chunked-scan", "sequential-range-for-scan", "sequential-gdn-not-chunked",
+         "paged-32bit-safe-addressing", "isa-return-form", "tile-to-hw-limits",
          "psum-native-accumulation", "keepdims-2d"),
         ("nc_matmul", "activation", "reduce"),
         ("chunk-partition-limit", "no-dst-param", "partition-le-128",
-         "no-1d-collapse"),
+         "no-1d-collapse", "rmsnormgated-plain-weight"),
         (_EX_SCAN,),
     ),
     MOE_ROUTER: KnowledgeEntry(
@@ -526,7 +582,8 @@ _FAMILY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (ATTENTION,   ("attn", "attention", "sdpa", "flash", "qk^t", "softmax-pv")),
     (SCAN,        ("scan", "ssm", "ssd", "mamba", "deltanet", "delta_net",
                    "linear_attention", "linear-attention", "recurr", "kda",
-                   "gateddelta", "selective_scan", "state space", "state-space")),
+                   "gateddelta", "gated_delta", "delta_rule", "gdn",
+                   "selective_scan", "state space", "state-space")),
     (MOE_ROUTER,  ("router", "topk", "top_k", "top-k", "moe", "expert",
                    "gating", "gate_logits", "affinit")),
     (SOFTMAX,     ("softmax",)),
