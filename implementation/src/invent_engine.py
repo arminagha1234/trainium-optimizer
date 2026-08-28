@@ -434,6 +434,7 @@ class InventEngine:
         perf_use_mutator: bool = True,
         kernel_library: "Any" = None,
         arch: str = "trn2",
+        profiler: "Any" = None,
     ) -> None:
         # The pluggable authoring seam. Defaults to the recipe table
         # (``RecipeAuthor`` wraps ``invent_kernels.author_kernel``) so behaviour
@@ -504,6 +505,30 @@ class InventEngine:
         # (behaviour unchanged); the win still banks its NKI_KERNEL lesson as before.
         self.kernel_library = kernel_library
         self.arch = arch
+        # PROFILE-GUIDED bottleneck diagnosis (neuron_profile). A ``profiler`` is
+        # a callable ``(run_fn) -> engine_busy`` that runs neuron-profile on ONE
+        # measured kernel; when set, ``_device_race`` attaches the profiled
+        # dominant bottleneck (which engine actually dominated latency) to the
+        # RaceResult.reason, so the perf loop's ``classify_bottleneck`` routes to
+        # the RIGHT lever from a real measurement instead of the analytic guess.
+        # Default None => analytic-only (behaviour unchanged): profiling is a
+        # precision upgrade the caller opts into by wiring a real neuron-profile.
+        self.profiler = profiler
+
+    def attach_tournament(self, complete_fn, strategies=None, *,
+                          compose: bool = True) -> None:
+        """Wire a TOURNAMENT author onto this engine: hard ops are authored by
+        racing N diverse-strategy candidates through THIS engine's ``_device_race``
+        and keeping the correct+fastest, then repair iterates the winner. This is
+        the only place the tournament's ``measure_fn`` can be the engine's real
+        race (a bound method unavailable at caller-construction), so it is wired
+        here. ``complete_fn`` is the same provider seam an ``LLMAuthor`` takes.
+        No-op-safe: importable without the tournament module changing default
+        behaviour (a run that never calls this is byte-for-byte unchanged)."""
+        from kernel_tournament import TournamentAuthor  # noqa: PLC0415
+        self.author = TournamentAuthor(
+            complete_fn, strategies=strategies, compose=compose
+        ).with_measure(self._device_race)
 
     # -- prior-art / Harvest (search before authoring) -----------------------
 
@@ -849,6 +874,23 @@ class InventEngine:
 
             kernel_ms = _device_timed_ms(_run_kernel, device)
             baseline_ms = _device_timed_ms(_run_baseline, device)
+            # PROFILE-GUIDED bottleneck: if a real neuron-profile is wired, profile
+            # the kernel and fold the profiled dominant-engine reason into the
+            # analytic bottleneck string. classify_bottleneck (perf loop) greps
+            # this reason for dma/single-engine/spill keywords BEFORE the analytic
+            # fallback, so a measured "DMA 71% busy" overrides a wrong analytic
+            # guess. Fail-open: no profiler / a profile failure leaves the analytic
+            # signal untouched (profile_reason stays "").
+            profile_reason = ""
+            if self.profiler is not None:
+                try:
+                    import neuron_profile  # noqa: PLC0415 — optional, self-contained
+                    _rep = neuron_profile.profile_kernel(
+                        _run_kernel, device, profiler=self.profiler)
+                    if _rep is not None and _rep.measured:
+                        profile_reason = _rep.reason
+                except Exception:  # noqa: BLE001 — profiling is advisory; never break the race
+                    profile_reason = ""
             speedup = _fair_speedup(kernel_ms, baseline_ms,
                                     "wallclock@device", "wallclock@device")
             if speedup is None:
@@ -872,9 +914,12 @@ class InventEngine:
                 sol, profit_verdict = _prof.sol, _prof.verdict
             except Exception:  # noqa: BLE001 — %SOL is advisory; never break the race
                 pass
+            reason = f"correct={correct} speedup={speedup:.3f}x [{oracle_note}]"
+            if profile_reason:
+                reason += f" | profile: {profile_reason}"
             return RaceResult(True, correct, corr_pct, speedup,
                               kernel_ms, baseline_ms,
-                              reason=f"correct={correct} speedup={speedup:.3f}x [{oracle_note}]",
+                              reason=reason,
                               sol=sol, profit_verdict=profit_verdict, **_perf)
         except Exception as e:  # noqa: BLE001 — device errors are data
             return RaceResult(True, False, 0.0, 0.0,
@@ -1382,8 +1427,23 @@ class InventEngine:
     def run(self, specs: list[OpSpec],
             race_fn: RaceFn | None = None,
             select_targets_first: bool = False,
-            max_targets: int | None = None) -> list[InventResult]:
+            max_targets: int | None = None,
+            fuse_first: bool = False,
+            max_fusion_targets: int | None = None) -> list[InventResult]:
         """Author each spec (via ``run_op``) and write the summary.
+
+        ``fuse_first`` turns on CROSS-OP FUSION (``fusion.select_fusion_targets``):
+        before per-op authoring, adjacent fusable ops (a pre-norm feeding an
+        attention, a router feeding an expert GEMM, ...) are detected over the
+        EXECUTION-ORDERED ``specs`` and materialized as fused megakernel
+        ``OpSpec``s, which are PREPENDED to the author list (highest-worth first,
+        optionally capped by ``max_fusion_targets``). Each megakernel's reference
+        is the exact sequential composition of its members, so the correctness
+        gate validates it against real ground truth — fusion changes what we
+        author, never what we trust. The per-op specs are still authored after
+        (fusion is additive), and the opportunity sweep below still applies to the
+        combined list. Default False = no fusion (unchanged). Never raises out of
+        detection — a failure just skips fusion.
 
         ``select_targets_first`` turns on the autonomous OPPORTUNITY SWEEP
         (``opportunity.select_targets``): before authoring, the op list is
@@ -1394,6 +1454,16 @@ class InventEngine:
         ``max_targets`` caps how many are authored (single-chip budget). Default
         False = author every spec (unchanged). Never raises out of the sweep — a
         sweep failure falls back to authoring all specs."""
+        # CROSS-OP FUSION: prepend fused megakernel targets for adjacent fusable
+        # ops. Additive — the per-op specs are still authored after.
+        if fuse_first and specs:
+            try:
+                from fusion import select_fusion_targets
+                fused = select_fusion_targets(specs, max_targets=max_fusion_targets)
+                if fused:
+                    specs = fused + list(specs)
+            except Exception:  # noqa: BLE001 — a fusion failure must not stop authoring
+                pass
         skipped: list[InventResult] = []
         if select_targets_first and specs:
             try:
