@@ -34,15 +34,37 @@ from typing import Any, Callable
 # Op families where a hand/LLM-authored NKI kernel can beat the compiler (it is
 # weak / cannot lower / OOMs) — from nki_knowledge.classify_op labels. Everything
 # else the compiler already does at/near speed-of-light (measured on-device).
-_COMPILER_WEAK_FAMILIES = frozenset({"attention", "scan"})
+#
+# ATTENTION IS DELIBERATELY NOT HERE (2026-08-28 calibration). On-device
+# measurement (single trn2 core, hd=128, bf16, fresh-input steady-state) found the
+# COMPILER'S dense attention BEATS/ties the harvested flash kernel across S=8k-32k
+# and does not OOM through 65k — single-head attention is compiler-STRONG, not
+# weak. So attention is ranked by the ACTUAL score-matrix pressure (see
+# ``_attention_opportunity``) and, authoritatively, by MEASURED %SOL — never a
+# blanket "attention → author it" assumption. ``scan`` (linear-attention / SSM /
+# GatedDeltaNet) STAYS: its sequential recurrence genuinely can't be parallelized
+# by the compiler (validated separately).
+_COMPILER_WEAK_FAMILIES = frozenset({"scan"})
 # A default analytic opportunity score per family (0..1, higher = more worth
-# authoring). Attention/scan high; standard families low. Tunable.
+# authoring). scan high; standard families low; attention handled specially by
+# ``_attention_opportunity`` (shape-aware), so its entry here is only the
+# unknown-shape fallback.
 _FAMILY_OPPORTUNITY = {
-    "attention": 0.90, "scan": 0.90, "moe_router": 0.55,
+    "attention": 0.40, "scan": 0.90, "moe_router": 0.55,
     "softmax": 0.35, "reduction": 0.30, "normalization": 0.25,
     "matmul": 0.15, "elementwise": 0.15,
 }
 _DEFAULT_ANALYTIC = 0.20  # unknown family -> mild, low-priority opportunity
+
+# Attention score-matrix pressure thresholds, in TOTAL score elements (B*H*S*S) —
+# the quantity that decides whether the compiler's dense [S,S] materialization
+# stays cheap (it WINS) or grows costly (flash's regime). Calibrated to the
+# on-device crossover: single-head S=8k (6.7e7 elems) -> compiler 1.45x faster;
+# S=32k (1.07e9) -> ~tie. So below ~2.5e8 the compiler clearly wins (low
+# opportunity), above ~1e9 the score work is large enough that a streaming flash
+# kernel has real headroom (higher opportunity), with a marginal band between.
+_ATTN_ELEMS_LOW = 2.5e8
+_ATTN_ELEMS_HIGH = 1.0e9
 
 
 @dataclass(frozen=True)
@@ -67,10 +89,96 @@ def _op_family(spec: Any) -> str:
         return ""
 
 
+import re as _re
+
+# Tokens the attention specs encode in shape_class: b<batch> h<heads> s<seq>
+# hd<head_dim> (e.g. "mha-b8-h32-s2048-hd128", "flash-s2048-hd128"). Parsed to get
+# the REAL shape WITHOUT allocating inputs (a batched spec's real_inputs is
+# multi-GB — reading its shape by materializing it is a non-starter).
+_SHAPE_TOKEN = {"b": _re.compile(r"(?:^|[^a-z])b(\d+)"),
+                "h": _re.compile(r"(?:^|[^a-z])h(\d+)"),
+                "s": _re.compile(r"(?:^|[^a-z])s(\d+)"),
+                "hd": _re.compile(r"hd(\d+)")}
+
+
+def _attention_score_elems(spec: Any) -> float:
+    """Estimate an attention op's TOTAL score-matrix elements (B*H*S*S) — the
+    quantity the compiler must materialize for dense attention (small => compiler
+    wins; large => flash's regime). Returns 0.0 when it can't infer (caller uses
+    the moderate default). Never raises. Never allocates.
+
+    Prefers parsing ``shape_class`` (the specs encode ``b/h/s/hd`` there), so a
+    batched spec whose real inputs are multi-GB is read cheaply. Falls back to the
+    (small) ``offline_inputs`` array shapes when the shape_class carries no tokens:
+    S is the largest dim, d the smallest dim >= 8, and B*H = total_q / (S*d)."""
+    sc = (getattr(spec, "shape_class", "") or "").lower()
+    m_s = _SHAPE_TOKEN["s"].search(sc)
+    m_hd = _SHAPE_TOKEN["hd"].search(sc)
+    if m_s and m_hd:
+        S = float(m_s.group(1))
+        mb, mh = _SHAPE_TOKEN["b"].search(sc), _SHAPE_TOKEN["h"].search(sc)
+        B = float(mb.group(1)) if mb else 1.0
+        H = float(mh.group(1)) if mh else 1.0
+        return B * H * S * S
+    # Fallback: infer from the SMALL offline inputs (never real_inputs — may be
+    # multi-GB). This is a lower-bound proxy but avoids a huge allocation.
+    try:
+        import numpy as np  # noqa: PLC0415
+        inp = spec.offline_inputs()
+        if not isinstance(inp, dict) or not inp:
+            return 0.0
+        named = {k: np.asarray(v) for k, v in inp.items()}
+        qkv = [a for k, a in named.items()
+               if k.lower() in ("q", "k", "v", "query", "key", "value")] \
+            or list(named.values())
+        qkv = [a for a in qkv if getattr(a, "ndim", 0) >= 2]
+        if not qkv:
+            return 0.0
+        dims = [d for a in qkv for d in a.shape]
+        S = float(max(dims))
+        d = float(min(x for x in dims if x >= 8) if any(x >= 8 for x in dims)
+                  else min(dims))
+        n_mats = max(1.0, round(float(qkv[0].size) / (S * d)))
+        return n_mats * S * S
+    except Exception:  # noqa: BLE001 — inference is best-effort
+        return 0.0
+
+
+def _attention_opportunity(spec: Any) -> OpTarget:
+    """Shape-aware attention verdict (2026-08-28 calibration). Ranks by the
+    materialized score-matrix pressure instead of a blanket assumption: small
+    scores -> compiler wins (low opportunity, measured); large scores (long S,
+    batched-multi-head) -> a streaming flash kernel has headroom. MEASURED %SOL
+    still overrides this in ``rank_targets`` when a device race is available."""
+    elems = _attention_score_elems(spec)
+    op = getattr(spec, "name", "?")
+    if elems <= 0.0:
+        # Couldn't infer shape — moderate "measure it" prior, not worth-authoring
+        # on the analytic signal alone.
+        return OpTarget(op, _FAMILY_OPPORTUNITY["attention"], False, "analytic",
+                        "attention (shape unknown) — measure %SOL before authoring; "
+                        "single-head dense attention is compiler-strong on trn2")
+    if elems < _ATTN_ELEMS_LOW:
+        return OpTarget(op, 0.15, False, "analytic",
+                        f"attention scores ~{elems:.2e} elems (< {_ATTN_ELEMS_LOW:.0e}) "
+                        "— compiler's dense attention wins here (measured); skip")
+    if elems >= _ATTN_ELEMS_HIGH:
+        return OpTarget(op, 0.70, True, "analytic",
+                        f"attention scores ~{elems:.2e} elems (>= {_ATTN_ELEMS_HIGH:.0e}) "
+                        "— large score matrix (long-context / batched-multi-head); a "
+                        "streaming flash kernel has real headroom")
+    return OpTarget(op, 0.40, False, "analytic",
+                    f"attention scores ~{elems:.2e} elems — marginal; measure %SOL")
+
+
 def analytic_opportunity(spec: Any) -> OpTarget:
-    """Device-FREE opportunity verdict from the op family alone — no compile.
-    Used to pre-rank a model's ops before spending any device time."""
+    """Device-FREE opportunity verdict from the op family — no compile. Used to
+    pre-rank a model's ops before spending any device time. Attention is
+    shape-aware (``_attention_opportunity``); other families use the flat
+    per-family prior."""
     fam = _op_family(spec)
+    if fam == "attention":
+        return _attention_opportunity(spec)
     score = _FAMILY_OPPORTUNITY.get(fam, _DEFAULT_ANALYTIC)
     weak = fam in _COMPILER_WEAK_FAMILIES
     return OpTarget(

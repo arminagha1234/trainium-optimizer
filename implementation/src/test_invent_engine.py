@@ -1088,9 +1088,12 @@ def test_run_select_targets_prunes_standard_ops(tmp_path):
     by = {r.op: r.status for r in res}
     assert by["rmsnorm"] == "skipped_near_sol"
     assert by["gelu_tanh"] == "skipped_near_sol"
-    # compiler-weak ops were selected for authoring (not skipped)
+    # scan (GDN) is compiler-weak -> selected for authoring
     assert by["gated_delta_rule"] != "skipped_near_sol"
-    assert by["flash_attention"] != "skipped_near_sol"
+    # SINGLE-HEAD flash attention at S=512 is now correctly SKIPPED (2026-08-28
+    # calibration: single-head dense attention is compiler-strong; only large
+    # B*H*S*S — long-context / batched-multi-head — is worth authoring).
+    assert by["flash_attention"] == "skipped_near_sol"
 
 
 def test_run_default_authors_all(tmp_path):
