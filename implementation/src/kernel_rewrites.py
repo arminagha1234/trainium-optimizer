@@ -292,6 +292,172 @@ REWRITES: tuple[Rewrite, ...] = (
         confidence="high",
         evidence="invent_kernels.static_lint rule 4 (CLAUDE.md DMA rule).",
     ),
+    # --- HARVESTED from AWShtokoyo/vllm-neuron contributed models (Apache-2.0,
+    # Copyright Amazon.com; harvested 2026-08-28, see docs/vllm-neuron-harvest.md).
+    # These are real, model-team-captured Neuron failures + their fixes across
+    # GLM-5.2 / Qwen3.6-GDN / Gemma-4 / Ministral3. confidence="medium": grounded
+    # in that repo's on-device work but NOT yet re-verified in OUR loop — the
+    # repair loop still re-compiles to confirm. ------------------------------
+    Rewrite(
+        name="repeat-interleave-to-broadcast",
+        summary="Replace torch.repeat_interleave (indirect DGE, OOBMode.ERROR) "
+                "with an index-FREE unsqueeze/expand/reshape broadcast.",
+        error_signatures=("repeat_interleave", "OOBMode.ERROR", "indirect DGE",
+                          "OOB indirect"),
+        hostile_ops=("aten::repeat_interleave", "repeat_interleave"),
+        fix=(
+            "# repeat_interleave lowers to an INDIRECT DMA (gather) that faults\n"
+            "# OOBMode.ERROR on Neuron. For the common GQA k/v head expansion the\n"
+            "# repeat is STRUCTURED — do it index-free (bit-identical, no gather):\n"
+            "# was: k = k.repeat_interleave(n_rep, dim=1)   # [B,Hkv,...] -> [B,Hq,...]\n"
+            "k = k[:, :, None, :, :].expand(B, Hkv, n_rep, S, D).reshape(B, Hkv*n_rep, S, D)\n"
+            "# LAW (harvested): rewrite an index op to a broadcast/reshape, NEVER a\n"
+            "# value clamp — the clamp hides the OOB, the reshape removes it."
+        ),
+        applies_at="model-graph",
+        confidence="medium",
+        evidence="AWShtokoyo/vllm-neuron add-qwen36-moe: repeat_interleave -> "
+                 "OOBMode.ERROR indirect DGE; index-free expand/reshape fix.",
+    ),
+    Rewrite(
+        name="gelu-tanh-inline",
+        summary="Inline F.gelu(approximate='tanh') as the explicit fp32 tanh "
+                "polynomial (Dynamo marks the fused gelu 'skipped').",
+        error_signatures=("function marked as skipped", "approximate", "gelu"),
+        hostile_ops=("aten::gelu", "F.gelu"),
+        fix=(
+            "# torch.compile/Dynamo refuses F.gelu(approximate='tanh') ('function\n"
+            "# marked as skipped'). Inline the tanh-approx GELU in fp32:\n"
+            "g = 0.5 * x * (1.0 + torch.tanh(0.7978845608 * (x + 0.044715 * x*x*x)))\n"
+            "# (0.7978845608 = sqrt(2/pi)). Compute in fp32, downcast the result."
+        ),
+        applies_at="model-graph",
+        confidence="medium",
+        evidence="AWShtokoyo/vllm-neuron add-gemma-4: GeGLU F.gelu(tanh) Dynamo skip.",
+    ),
+    Rewrite(
+        name="argsort-to-argmax-mask",
+        summary="Replace an unlowerable argsort/topk-sort with a sort-free "
+                "iterative argmax-on-equality-mask (N/8 passes).",
+        error_signatures=("argsort", "sort is not", "unlowerable sort",
+                          "aten::argsort"),
+        hostile_ops=("aten::argsort", "aten::sort", "argsort"),
+        fix=(
+            "# argsort/sort do not lower on Neuron. Rank via iterative argmax with\n"
+            "# an equality mask (as GLM-5.2 _torch_argsort_unstable does), or for a\n"
+            "# MoE router use a sort-free rotational/cascaded topk. Complements the\n"
+            "# existing topk-sort-to-argmax router rewrite for the general argsort."
+        ),
+        applies_at="model-graph",
+        confidence="medium",
+        evidence="AWShtokoyo/vllm-neuron add-glm-5-2 functional/argsort_unstable.py "
+                 "+ functional/{topk,moe/router}.py sort-free ranking.",
+    ),
+    Rewrite(
+        name="moe-dge-16-alignment",
+        summary="Pad the MoE token count to a multiple of 16 before the "
+                "affinity-mask indirect DMA (swDGE over-reads to the next mult-16).",
+        error_signatures=("DGE out-of-bound", "swdge", "GpSimd", "out-of-bound",
+                          "nrta-1006"),
+        hostile_ops=("grouped_mm", "moe_tkg", "index_add_"),
+        fix=(
+            "# The MoE token-generation affinity-mask indirect DMA (moe_tkg) aborts\n"
+            "# DGE-out-of-bound when T % 16 != 0 (the GpSimd swDGE over-reads to the\n"
+            "# next multiple of 16). Pad T up to a multiple of 16, route the pad\n"
+            "# rows to expert 0 with ZERO affinity, run, then slice the pad off:\n"
+            "Tp = ((T + 15) // 16) * 16                       # _DGE_ALIGNMENT=16\n"
+            "# pad rows -> expert 0, affinity 0; out = moe(...)[:T]\n"
+            "# (At MTP verify shape T=bs*(1+gamma), gamma=1: fall back to a kernel-\n"
+            "#  free bf16 einsum decode path instead — the indirect DMA over-reads.)"
+        ),
+        applies_at="model-graph",
+        confidence="medium",
+        evidence="AWShtokoyo/vllm-neuron add-glm-5-2: moe_tkg _DGE_ALIGNMENT=16 pad; "
+                 "MTP gamma=1 _forward_decode_einsum fallback.",
+    ),
+    Rewrite(
+        name="moe-padding-token-dispatch-oob",
+        summary="Mask right-padding tokens out of MoE expert dispatch (they "
+                "over-run the dispatch buffer, nrta-1006).",
+        error_signatures=("nrta-1006", "dispatch", "expert_mask", "over-run"),
+        hostile_ops=("grouped_mm", "one_hot", "index_add_"),
+        fix=(
+            "# MoE prefill right-pads the batch; ~all pad tokens route to real\n"
+            "# experts and over-run the dispatch buffer. Mask them BEFORE the\n"
+            "# expert_mask and clamp the scatter index:\n"
+            "padding_mask = idx <= positions.argmax()         # pad tokens = False\n"
+            "expert_mask = expert_mask & padding_mask[..., None]\n"
+            "token_position_to_id = token_position_to_id.clamp(min=-1, max=T-1)"
+        ),
+        applies_at="model-graph",
+        confidence="medium",
+        evidence="AWShtokoyo/vllm-neuron add-qwen36-moe: prefill padding-token "
+                 "dispatch OOB; padding_mask + clamp fix. moe_cte skip_weight=True.",
+    ),
+    Rewrite(
+        name="fp8-promotion-to-bf16-cast",
+        summary="Insert an explicit .to(bf16) where an fp8 tensor meets a "
+                "promotion op (residual add) — 'Float8 promotion not supported'.",
+        error_signatures=("Float8 promotion not supported", "XLAFloat8_e4m3",
+                          "Float8 promotion", "e4m3"),
+        hostile_ops=("aten::add", "aten::view"),
+        fix=(
+            "# Neuron has no implicit fp8 promotion. Where an fp8 tensor feeds a\n"
+            "# promotion op (e.g. the residual add), cast explicitly (fp8->bf16 is a\n"
+            "# runtime no-op on the values):\n"
+            "h = h_fp8.to(torch.bfloat16) + residual\n"
+            "# After a dtype .view to fp8, add .contiguous() to materialize it\n"
+            "# ('Expected XLA tensor ... Got XLAFloat8_e4m3')."
+        ),
+        applies_at="model-graph",
+        confidence="medium",
+        evidence="AWShtokoyo/vllm-neuron Ministral3 (Devstral-2) static-FP8 path.",
+    ),
+    Rewrite(
+        name="inplace-scatter-stale-read",
+        summary="Gather prior KV/state BEFORE scattering the new step; write the "
+                "cache AFTER attending (in-place scatter+gather of one tensor "
+                "reads stale values -> period-2 decode oscillation).",
+        error_signatures=("stale", "period-2", "oscillat", "decode diverges",
+                          "in-place scatter"),
+        hostile_ops=("aten::scatter_", "aten::index_copy_", "slice_scatter"),
+        fix=(
+            "# Scattering the new token into a cache and then gathering the SAME\n"
+            "# tensor in the same step reads pre-write (stale) values -> outputs\n"
+            "# oscillate with period 2 across decode steps. Order it:\n"
+            "prior = gather(cache, slots)      # 1. read prior\n"
+            "ctx   = concat(prior, new_kv)     # 2. attend against a LOCAL tensor\n"
+            "out   = attend(q, ctx)\n"
+            "scatter_(cache, slots, new_kv)    # 3. write cache LAST\n"
+            "# Also: anchor compile-folded slot indices into the XLA graph via\n"
+            "# `idx + 0*anchor_scalar`, and bind state as a graph input with an\n"
+            "# in-place copy_ (attribute reassignment demotes it to a CPU constant)."
+        ),
+        applies_at="model-graph",
+        confidence="medium",
+        evidence="AWShtokoyo/vllm-neuron add-qwen36-moe (GDN paged state) + "
+                 "add-glm-5-2 (aliased MLA latent): scatter-before-gather ordering.",
+    ),
+    Rewrite(
+        name="fp8-e4m3-240-saturate",
+        summary="Byte-saturate OCP e4m3 codes >240 onto the trn2 ±240 grid; do "
+                "NOT rescale by 240/448 (that moves every element off the grid).",
+        error_signatures=("e4m3", "448", "240", "inf", "NaN from fp8"),
+        hostile_ops=(),
+        fix=(
+            "# trn2 legacy e4m3 max is 240; OCP e4m3 max is 448. Out-of-range OCP\n"
+            "# codes read back inf -> NaN. SATURATE the byte onto the 240 grid\n"
+            "# (exact for in-range codes), never multiply by 240/448:\n"
+            "#   for byte b: if (b & 0x7F) >= 0x78: b = (b & 0x80) | 0x77\n"
+            "# i.e. clamp magnitude to the largest representable <=240, keep sign.\n"
+            "# Rescaling by 240/448 shifts EVERY value off the fp8 grid (~4 orders\n"
+            "# worse); byte-saturation touches only the handful of oob codes."
+        ),
+        applies_at="nki-kernel",
+        confidence="medium",
+        evidence="AWShtokoyo/vllm-neuron Ministral3 + add-qwen36-moe: e4m3 240-vs-448 "
+                 "range mismatch; byte-saturation fix.",
+    ),
 )
 
 
