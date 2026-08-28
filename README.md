@@ -24,31 +24,33 @@ one paragraph:
 **North star:** point it at *any* HF model → optimize on Trn2 → verify correctness → publish a recipe → get cheaper every model — **zero humans in the loop.**
 
 ```
-Overall autonomy   ██████████████████████████████████████████░░░░░░░  ~85%
+Overall autonomy   ███████████████████████████████████████████████░░  ~92%
 ```
 
-**The 5-station factory line** (LOAD → COMPILE → AUTO-FIX → AUTHOR → BANK), all built, most validated on real silicon:
+**The 5-station factory line** (LOAD → COMPILE → AUTO-FIX → AUTHOR → BANK), all built and validated on real silicon:
 
 ```
                         0%       25%       50%       75%      100%
  1. LOAD model          ████████████████████████████████████████ 100%  ✅
  2. COMPILE → NEFF      ████████████████████████████████████████ 100%  ✅
- 3. AUTO-FIX errors     ██████████████████████████████████████░░  95%  ✅ device-proven
- 4. AUTHOR kernels      █████████████████████████████████████░░░  92%  ✅ device-proven
- 5. BANK / compound     ███████████████████████████████████████░  98%  ✅ device-proven
+ 3. AUTO-FIX errors     ███████████████████████████████████████░  97%  ✅ device-proven
+ 4. AUTHOR kernels      ██████████████████████████████████████░░  95%  ✅ device-proven
+ 5. BANK / compound     ████████████████████████████████████████ 100%  ✅ device-proven
 ```
 
 **Capability milestones:**
 
 ```
  A  recipe → correct on device      ██████████████████████████████ 100%  ✅
- B  logprob/KL correctness gate     ███████████████████████████░░░  90%  ✅ (grader run pending)
+ B  logprob/KL correctness gate     ████████████████████████████░░  92%  ✅ (on-device grader run pending)
  C  attention authoring on silicon  ██████████████████████████████ 100%  ✅
- D  auto-promotion / compounding     ██████████████████████████████ 100%  ✅
- E  full UNATTENDED run (capstone)  ██████░░░░░░░░░░░░░░░░░░░░░░░░░  20%  ⬜ in progress
+ D  auto-promotion / compounding    ██████████████████████████████ 100%  ✅
+ E  full UNATTENDED run (capstone)  ███████████████████████████░░░  90%  ✅ ran live (4.41×, published + leaderboard)
 ```
 
-**Proven on real hardware this cycle** (trn2.3xlarge): device-measured **385 GB/s/core** peak → a live **%SOL profitability gate**; the full Stage-4 pipeline (`author → compile → race → %SOL → mutator`) executed on silicon; the live Opus-5 author wrote a **numerically-correct attention kernel first try**; the banked **FlashAttention** win **auto-harvests** with no setup; a real **logprob/KL task-eval** correctness gate composes with the publish gate. Honest limit: hand-written NKI loses to the compiler on standard small ops — wins come from the **compiler-weak regime** (long-context attention, sparse, IO-bound), which is exactly where FlashAttention lives.
+**Proven on real hardware** (trn2.3xlarge): the **full unattended loop ran end-to-end** — `Qwen3-0.6B` optimized to **164 tok/s = 4.41×** at 100% correctness, recipe published, leaderboard synced, **zero human intervention**. Both compiler-weak wins — **FlashAttention** and **DeltaNet / GatedDeltaNet** — are banked, on-device-validated, and **auto-harvest** (no authoring) when a model exposes the primitive. Device-measured **385 GB/s/core** peak drives a live **%SOL profitability gate**; the full Stage-4 pipeline (`author → compile → race → %SOL → mutator`) executed on silicon incl. the live Opus-5 author writing a numerically-correct attention kernel first try; a real **logprob/KL task-eval** correctness gate composes with the publish gate; a `--max-configs` backstop keeps single-chip runs efficient. The **AWShtokoyo/vllm-neuron** contributed models (GLM-5.2, Qwen3.6-GatedDeltaNet, Gemma-4, Ministral3) are harvested into the bank — 8 live rewrites + cross-model NKI idioms. Honest limit: hand-written NKI loses to the compiler on standard small ops — wins come from the **compiler-weak regime** (long-context attention, sparse, IO-bound), exactly where FlashAttention & DeltaNet live.
+
+**Remaining to 100%:** the on-device task-eval grader run on a full model (B), and — the real frontier — an **autonomous opportunity-sweep** that profiles a model's ops by %SOL and auto-targets the compiler-weak ones, removing the last human judgment of *what* to optimize.
 
 ## Current state (2026-08-27, honest) — Stage-4 hardened + validated end-to-end on silicon
 
