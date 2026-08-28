@@ -89,6 +89,17 @@ PRIMITIVE_TO_KERNEL: dict[str, str] = {
     "flash": "FlashAttention",
     "longcontextattention": "FlashAttention",
     "attentionlongcontext": "FlashAttention",
+    # --- harvested from AWShtokoyo/vllm-neuron (docs/vllm-neuron-harvest.md) ---
+    # Routing INTENT for the newly-catalogued arches: these descriptors route to
+    # canonical kernel names whose kernels are not authored yet, so for_primitive
+    # returns None until one exists (the loop then authors). Recorded so a model
+    # exposing the descriptor is a named work-item, not a silent skip.
+    "glmmoedsa": "GlmMoeDsa",              # GLM-5.2 MLA + 256-expert sigmoid MoE (DSA-omitted)
+    "glm5": "GlmMoeDsa",
+    "mlaabsorbed": "MLA",                  # MLA weight-absorbed decode/prefill -> MLA corpus
+    "heteroattention": "FlashAttention",   # Gemma-4 sliding-window + global, head_dim<=512
+    "slidingwindowattention": "FlashAttention",
+    "gemma4attention": "FlashAttention",
 }
 
 
