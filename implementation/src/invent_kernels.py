@@ -546,6 +546,63 @@ def flash_attention_spec(seqlen: int = 2048, d_head: int = 128) -> OpSpec:
               "the dense compiler OOMs")
 
 
+# ---- gated delta rule (GatedDeltaNet / Qwen3.6 linear-attention mixer) ------
+# A COMPILER-WEAK op: a sequential recurrence over the sequence the compiler
+# cannot parallelize well (it either unrolls T-deep and stalls, or diverges via
+# the chunked (I-M)^-1 form). This is exactly the regime where a hand/LLM-authored
+# NKI sequential-scan kernel (nl.sequential_range) can WIN — see the
+# sequential-gdn-not-chunked / sequential-range-for-scan idioms in nki_knowledge,
+# harvested from AWShtokoyo/vllm-neuron add-qwen36-moe. Author-on-demand (not in
+# the built-in catalog); primitive routes to the DeltaNet kernel corpus.
+def _gated_delta_rule_reference(inp: Inputs) -> np.ndarray:
+    """Sequential gated delta rule. q,k [T,dk]; v [T,dv]; g,beta [T].
+    State S[dk,dv]: S_t = g_t*S_{t-1} + beta_t * k_t ⊗ (v_t - k_tᵀ S_{t-1});
+    out_t = q_tᵀ S_t. (g = per-step decay gate in (0,1); beta = learning rate.)"""
+    q, k, v = inp["q"], inp["k"], inp["v"]
+    g, beta = inp["g"], inp["beta"]
+    T, dk = k.shape
+    dv = v.shape[1]
+    S = np.zeros((dk, dv), dtype=np.float64)
+    out = np.zeros((T, dv), dtype=np.float32)
+    for t in range(T):
+        kt = k[t].astype(np.float64)
+        err = v[t].astype(np.float64) - kt @ S            # [dv] prediction error
+        S = g[t] * S + beta[t] * np.outer(kt, err)        # gated delta update
+        out[t] = (q[t].astype(np.float64) @ S).astype(np.float32)
+    return out
+
+
+def _gated_delta_rule_inputs(T: int, dk: int, dv: int, seed: int) -> Inputs:
+    g = _rng(seed)
+
+    def _l2(x):  # unit-L2 per row — GatedDeltaNet normalizes q,k so the delta
+        return (x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-6)).astype(np.float32)
+    # rule stays contractive (bounded state), matching the real mixer.
+    return {
+        "q": _l2(g.standard_normal((T, dk))),
+        "k": _l2(g.standard_normal((T, dk))),
+        "v": g.standard_normal((T, dv)).astype(np.float32),
+        "g": (0.9 + 0.1 * g.random((T,))).astype(np.float32),      # decay [0.9,1.0)
+        "beta": (0.1 + 0.4 * g.random((T,))).astype(np.float32),   # lr [0.1,0.5)
+    }
+
+
+def gated_delta_rule_spec(seqlen: int = 512, dk: int = 128, dv: int = 128) -> OpSpec:
+    """OpSpec for the GatedDeltaNet linear-attention mixer (Qwen3.6 / Qwen3-Next).
+    ``primitive="gated_delta_rule"`` routes to the DeltaNet kernel corpus (harvest
+    if a kernel exists, else author). A genuine compiler-weak WIN candidate."""
+    return OpSpec(
+        "gated_delta_rule", "hybrid-attention-causal-lm",
+        f"gdn-dk{dk}-dv{dv}-s{seqlen}", "bf16",
+        _gated_delta_rule_reference,
+        lambda: _gated_delta_rule_inputs(128, dk, dv, 31),
+        lambda: _gated_delta_rule_inputs(seqlen, dk, dv, 32),
+        baseline="torch-eager sequential gated delta rule", origin="invented",
+        primitive="gated_delta_rule",
+        notes="sequential gated delta rule recurrence; compiler-weak scan — author "
+              "with nl.sequential_range (NOT chunked (I-M)^-1). Author-on-demand.")
+
+
 # ---- bootstrap seeds -------------------------------------------------------
 def _rmsnorm_reference(inp: Inputs) -> np.ndarray:
     x = inp["x"]
