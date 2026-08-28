@@ -212,6 +212,7 @@ def run_one(
     log,
     instance_type: str | None = "trn2.48xlarge",
     cycle: int = 1,
+    max_configs: int | None = None,
     profile_loop: bool = True,
     profile_loop_rounds: int = 3,
     profile_loop_patience: int = 2,
@@ -272,6 +273,7 @@ def run_one(
             backend=backend, bank=bank, guards=Guardrails(), ledger=ledger,
             equivalence=_equivalence_for(effective_backend), sdk_version=sdk_version,
             instance_type=instance_type,   # fills the whole box (DP/CP), not just the TP group
+            max_configs=max_configs,       # hard Stage-1 config backstop (small-box efficiency)
         )
 
         log(f"[{slug}] establishing baseline on {effective_backend}")
@@ -595,6 +597,12 @@ def main() -> None:
     ap.add_argument("--sdk", default="2.28.0")
     ap.add_argument("--instance-type", default="trn2.48xlarge",
                     help="fills the whole instance (DP/CP); '' to disable")
+    ap.add_argument("--max-configs", type=int, default=None,
+                    help="HARD backstop on Stage-1 configs evaluated per model "
+                         "(compute budget, not a quality stop). Unset = uncapped. "
+                         "Set it on a SMALL box (e.g. 12-16 on a 4-core "
+                         "trn2.3xlarge) so the beam doesn't over-explore the "
+                         "refinement tail — each config is a ~2-min NEFF compile.")
     # --- continuous operation: "keep working and working" ---
     ap.add_argument("--cycles", type=int, default=1,
                     help="passes over the model set; 0 = run until stopped")
@@ -733,6 +741,7 @@ def main() -> None:
                 results.append(run_one(
                     slug, specs[slug], a.backend, out_root, bank, a.sdk, log,
                     instance_type=instance_type, cycle=cycle,
+                    max_configs=a.max_configs,
                     profile_loop=a.profile_loop,
                     profile_loop_rounds=a.profile_loop_rounds,
                     profile_loop_patience=a.profile_loop_patience,
