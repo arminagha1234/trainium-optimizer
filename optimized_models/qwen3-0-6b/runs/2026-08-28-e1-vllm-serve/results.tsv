@@ -1,0 +1,27 @@
+commit	stage	origin	layer	source	metric	mfu	correctness	compile_s	status	description
+unknown	baseline				37.257146039751504	-1.0	100.0	0.0	keep	baseline
+unknown	config		config		37.26811198732965	-1.0	100.0	0.0	discard	weights_dtype=fp8
+unknown	config		config		72.23596529744461	-1.0	100.0	0.0	keep	tp_degree=1 [under-util: 25% of 4 cores]
+unknown	config		config		164.2902106371484	-1.0	100.0	0.0	keep	tp_degree=2 [under-util: 50% of 4 cores]
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	tp_degree=8 (metric=0 -> backend produced no throughput)
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	tp_degree=16 (metric=0 -> backend produced no throughput)
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	tp_degree=32 (metric=0 -> backend produced no throughput)
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	tp_degree=64 (metric=0 -> backend produced no throughput)
+unknown	config		config		37.27020912494303	-1.0	100.0	0.0	discard	num_batched_tokens=1024
+unknown	config		config		37.276608927260895	-1.0	100.0	0.0	discard	num_batched_tokens=2048
+unknown	config		config		36.92896338369887	-1.0	100.0	0.0	discard	on_device_sampling=False
+unknown	config		config		37.26611875885907	-1.0	100.0	0.0	discard	async_scheduling=True
+unknown	config		config		37.24902178469461	-1.0	100.0	0.0	discard	speculative=draft
+unknown	config		config		164.25751211896616	-1.0	100.0	0.0	discard	weights_dtype=fp8 [under-util: 50% of 4 cores]
+unknown	config		config		164.6763351331059	-1.0	100.0	0.0	discard	num_batched_tokens=1024 [under-util: 50% of 4 cores]
+unknown	config		config		164.92617329746332	-1.0	100.0	0.0	discard	num_batched_tokens=2048 [under-util: 50% of 4 cores]
+unknown	config		config		156.58007372223653	-1.0	100.0	0.0	discard	on_device_sampling=False [under-util: 50% of 4 cores]
+unknown	config		config		164.25911085816904	-1.0	100.0	0.0	discard	async_scheduling=True [under-util: 50% of 4 cores]
+unknown	config		config		164.26434789113205	-1.0	100.0	0.0	discard	speculative=draft [under-util: 50% of 4 cores]
+unknown	config		config		72.25127482012856	-1.0	100.0	0.0	discard	weights_dtype=fp8 [under-util: 25% of 4 cores]
+unknown	config		config		72.32145723146294	-1.0	100.0	0.0	discard	num_batched_tokens=1024 [under-util: 25% of 4 cores]
+unknown	config		config		72.26508013799923	-1.0	100.0	0.0	discard	num_batched_tokens=2048 [under-util: 25% of 4 cores]
+unknown	config		config		70.1659462178442	-1.0	100.0	0.0	discard	on_device_sampling=False [under-util: 25% of 4 cores]
+unknown	config		config		72.326370005704	-1.0	100.0	0.0	discard	async_scheduling=True [under-util: 25% of 4 cores]
+unknown	config		config		72.22627692163358	-1.0	100.0	0.0	discard	speculative=draft [under-util: 25% of 4 cores]
+unknown	config		config		37.26833491040166	-1.0	100.0	0.0	discard	weights_dtype=fp8

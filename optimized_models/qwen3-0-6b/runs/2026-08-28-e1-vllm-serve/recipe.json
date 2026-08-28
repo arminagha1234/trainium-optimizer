@@ -1,0 +1,22 @@
+{
+  "model_id": "Qwen/Qwen3-0.6B",
+  "backend": "vllm-serve",
+  "baseline_metric": 37.257146039751504,
+  "best_metric": 164.2902106371484,
+  "speedup": 4.41,
+  "metric_label": "tok/s",
+  "config": {
+    "tp_degree": 2,
+    "weights_dtype": "bf16",
+    "backend": "vllm-serve"
+  },
+  "toolchain": {
+    "neuronxcc": "2.27.5334",
+    "vllm": "0.24.0",
+    "instance": "trn2.3xlarge"
+  },
+  "kernels": [],
+  "measurements": {},
+  "verified": "ungraded",
+  "generated_at": "2026-08-28T00:29:35Z"
+}
