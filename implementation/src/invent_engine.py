@@ -1707,6 +1707,22 @@ def _torch_baseline(op: str, inp: dict, device=None):
     if op == "attn_decode":
         q, k, v = t("q"), t("k"), t("v")
         return F.scaled_dot_product_attention(q[None], k[None], v[None])[0]
+    if op == "gated_delta_rule":
+        # Sequential gated delta rule (mirrors _gated_delta_rule_reference). The
+        # torch-eager T-loop is the compiler-weak baseline an NKI sequential-scan
+        # kernel aims to beat (the compiler can't parallelize the recurrence).
+        q, k, v = t("q"), t("k"), t("v")
+        g, beta = t("g"), t("beta")
+        T, dk = k.shape
+        dv = v.shape[1]
+        S = torch.zeros(dk, dv, dtype=torch.float32, device=q.device)
+        outs = []
+        for i in range(T):
+            ki = k[i].float()
+            err = v[i].float() - ki @ S
+            S = g[i].float() * S + beta[i].float() * torch.outer(ki, err)
+            outs.append(q[i].float() @ S)
+        return torch.stack(outs).to(torch.bfloat16)
     if op == "flash_attention":
         # Dense (materialized-scores) attention matching _flash_attention_reference:
         # q,k,v are [d_head, S]; scores = qᵀ@k [S,S] UNSCALED; out = softmax(scores)@vᵀ
