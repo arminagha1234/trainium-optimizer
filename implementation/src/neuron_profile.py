@@ -193,15 +193,73 @@ def _as_fraction(v: Any) -> float:
     return max(0.0, min(1.0, f))
 
 
+# --- neuron-explorer summary-json schema ------------------------------------
+# `neuron-profile` is DEPRECATED -> `neuron-explorer`. Its `view
+# --output-format=summary-json` emits ``{"n_<hash>": {<metrics>}}`` where the
+# per-engine utilization lives in SPECIFIC keys (values are 0..1 fractions
+# despite the ``_percent`` suffix). We map ONLY those keys — a naive flatten
+# would misread e.g. ``tensor_engine_instruction_count=55`` as 5500% util.
+# Captured from a real trn2 run (neuron-explorer 2.32.0, 2026-08-28).
+_EXPLORER_ENGINE_KEYS = {
+    "pe": "tensor_engine_active_time_percent",
+    "act": "scalar_engine_active_time_percent",
+    "pool": "gpsimd_engine_active_time_percent",
+    "dma": "dma_active_time_percent",
+}
+# Extra roofline signals neuron-explorer reports (compute / memory-bandwidth
+# utilization) — surfaced on the report reason when present.
+_EXPLORER_MFU_KEY = "mfu_estimated_percent"
+_EXPLORER_MBU_KEY = "mbu_estimated_percent"
+
+
+def _is_explorer_node(d: Any) -> bool:
+    """True when ``d`` is a neuron-explorer per-node metrics dict."""
+    return isinstance(d, dict) and any(k in d for k in _EXPLORER_ENGINE_KEYS.values())
+
+
+def parse_neuron_explorer_summary(obj: Any) -> dict:
+    """Extract the normalized ``{pe,act,pool,dma: fraction}`` map from a
+    neuron-explorer ``summary-json`` object (``{"n_<id>": {...}}`` or a bare
+    per-node metrics dict). Reads ONLY the known engine-utilization keys, so
+    instruction counts / times never leak in as bogus utilization. Uses the
+    busiest node when several are present. Never raises; ``{}`` on any miss."""
+    try:
+        node = obj
+        if isinstance(obj, dict) and not _is_explorer_node(obj):
+            # {"n_<id>": {...}, ...} — pick the node with the highest DMA+PE busy.
+            nodes = [v for v in obj.values() if _is_explorer_node(v)]
+            if not nodes:
+                return {}
+            node = max(nodes, key=lambda n: (
+                _as_fraction(n.get(_EXPLORER_ENGINE_KEYS["dma"], 0)) +
+                _as_fraction(n.get(_EXPLORER_ENGINE_KEYS["pe"], 0))))
+        if not _is_explorer_node(node):
+            return {}
+        return {eng: _as_fraction(node.get(key, 0.0))
+                for eng, key in _EXPLORER_ENGINE_KEYS.items()
+                if key in node}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def parse_profile_json(obj: Any) -> dict:
-    """Extract a normalized ``{engine: busy_fraction}`` map from a neuron-profile
-    summary object (already JSON-parsed). Tolerant of the several shapes the
-    profiler emits — a flat ``{"PE busy %": 71, ...}``, a nested
+    """Extract a normalized ``{engine: busy_fraction}`` map from a neuron-profile /
+    neuron-explorer summary object (already JSON-parsed). Tolerant of the several
+    shapes the profiler emits — the neuron-explorer ``{"n_<id>": {...}}`` schema
+    (handled first, schema-aware), a flat ``{"PE busy %": 71, ...}``, a nested
     ``{"engines": {"TensorEngine": {"utilization": 0.71}}}``, or a list of
     ``{"name":..., "busy":...}`` records — because the exact schema drifts across
     SDK versions and a strict parse would fail-closed on every bump. Unknown /
     unparseable input -> ``{}`` (which ``summarize`` treats as fail-open). Never
     raises."""
+    # neuron-explorer summary-json takes precedence when recognized (its keys are
+    # specific and a naive flatten would mis-scale its instruction-count fields).
+    if isinstance(obj, dict):
+        if _is_explorer_node(obj) or any(
+                isinstance(v, dict) and _is_explorer_node(v) for v in obj.values()):
+            got = parse_neuron_explorer_summary(obj)
+            if got:
+                return got
     out: dict = {}
 
     def _put(name: str, val: Any) -> None:
@@ -285,3 +343,64 @@ def _looks_normalized(d: Any) -> bool:
     keys = set(d.keys())
     return keys.issubset({"pe", "act", "pool", "dma"}) and bool(
         keys & {"pe", "act", "pool", "dma"})
+
+
+def capture_profiler(neff_path: str, *, core: int = 1,
+                     explorer: str = "neuron-explorer",
+                     workdir: str = "/tmp") -> Callable[[Callable], dict] | None:
+    """Build a real ``profiler(run_fn) -> engine_busy`` backed by the
+    ``neuron-explorer`` capture→view flow (``neuron-profile`` is deprecated).
+
+    Given a compiled ``.neff`` (obtainable from the neuronx-cc compile cache, e.g.
+    ``/var/tmp/neuron-compile-cache/.../model.neff``), the returned profiler runs
+    ``neuron-explorer capture -n <neff> -s <ntff> --io-from=neff`` on ``core`` and
+    ``neuron-explorer view -n <neff> -s <ntff> --output-format=summary-json``, then
+    parses the summary via ``parse_neuron_explorer_summary``. The ``run_fn`` arg is
+    accepted for interface parity but not used (the NEFF is executed by the capture
+    itself). Returns ``None`` (so ``profile_kernel`` fails open) when ``explorer``
+    is not on PATH or ``neff_path`` is missing; the profiler itself returns ``{}``
+    on any capture/view/parse failure. Never raises at build time."""
+    import os
+    import shutil
+    if shutil.which(explorer) is None or not (neff_path and os.path.exists(neff_path)):
+        return None
+
+    import json
+    import subprocess
+
+    def profiler(_run_fn: Callable) -> dict:
+        try:
+            ntff = os.path.join(workdir, "topt_profile.ntff")
+            env = dict(os.environ, NEURON_RT_VISIBLE_CORES=str(core))
+            subprocess.run(
+                [explorer, "capture", "-n", neff_path, "-s", ntff, "--io-from=neff"],
+                check=True, capture_output=True, timeout=180, env=env)
+            view = subprocess.run(
+                [explorer, "view", "-n", neff_path, "-s", ntff,
+                 "--output-format=summary-json"],
+                check=True, capture_output=True, timeout=120, env=env)
+            return json.loads(view.stdout.decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001 — a capture/view/parse failure is "cannot profile"
+            return {}
+
+    return profiler
+
+
+def latest_neff(cache_root: str = "/var/tmp/neuron-compile-cache") -> str | None:
+    """The most-recently-modified ``model.neff`` under the neuronx-cc compile
+    cache (the artifact a just-compiled kernel produced), or ``None`` if none
+    exists. A convenience for wiring ``capture_profiler`` right after a kernel
+    compiles. Never raises."""
+    import os
+    try:
+        best, best_mtime = None, -1.0
+        for root, _dirs, files in os.walk(cache_root):
+            for f in files:
+                if f.endswith(".neff"):
+                    p = os.path.join(root, f)
+                    m = os.path.getmtime(p)
+                    if m > best_mtime:
+                        best, best_mtime = p, m
+        return best
+    except Exception:  # noqa: BLE001
+        return None

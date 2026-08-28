@@ -1110,3 +1110,16 @@ def test_run_max_targets_caps_authored(tmp_path):
     res = eng.run(specs, race_fn=_win_race, select_targets_first=True, max_targets=1)
     authored = [r for r in res if r.status != "skipped_near_sol"]
     assert len(authored) == 1     # only the single highest-opportunity op authored
+
+
+# -- Fix A: environment/import errors DEFER, never bank a false anti-pattern --
+def test_is_environment_error_classifies_imports_and_libs():
+    from invent_engine import _is_environment_error
+    assert _is_environment_error(ModuleNotFoundError("No module named 'torch_neuronx'"))
+    assert _is_environment_error(ImportError("x"))
+    assert _is_environment_error(OSError(
+        "Could not load this library: .../libtorchneuron.so"))
+    assert _is_environment_error(RuntimeError("sh: 1: neuronx-cc: not found"))
+    # a genuine numerical/kernel failure is NOT an environment error
+    assert not _is_environment_error(ValueError("cosine 0.2 below tolerance"))
+    assert not _is_environment_error(RuntimeError("nc_matmul moving free dim 4096 > 512"))

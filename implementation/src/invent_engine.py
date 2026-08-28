@@ -922,6 +922,21 @@ class InventEngine:
                               reason=reason,
                               sol=sol, profit_verdict=profit_verdict, **_perf)
         except Exception as e:  # noqa: BLE001 — device errors are data
+            # ENVIRONMENT vs REAL failure: an import/library-load error (a missing
+            # torch_neuronx / an ABI-mismatched libtorchneuron.so / a missing
+            # neuronx-cc) is a property of THIS BOX, not of the kernel — branding it
+            # correct=False would bank a FALSE anti-pattern that poisons every later
+            # model. Defer (ran=False) so it is recorded honestly as "could not run
+            # here", exactly like the no-device / no-build paths. Only a genuine
+            # on-device failure (the kernel ran and produced wrong/crashing output)
+            # is scored incorrect. Motivating case: the vLLM-inference venv ships
+            # torch-xla 2.11 with no compatible torch_neuronx, so neuronxcc.nki's
+            # torch_xla bridge raises ModuleNotFoundError on EVERY kernel invoke —
+            # which previously banked every kernel as incorrect (a false negative).
+            if _is_environment_error(e):
+                return RaceResult(False, reason=(
+                    f"environment error — on-device race deferred (not scored "
+                    f"incorrect): {e!r}"), **_perf)
             return RaceResult(True, False, 0.0, 0.0,
                               reason=f"device race error: {e!r}", **_perf)
 
@@ -1709,6 +1724,27 @@ def _try_tuple_callable(fn: Callable, args: list):
     except Exception:  # noqa: BLE001
         pass
     return _NO_CALL
+
+
+def _is_environment_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a BOX/ENVIRONMENT failure (a missing/mismatched
+    package or shared library), not a kernel defect.
+
+    Such an error means the race COULD NOT RUN here — it must be DEFERRED, never
+    scored incorrect, or a false anti-pattern is banked against a kernel that is
+    fine on a correctly-provisioned box. Covers ImportError/ModuleNotFoundError
+    (e.g. neuronxcc.nki's torch_xla bridge needs ``torch_neuronx``) and the
+    shared-library load failures they surface as (``libtorchneuron.so`` ABI
+    mismatch -> OSError; ``neuronx-cc: not found`` -> a message we match by text)."""
+    if isinstance(exc, (ImportError, ModuleNotFoundError)):
+        return True
+    text = f"{type(exc).__name__}: {exc!s}".lower()
+    _MARKERS = (
+        "torch_neuronx", "libtorchneuron", "libneuronxla", "no module named",
+        "neuronx-cc: not found", "could not load this library",
+        "cannot open shared object", "undefined symbol",
+    )
+    return any(m in text for m in _MARKERS)
 
 
 def _neuron_device():

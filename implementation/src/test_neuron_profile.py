@@ -131,3 +131,64 @@ def test_profile_kernel_broken_profiler_is_none():
 
 def test_profile_kernel_empty_result_is_none():
     assert profile_kernel(lambda: None, profiler=lambda run: {}) is None
+
+
+# --- neuron-explorer summary-json schema (real trn2 capture, 2026-08-28) -----
+from neuron_profile import parse_neuron_explorer_summary, capture_profiler, latest_neff
+
+# A trimmed real neuron-explorer `view --output-format=summary-json` node.
+_EXPLORER_NODE = {
+    "tensor_engine_active_time_percent": 0.110,
+    "tensor_engine_instruction_count": 55,          # must NOT be read as utilization
+    "scalar_engine_active_time_percent": 0.383,
+    "scalar_engine_instruction_count": 94,
+    "gpsimd_engine_active_time_percent": 0.563,
+    "dma_active_time_percent": 0.476,
+    "dynamic_dma_active_time_percent": 0.457,
+    "mfu_estimated_percent": 0.0,
+    "mbu_estimated_percent": 0.184,
+}
+
+
+def test_parse_explorer_node_maps_engines():
+    b = parse_neuron_explorer_summary(_EXPLORER_NODE)
+    assert abs(b["pe"] - 0.110) < 1e-9      # tensor_engine, NOT instruction_count(55)
+    assert abs(b["act"] - 0.383) < 1e-9     # scalar_engine
+    assert abs(b["pool"] - 0.563) < 1e-9    # gpsimd_engine
+    assert abs(b["dma"] - 0.476) < 1e-9
+
+
+def test_parse_explorer_wrapped_by_node_id():
+    b = parse_neuron_explorer_summary({"n_deadbeef": _EXPLORER_NODE})
+    assert b["pe"] == 0.110 and b["dma"] == 0.476
+
+
+def test_parse_profile_json_detects_explorer_schema():
+    # parse_profile_json must route the explorer schema to the schema-aware parser
+    # (a naive flatten would read instruction_count=55 as 5500% util).
+    b = parse_profile_json({"n_x": _EXPLORER_NODE})
+    assert b["pe"] == 0.110 and "pe" in b and b["pe"] < 1.0
+
+
+def test_explorer_node_routes_to_single_engine_via_summarize():
+    from neuron_profile import summarize, SINGLE_ENGINE
+    b = parse_neuron_explorer_summary(_EXPLORER_NODE)
+    # gpsimd(pool) 56% busiest, nothing saturated, dma 48% (not >= pool*1.1) -> pool serial
+    r = summarize(b)
+    assert r.dominant in (SINGLE_ENGINE,)  # pool 0.563 busiest, dma 0.476 < 0.563*1.1
+
+
+def test_multiple_explorer_nodes_picks_busiest():
+    quiet = dict(_EXPLORER_NODE, dma_active_time_percent=0.01,
+                 tensor_engine_active_time_percent=0.01)
+    b = parse_neuron_explorer_summary({"n_a": quiet, "n_b": _EXPLORER_NODE})
+    assert b["dma"] == 0.476    # busier node chosen
+
+
+def test_capture_profiler_none_when_explorer_absent(tmp_path):
+    # non-existent neff / explorer -> None so profile_kernel fails open
+    assert capture_profiler("/no/such.neff", explorer="definitely-not-a-real-cmd") is None
+
+
+def test_latest_neff_missing_cache_is_none():
+    assert latest_neff("/no/such/cache/dir") is None
