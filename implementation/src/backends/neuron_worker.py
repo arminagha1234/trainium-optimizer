@@ -573,12 +573,30 @@ def main() -> None:
         for _ in range(max(0, a.warmup - 1)):
             o = model(ids); _sync(o.logits)
 
+    # FAIR TIMING: distinct input per timed iteration.
+    #
+    # Re-using one `ids` tensor for every iteration lets the stack serve
+    # iteration k from iteration k-1 (XLA result-caches identical inputs; CSE
+    # can dedup identical loop bodies), which reports a fabricated latency.
+    # `ids` itself must stay deterministic because the equivalence gate compares
+    # its top-1 tokens byte-for-byte against the baseline -- so the timing loop
+    # gets its OWN inputs instead, built here rather than inside the timed
+    # region so tensor construction is never measured. Still deterministic (a
+    # fixed prime stride, not random) so a re-measure reproduces exactly.
+    n_timed = max(1, a.iters)
+    timing_ids = [
+        ((torch.arange(a.batch * a.input_len, device=dev) + (k + 1) * 7919)
+         % vocab_cap).reshape(a.batch, a.input_len)
+        for k in range(n_timed)
+    ]
+    for _t in timing_ids:          # materialize on device before timing starts
+        _sync(_t)
     # Timed iterations, each synced to device completion.
     times = []
     with torch.no_grad():
-        for _ in range(a.iters):
+        for _k in range(a.iters):
             t = time.time()
-            o = model(ids)
+            o = model(timing_ids[_k])
             _sync(o.logits)
             times.append(time.time() - t)
 
@@ -590,6 +608,14 @@ def main() -> None:
 
     # MFU: 2 * params * tok/s / (peak_per_core * tp_cores)
     mfu = 100.0 * (2 * params * tok_s) / (PEAK_TFLOPS_BF16 * 1e12 * a.tp)
+    # Implausibility guard. MFU > 100% is physically impossible, so it means the
+    # timed loop measured dispatch rather than compute (result cache, DCE'd
+    # output, or an un-synced queue). Surface it loudly instead of publishing a
+    # fabricated speedup -- a silent 100x is far more expensive than a failed run.
+    if mfu > 100.0:
+        _log(f"IMPLAUSIBLE: mfu={mfu:.1f}% exceeds the device FLOP ceiling "
+             f"(tok_s={tok_s:.1f}, p50={p50 * 1e3:.4f}ms, params={params:.3g}, tp={a.tp}). "
+             f"Timing is measuring dispatch, not compute -- treat this result as void.")
 
     # HBM: REAL peak from the Neuron runtime (#4). Falls back to an estimate
     # only if the API is unavailable.
