@@ -150,10 +150,13 @@ class Orchestrator:
                          status=Status.FAIL_NO_BASELINE,
                          desc="FAIL_NO_BASELINE: baseline worker produced no "
                               "throughput (crash / 0 tok/s) — run is void")
+            why = (getattr(m, "failure_reason", "") or "").strip()
             raise NoBaselineError(
                 f"FAIL_NO_BASELINE: {spec.model_id} baseline produced no "
                 f"throughput (metric={m.metric}); the worker crashed or "
-                f"returned 0 tok/s, so there is no incumbent to optimize.")
+                f"returned 0 tok/s, so there is no incumbent to optimize."
+                + (f" WORKER: {why}" if why else
+                   " WORKER: no stderr captured (older backend?)."))
 
         # Capture the baseline's top-1 token signature — this IS the correctness
         # reference every later candidate is gated against.
@@ -565,7 +568,11 @@ class Orchestrator:
             self._record(cand, stage, origin, layer, source, metric=0.0,
                          correctness=0.0, compile_s=compile_s,
                          status=Status.DISCARD,
-                         desc=f"{cand.provenance} (metric=0 -> backend produced no throughput)")
+                         desc=(f"{cand.provenance} (metric=0 -> backend produced no "
+                               f"throughput"
+                               + (f": {m.failure_reason}"
+                                  if getattr(m, "failure_reason", "") else "")
+                               + ")"))
             return None
 
         # Equivalence — HARD gate. Compares this config's top-1 tokens against

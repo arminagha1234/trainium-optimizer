@@ -138,6 +138,13 @@ class Measurements:
     # default means no swap was attempted (dense model, or non-borrow candidate).
     # Threaded to the ledger so a reader can tell "kernel ran" from "fell back".
     moe_kernel_swap: str = ""
+    # Why this measurement produced metric == 0.0. Empty when the measurement
+    # succeeded. Purely additive and defaulted, so a backend that never sets it
+    # behaves exactly as before -- but when a worker dies, this is the only place
+    # the reason can survive. Without it every failure (OOM, unsupported arch,
+    # missing dep, import error) collapses to an indistinguishable metric=0.0,
+    # which is what made large-model bring-up undebuggable.
+    failure_reason: str = ""
 
     @property
     def hbm_utilization(self) -> float:
