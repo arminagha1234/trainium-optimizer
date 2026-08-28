@@ -188,3 +188,42 @@ def test_equivalence_threshold_is_stage_aware(orchestrator: Orchestrator):
     # Same measured correctness either way; only the gate differs.
     assert loose.correctness_pct == pytest.approx(90.0)
     assert strict.correctness_pct == pytest.approx(90.0)
+
+
+def _orch_cap(tmp_path, max_configs):
+    return Orchestrator(
+        backend=MockBackend(seed=42), bank=_seed_bank(tmp_path / "bank"),
+        guards=Guardrails(), ledger=Ledger(tmp_path / "run"),
+        equivalence=always_equivalent, sdk_version="2.28.0",
+        max_configs=max_configs)
+
+
+def test_max_configs_backstop_bounds_stage1(tmp_path: Path):
+    """The max_configs compute backstop stops Stage-1 early (fewer configs
+    evaluated) than an uncapped run, while still returning a valid incumbent."""
+    full = _orch_cap(tmp_path / "full", None)
+    full.ledger.init()
+    full.run_stage1_config(SPEC)
+    full_cfgs = [r for r in full.ledger.read()
+                 if r.stage is Stage.CONFIG and not r.description.startswith("pruned:")]
+
+    cap = _orch_cap(tmp_path / "cap", 2)
+    cap.ledger.init()
+    best = cap.run_stage1_config(SPEC)
+    cap_cfgs = [r for r in cap.ledger.read()
+                if r.stage is Stage.CONFIG and not r.description.startswith("pruned:")]
+
+    assert len(full_cfgs) > len(cap_cfgs), (len(full_cfgs), len(cap_cfgs))
+    assert best is not None                      # a valid incumbent is still returned
+    # the cap is a round-level backstop, so it may slightly overshoot the raw
+    # number, but must be far below the full search.
+    assert len(cap_cfgs) <= len(full_cfgs) // 2
+
+
+def test_max_configs_none_is_uncapped(tmp_path: Path):
+    o = _orch_cap(tmp_path / "none", None)
+    o.ledger.init()
+    o.run_stage1_config(SPEC)
+    cfgs = [r for r in o.ledger.read()
+            if r.stage is Stage.CONFIG and not r.description.startswith("pruned:")]
+    assert len(cfgs) > 5     # full search unchanged

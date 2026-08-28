@@ -101,6 +101,14 @@ class Orchestrator:
     # existing budget-less callers and tests are unchanged. Real runs set it
     # (e.g. "trn2.48xlarge") — see overnight.py.
     instance_type: str | None = None
+    # HARD backstop on total configs evaluated in Stage-1 (compute budget, NOT a
+    # search-quality stop). None = uncapped (unchanged default). Set it for a
+    # SMALL box (e.g. a 4-core trn2.3xlarge) where the beam otherwise over-
+    # explores a large refinement tail — each vllm-serve config is a fresh
+    # ~2-min NEFF compile, so 24+ configs on a tiny model is mostly wasted (the
+    # winner is found in the first handful). Fires only AFTER the current round
+    # finishes (never mid-round), so the round holding the big lever still runs.
+    max_configs: int | None = None
 
     # populated during a run
     incumbent: Candidate | None = None
@@ -196,6 +204,11 @@ class Orchestrator:
                 self._update_incumbent(evaluated)
         beam = proposer.select(scored_seed) if scored_seed else [self.incumbent]
 
+        # Total CONFIG candidates evaluated (seed + rounds) — for the optional
+        # max_configs compute backstop. The pure-baseline seed member is not a
+        # compile, so it does not count.
+        n_configs = sum(1 for c in scored_seed if c.provenance != "baseline")
+
         state = StoppingState(guards=self.guards)
         # Don't let the SOFT stopping criteria (no-improvement / marginal) end
         # the search before every config axis has been tried at least once.
@@ -240,6 +253,7 @@ class Orchestrator:
                 if "=" in cand.provenance:          # "axis=value" -> axis seen
                     explored.add(cand.provenance.split("=", 1)[0])
                 evaluated = self._evaluate(cand, spec, Stage.CONFIG)
+                n_configs += 1
                 if evaluated is None:
                     continue
                 scored.append(evaluated)
@@ -250,6 +264,12 @@ class Orchestrator:
 
             state.record(improved=round_improved, gain_pct=round_best_gain)
             beam = proposer.select(beam + scored)
+
+            # HARD compute backstop (round-level, so the round that ran the big
+            # lever completed): stop once the config budget is spent. Unset =
+            # uncapped (unchanged). See Orchestrator.max_configs.
+            if self.max_configs is not None and n_configs >= self.max_configs:
+                break
 
         assert self.incumbent is not None
         return self.incumbent
