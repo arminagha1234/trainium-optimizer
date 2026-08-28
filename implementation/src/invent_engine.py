@@ -1380,8 +1380,44 @@ class InventEngine:
         return self._finish(spec, outcome.kernel, n, race_fn, lessons=lessons)
 
     def run(self, specs: list[OpSpec],
-            race_fn: RaceFn | None = None) -> list[InventResult]:
+            race_fn: RaceFn | None = None,
+            select_targets_first: bool = False,
+            max_targets: int | None = None) -> list[InventResult]:
+        """Author each spec (via ``run_op``) and write the summary.
+
+        ``select_targets_first`` turns on the autonomous OPPORTUNITY SWEEP
+        (``opportunity.select_targets``): before authoring, the op list is
+        ranked and PRUNED to the compiler-weak / far-from-SOL ops actually worth
+        a kernel — the standard ops the compiler already wins are dropped (a
+        skipped ``InventResult`` is recorded for each so the ledger is honest,
+        not silent). Off-device this uses the device-free op-family heuristic;
+        ``max_targets`` caps how many are authored (single-chip budget). Default
+        False = author every spec (unchanged). Never raises out of the sweep — a
+        sweep failure falls back to authoring all specs."""
+        skipped: list[InventResult] = []
+        if select_targets_first and specs:
+            try:
+                from opportunity import select_targets, analytic_opportunity
+                targets = select_targets(specs, max_targets=max_targets)
+                keep_names = {t.op for t in targets}
+                chosen = [s for s in specs if s.name in keep_names]
+                for s in specs:
+                    if s.name not in keep_names:
+                        why = analytic_opportunity(s).reason
+                        self._record(s, Status.DISCARD, 0.0, 0.0,
+                                     f"opportunity-sweep skip: {why}")
+                        skipped.append(InventResult(
+                            s.name, s.shape_class, s.origin, "skipped_near_sol",
+                            OfflineGate(False, False, 0.0,
+                                        reason="not authored: opportunity-sweep"),
+                            RaceResult(False, reason="opportunity-sweep: compiler "
+                                       "already near-SOL / not worth authoring"),
+                            detail=f"opportunity-sweep skip: {why}"))
+                specs = chosen if chosen else specs   # never author nothing on a bad sweep
+            except Exception:  # noqa: BLE001 — a sweep failure must not stop authoring
+                pass
         results = [self.run_op(s, race_fn=race_fn) for s in specs]
+        results = skipped + results
         self._write_summary(results)
         return results
 
@@ -1458,6 +1494,11 @@ class InventEngine:
                     "correct": r.race.correct,
                     "correctness_pct": r.race.correctness_pct,
                     "speedup": r.race.speedup,
+                    # MEASURED %SOL + profitability verdict — persisted so a later
+                    # cycle's opportunity-sweep can rank targets off the real
+                    # device number instead of the analytic heuristic.
+                    "sol": getattr(r.race, "sol", 0.0),
+                    "profit_verdict": getattr(r.race, "profit_verdict", ""),
                     "detail": r.detail,
                 }
                 for r in results
@@ -1943,6 +1984,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--spec", type=Path, default=None,
                     help="optional .py spec file adding new ops (SPECS or op_specs())")
     ap.add_argument("--sdk", default=_SDK, help="neuron SDK version stamp")
+    ap.add_argument("--select-targets", action="store_true",
+                    help="AUTONOMOUS TARGET SELECTION (opportunity-sweep): before "
+                         "authoring, prune the op list to the compiler-weak / "
+                         "far-from-SOL ops actually worth a kernel — skip the "
+                         "standard ops the compiler already wins. Off-device uses "
+                         "the op-family heuristic. Skipped ops are recorded, not "
+                         "silently dropped.")
+    ap.add_argument("--max-targets", type=int, default=None,
+                    help="with --select-targets, cap how many ops to author "
+                         "(single-chip budget); highest-opportunity first.")
     ap.add_argument(
         "--self-test", nargs="?", const="silu_gate", default=None,
         metavar="SEED",
@@ -1989,7 +2040,8 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("no ops resolved (use --ops and/or --spec)")
 
     engine = InventEngine(out_dir=a.out, bank_root=a.bank_root, sdk_version=a.sdk)
-    results = engine.run(specs)
+    results = engine.run(specs, select_targets_first=a.select_targets,
+                         max_targets=a.max_targets)
     _print_report(results, engine.out_dir, nki_available())
     return 0
 
