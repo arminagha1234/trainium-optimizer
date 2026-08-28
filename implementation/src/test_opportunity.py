@@ -52,20 +52,32 @@ def test_single_head_attention_compiler_strong_low_opportunity():
     assert "wins" in t.reason
 
 
-def test_batched_multihead_attention_is_opportunity():
+def test_batched_multihead_attention_ranks_high_but_measure_only():
     from invent_kernels import mha_attention_spec
-    # B=8,H=16,S=2048 -> 8*16*2048^2 ~= 5.4e8... push to clearly-high regime
+    # 8*32*2048^2 = 1.07e9 >= HIGH: ranks high-priority-to-MEASURE but is NOT
+    # auto-worth (on-device: compiler is strong on attention at every size; a flash
+    # win is unproven even batched -> only measured %SOL may select it).
     t = analytic_opportunity(mha_attention_spec(batch=8, heads=32, seqlen=2048,
                                                 d_head=128))
-    # 8*32*2048^2 = 1.07e9 >= HIGH -> worth authoring (flash's regime)
-    assert t.worth_authoring and t.score >= 0.6
-    assert "headroom" in t.reason
+    assert not t.worth_authoring and t.score >= 0.5
+    assert "MEASURE" in t.reason
 
 
-def test_measured_sol_overrides_attention_analytic():
+def test_attention_never_auto_selected_analytically():
+    from invent_kernels import mha_attention_spec, flash_attention_spec
+    # no attention op is authored on the analytic signal alone (any size)
+    specs = [flash_attention_spec(seqlen=8192, d_head=128),
+             mha_attention_spec(batch=8, heads=32, seqlen=2048, d_head=128)]
+    assert select_targets(specs) == []          # measured %SOL is the sole authority
+
+
+def test_measured_low_sol_selects_attention():
     from invent_kernels import mha_attention_spec
     spec = mha_attention_spec(batch=8, heads=32, seqlen=2048, d_head=128)
-    # even a "big" attention op is skipped if MEASURED %SOL says near-SOL
+    # a device race showing the compiler FAR from SOL -> attention IS selected
+    ranked = rank_targets([spec], sol_fn=lambda s: (0.10, "memory_bound"))
+    assert ranked[0].worth_authoring and ranked[0].source == "measured"
+    # ...but near-SOL -> skipped
     ranked = rank_targets([spec], sol_fn=lambda s: (0.92, "compute_bound"))
     assert not ranked[0].worth_authoring and ranked[0].source == "measured"
 
