@@ -1,0 +1,3 @@
+commit	stage	origin	layer	source	metric	mfu	correctness	compile_s	status	description
+record	baseline				11729.1			0.0	keep	baseline (from HISTORY.tsv)
+record	config				156974.1		81.2	0.0	keep	winning stage config — 13.383x (from HISTORY.tsv; full search trace on source box)

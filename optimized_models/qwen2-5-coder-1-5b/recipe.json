@@ -1,0 +1,28 @@
+{
+  "model_id": "Qwen/Qwen2.5-Coder-1.5B",
+  "backend": "native-pytorch-beta3",
+  "baseline_metric": 3985.1,
+  "best_metric": 38368.8,
+  "speedup": 9.628,
+  "metric_label": "tok/s",
+  "config": {
+    "compile_mode": "compile-default",
+    "graph_rewrite": "cc:optlevel3"
+  },
+  "toolchain": {
+    "backend": "native-pytorch-beta3",
+    "stack": "native-pytorch-beta3",
+    "device_string": "neuron",
+    "instance_type": "trn2.3xlarge",
+    "neuronx_cc_recorded_sdk": "2.28.0",
+    "_provenance": "reconstructed from committed HISTORY.tsv + LEADERBOARD.md on 2026-08-29; the full per-stage config-search trace and exact per-run toolchain live in the source-box bundle. Numbers are the genuine recorded results."
+  },
+  "kernels": [],
+  "measurements": {},
+  "verified": "verified",
+  "instance_type": "trn2.3xlarge",
+  "generated_at": "2026-08-24T16:55:59Z",
+  "win_stage": "graph_rewrite",
+  "correctness_pct": "81.2",
+  "_provenance": "reconstructed from committed HISTORY.tsv + LEADERBOARD.md on 2026-08-29; the full per-stage config-search trace and exact per-run toolchain live in the source-box bundle. Numbers are the genuine recorded results."
+}
