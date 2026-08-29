@@ -3,8 +3,16 @@
   "status": "passed-on-device",
   "entry": "adapter:build_kda_forward",
   "path": "KDA/adapter.py",
-  "variants": ["kda", "kimi_delta_attention", "gated_delta_linear_attention", "kda_prefill", "kda_decode"],
-  "tolerances": {"fp32": 1.0e-6},
+  "variants": [
+    "kda",
+    "kimi_delta_attention",
+    "gated_delta_linear_attention",
+    "kda_prefill",
+    "kda_decode"
+  ],
+  "tolerances": {
+    "fp32": 1e-06
+  },
   "backend": "native-pytorch-beta3",
-  "notes": "Kimi Delta Attention (gated delta-rule with PER-CHANNEL log-decay) NKI kernels, vendored verbatim (Apache-2.0, ./LICENSE) from jburtoft/kda-neuron-kernels (HuggingFace build/torch-neuron/): nki_kda.py + nki_kda_chunked_exact.py. Two on-device-validated variants selected via the module attr kda_mode: 'prefill' -> kda_chunk_step_exact (exact per-channel 128-chunk, cross-chunk state carry), 'decode' -> kda_recurrent_fwd_state (token-serial). Per-(batch,head) op; caller loops B*H, does fla-core q/k L2-norm+scale (adapter handles preprocess). Constraints: head_dim==128, chunk==128, prefill seqlen % 128 == 0, fp32 gate path. On-device validated on trn2 (nki 0.6.0): cos 1.0, max_err ~1e-7 (prefill, all gate regimes incl g=2.0) / ~1e-8 (decode); exact state carry. Injected via backends.kernel_inject through adapter:build_kda_forward."
+  "notes": "Kimi Delta Attention (gated delta-rule with PER-CHANNEL log-decay) NKI kernels, vendored verbatim (Apache-2.0, ./LICENSE) from jburtoft/kda-neuron-kernels (HuggingFace build/torch-neuron/): nki_kda.py + nki_kda_chunked_exact.py. Two on-device-validated variants selected via the module attr kda_mode: 'prefill' -> kda_chunk_step_exact (exact per-channel 128-chunk, cross-chunk state carry), 'decode' -> kda_recurrent_fwd_state (token-serial). Per-(batch,head) op; caller loops B*H, does fla-core q/k L2-norm+scale (adapter handles preprocess). Constraints: head_dim==128, chunk==128, prefill seqlen % 128 == 0, fp32 gate path. On-device validated on trn2 (nki 0.6.0): cos 1.0, max_err ~1e-7 (prefill, all gate regimes incl g=2.0) / ~1e-8 (decode); exact state carry. Injected via backends.kernel_inject through adapter:build_kda_forward. PERF (2026-08-28): DEVICE FAST-PATH \u2014 when inputs are torch tensors on a Neuron device, adapter calls the @nki.jit kernel DIRECTLY (do NOT round-trip through host numpy = nki sim/recompile). Decode: ~3.5ms vs ~6410ms numpy (~1834x). Prefill (chunked): ~5.3ms. Both byte-identical (cos 1.0). KDA is scan-family = compiler-weak; this is the per-token serving win for Kimi-Linear / Kimi-K3 (KDA)."
 }
