@@ -39,6 +39,7 @@ from guardrails import Guardrails
 from kernel_registry import KernelRegistry
 from ledger import Ledger, Origin
 from orchestrator import ModelSpec, Orchestrator
+from capability import measured_weight_gb, profile_for as capability_profile_for
 from preflight import (
     arch_signature,
     load_hf_config,
@@ -246,10 +247,23 @@ def run_one(
             # via the kernel path. Registry reads $TRN_OPT_KERNEL_DIR (empty if
             # unset), so with no kernel dir + kernels_wired=False this is
             # byte-for-byte today's behaviour.
+            # CAPABILITY GATE. Reject a model that cannot physically fit on this
+            # box before spending a run on it. Config-only (plus one metadata
+            # call), so the answer costs milliseconds instead of a download, a
+            # load and a device OOM. This is what would have caught
+            # Qwen3.5-122B-A10B, which burned ~12 min of a full trn2.48xlarge to
+            # OOM at 22.5 GB of a 24 GB core.
+            #
+            # profile_for() returns None for an unmodelled instance type, and
+            # preflight_check skips the gate when hardware is None -- so an
+            # unknown box degrades to today's behaviour instead of guessing.
+            _hw = capability_profile_for(instance_type)
+            _wgb = measured_weight_gb(spec.model_id) if _hw is not None else None
             ok, reason = preflight_check(
                 spec, bank=bank, sdk_version=sdk_version,
                 registry=registry, kernels_wired=kernels_wired,
                 rewrites_wired=rewrites_wired,
+                hardware=_hw, weight_gb=_wgb,
             )
             if not ok:
                 _record_preflight_skip(
