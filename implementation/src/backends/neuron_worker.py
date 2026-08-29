@@ -387,6 +387,32 @@ def main() -> None:
             except Exception:  # noqa: BLE001
                 pass
 
+    # EXPERT PARALLELISM -- must run BEFORE the model reaches the device (the
+    # .to(dev) further down), because the whole point is that the full expert set
+    # never gets allocated in HBM. `shard_model` below only shards `L.mlp` when it
+    # has `gate_proj`, i.e. a DENSE mlp; a Qwen3_5MoeSparseMoeBlock has
+    # gate/experts/shared_expert instead and was skipped entirely, so every rank
+    # held all 256 experts:
+    #     Qwen3.5-35B-A3B    64.4 GB/rank of experts (2.7x a 24 GB core)
+    #     Qwen3.5-122B-A10B 231.9 GB/rank            (9.7x)
+    # Both OOM'd at ~22 GB allocated regardless of tp, because tp only divided a
+    # ~0.2 GB dense term. Sharding the experts is what makes tp mean anything for
+    # these models. Exactness is established on CPU in test_moe_ep.py: each expert
+    # contributes to exactly one additive term, so partitioning + all-reduce
+    # reproduces the unsharded mixture.
+    if a.tp > 1:
+        try:
+            try:
+                from backends.moe_ep import shard_moe_experts as _ep_shard
+            except Exception:  # noqa: BLE001
+                from moe_ep import shard_moe_experts as _ep_shard
+            n_ep, gb_freed = _ep_shard(model, dist.get_rank(), a.tp)
+            if n_ep:
+                _log(f"expert parallelism: sharded {n_ep} MoE layer(s) across "
+                     f"tp={a.tp}, freeing ~{gb_freed:.1f} GB/rank")
+        except Exception as _e:  # noqa: BLE001 - never fail a run over this
+            _log(f"expert parallelism skipped: {_e!r}")
+
     if a.tp > 1 and _has_deltanet(model):
         # qwen3.8 hybrid (Gated DeltaNet + attention): manual head-parallel TP,
         # numerically validated exact (16/16 top-1 tokens vs CPU oracle at tp4).
