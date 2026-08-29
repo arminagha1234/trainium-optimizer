@@ -89,6 +89,28 @@ def _is_noise(line: str) -> bool:
     return len(set(t)) <= 2 and t[0] in "=-*_#~+ "
 
 
+def _child_traceback(log_dir: Path) -> str:
+    """Best child-rank stderr from a torchrun --log-dir tree, or ''.
+
+    torchrun reports only ChildFailedError on the parent stream; the rank's real
+    exception is written per-rank under --log-dir. Prefer whichever rank log
+    actually contains a traceback.
+    """
+    try:
+        logs = sorted(log_dir.rglob("stderr.log")) + sorted(log_dir.rglob("*stderr*"))
+    except OSError:
+        return ""
+    best = ""
+    for f in logs:
+        try:
+            txt = f.read_text("utf-8", "replace")
+        except OSError:
+            continue
+        if "Traceback" in txt or "Error" in txt:
+            best = txt[-_ERR_TAIL_CHARS:]
+    return best
+
+
 def _worker_failure_reason(rc: int | None, err_tail: str) -> str:
     """Turn a dead worker into one actionable line, keeping the raw tail.
 
@@ -327,10 +349,22 @@ class NativePyTorchBackend:
         batch = int(cfg.get("batch", batch))   # #1 batch is a searched config axis
         input_len = _shape_input_len(shape)
         out_f = Path(tempfile.gettempdir()) / f"neuron_meas_{os.getpid()}_{time.time_ns()}.json"
+        # Per-rank stdout/stderr land here so a child traceback survives even if
+        # the captured tail is truncated. Cheap: a few small text files per run.
+        _rank_log_dir = Path(tempfile.mkdtemp(prefix="neuron_ranklogs_"))
 
         cmd = [
             "torchrun", "--nnodes", "1", "--nproc_per_node", str(tp),
             "--rdzv_backend", "c10d", "--rdzv_endpoint", "localhost:0",
+            # Without these, torchrun DISCARDS the child traceback: a dead rank
+            # surfaces only as ChildFailedError with "error_file: <N/A>" and
+            # "traceback : To enable traceback see: ...", so the actual exception
+            # (OOM, unsupported arch, collective failure) is never recorded
+            # anywhere. --tee=3 mirrors both rank streams onto the parent's
+            # stderr, which measure() already captures, and --log-dir keeps a
+            # per-rank copy for anything the tail truncates. This is what makes
+            # large-model bring-up debuggable at all.
+            "--tee", "3", "--redirects", "3", "--log-dir", str(_rank_log_dir),
             str(_WORKER),
             "--model", neff.artifact.model_id,
             "--tp", str(tp),
@@ -377,6 +411,11 @@ class NativePyTorchBackend:
             # Worker never wrote its JSON: it died before reporting. This is the
             # case that matters most for new-model bring-up.
             reason = _worker_failure_reason(_rc, _err_tail)
+            # torchrun's own message is a wrapper (ChildFailedError). If a rank
+            # log exists, the child's real traceback is in there -- prefer it.
+            _child = _child_traceback(_rank_log_dir)
+            if _child:
+                reason = _worker_failure_reason(_rc, _child)
             print(f"[measure] worker produced no result (rc={_rc}): {reason}",
                   file=sys.stderr, flush=True)
             return Measurements(metric=0.0, shape=shape, batch=batch,
