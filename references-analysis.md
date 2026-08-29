@@ -478,10 +478,78 @@ read-only. We should adopt that literally.
 
 ---
 
+## 5. NVIDIA Model-Optimizer (ModelOpt)
+
+[github.com/NVIDIA/Model-Optimizer](https://github.com/NVIDIA/Model-Optimizer) —
+a mature model-*compression* library for the GPU/TensorRT-LLM/vLLM/SGLang stack:
+quantization (PTQ/QAT/QAD in FP8, NVFP4, INT4-AWQ, INT8-SmoothQuant), pruning
+(Minitron), NAS (Puzzletron), distillation, sparsity, and speculative decoding
+(Medusa/EAGLE). It's GPU-oriented, so most of its *techniques* don't transfer to
+Trainium — but the one that does is high-value, and its *engineering* is
+hardware-agnostic and worth copying.
+
+### The honest filter: what transfers to trn2, what doesn't
+
+| ModelOpt capability | Transfers to trn2? | Why |
+|---|---|---|
+| **Speculative decoding (Medusa/EAGLE)** | **✅ yes — top steal** | Draft-heads + verify, no special precision. Hits our *measured* bottleneck: bs=1 decode is host-bound (device >99% idle) — no kernel can move it, a decode-algorithm change can. Reference impls (`modelopt.torch.speculative`, `fastgen`) are harvestable. |
+| Quantization (NVFP4 / INT4-AWQ / INT8-SmoothQuant) | ❌ no | GPU/Blackwell compute paths; Trainium is fp-centric (no int8/int4 compute), NVFP4 is Blackwell-only, mxfp4 is trn3-only. See the precision table in `plan.md`. |
+| Quantization (**fp8 PTQ**) | ⚠️ maybe | fp8 is the *only* sub-bf16 format on trn2; steal the **calibration methodology** (per-tensor/channel scale selection from a data sample — the hard, format-agnostic part) *if* fp8 ever beats bf16+`torch.compile`. Unproven; measure first. |
+| Pruning + distillation (Minitron/Puzzletron) | ⚠️ future | Output is a smaller **bf16** model that runs natively — portable in principle, but training-heavy and it *changes the model* (needs an accuracy-retention gate, not equivalence). A future "compress-then-optimize" axis. |
+| QAT/QAD | ❌ low value | Accuracy recovery for aggressive quant we mostly can't do; training-heavy. |
+
+### What we adopt
+
+**The technique — speculative decoding as a new optimization axis (Stage 6).**
+The single portable, high-value technique steal: it attacks the one bottleneck
+kernels can't (host-bound bs=1 decode) and has mature reference code to harvest.
+Sequenced as a candidate axis in `plan.md` after the Milestone A→E closure;
+correctness reuses the `task_eval` logprob/KL gate; add ModelOpt to
+`kernel_sources.yaml` as a spec-decode harvest source.
+
+**The deeper steal — the composable-technique abstraction (higher leverage than
+any one technique).** ModelOpt's core design is that *every* method is one
+composable transform with a config, applied to a model, then a unified `export`
+(`mtq.quantize`, `mtn.prune`, `mtsp.convert`, compose, export). Our stages are
+more hardcoded. Adopting a uniform `OptimizationTechnique.apply(model, cfg) →
+(transformed, lesson)` interface — that config-search, kernel-swap, spec-decode,
+and future fp8 all implement — turns "add a new axis" from loop surgery into
+writing one pluggable module. This is the design lesson that makes the autonomous
+loop *extensible*: spec-decode is the first technique that proves the interface.
+
+**`modelopt_state`-style optimization-state save/restore.** ModelOpt persists the
+full applied-optimization state (which techniques, in what order, with what
+calibration) alongside the checkpoint, so a result is reproducible and resumable.
+Our `recipe.json` saves config; steal the richer "optimization state" to
+strengthen `reproduce.sh` into true replay.
+
+**Calibration-dataset discipline.** ModelOpt tunes decisions from a small data
+sample. Generalized past quant, this is a more rigorous version of our fixed
+probe shapes and the natural substrate for a stronger `task_eval` gate (held-out
+calibration data → better than a single probe).
+
+**Support-matrix reporting (model × technique × hardware).** ModelOpt publishes a
+clear "what works where" matrix; our leaderboard should adopt the same view — it
+dovetails with the per-(model, hardware) publish split the mxfp4 models forced.
+
+### What we deliberately do NOT take
+
+Do **not** port the quantization menu as a headline lever. It is where ModelOpt's
+value concentrates *on GPUs* and where the least of it survives on trn2: fp8 is
+the only candidate and it's unproven against the (already strong) Neuron
+compiler; everything else (NVFP4/INT4/INT8/mxfp4) is off-hardware. Pitching
+"quantization" as a big Trainium win would be inaccurate — the portable win is
+speculative decoding.
+
 ## Consolidated changes (updated)
 
 | Change | Source | Where |
 |--------|--------|-------|
+| **Speculative decoding (Medusa/EAGLE) as Stage-6 decode axis — the portable steal** | ModelOpt | `plan.md` optimization stages |
+| **Uniform composable `OptimizationTechnique` interface (apply→export)** | ModelOpt | `plan.md` / `optimization-stages.md` |
+| **`modelopt_state`-style optimization-state save/restore for replay** | ModelOpt | `reproduce.sh` / `knowledge-bank.md` |
+| **Support-matrix report (model × technique × hardware)** | ModelOpt | `trajectory-reporting.md` / leaderboard |
+| **fp8 PTQ *calibration methodology* (measure-first, not committed)** | ModelOpt | `open-questions.md` |
 | Beam search (size 4), 8 plans/parent, replacing pure greedy | Autocomp | `open-questions.md` Q1 |
 | Plan-then-implement two-phase prompt | Autocomp | `optimization-stages.md` |
 | Optimization menu with dropout; one-shot generation for invention | Autocomp | `optimization-stages.md` |
