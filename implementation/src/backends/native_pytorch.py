@@ -80,15 +80,41 @@ _ERR_SIGNATURES: tuple[tuple[str, str], ...] = (
 )
 
 
+def _is_noise(line: str) -> bool:
+    """Separator banners and rule lines carry no diagnostic information."""
+    t = line.strip()
+    if not t:
+        return True
+    # A line made only of separator punctuation ('====', '----', '****', ...).
+    return len(set(t)) <= 2 and t[0] in "=-*_#~+ "
+
+
 def _worker_failure_reason(rc: int | None, err_tail: str) -> str:
-    """Turn a dead worker into one actionable line, keeping the raw tail."""
+    """Turn a dead worker into one actionable line, keeping the raw tail.
+
+    Picking the *last* non-empty line is wrong in practice: worker tracebacks are
+    wrapped in '=' banners, so the last line is a rule and the real exception is
+    silently dropped. Prefer, in order: the line that matched a known signature,
+    then the last exception-shaped line, then the last line that is not a banner.
+    """
     tail = (err_tail or "").strip()
     if not tail:
         return f"worker exited rc={rc} with no stderr"
-    label = next((lbl for pat, lbl in _ERR_SIGNATURES if pat.lower() in tail.lower()), "")
-    last = [ln for ln in tail.splitlines() if ln.strip()][-1] if tail.splitlines() else ""
+    lines = [ln for ln in tail.splitlines() if not _is_noise(ln)]
+    label, matched = "", ""
+    for pat, lbl in _ERR_SIGNATURES:
+        hit = next((ln for ln in reversed(lines) if pat.lower() in ln.lower()), "")
+        if hit:
+            label, matched = lbl, hit
+            break
+    if not matched:
+        matched = next(
+            (ln for ln in reversed(lines)
+             if any(k in ln for k in ("Error", "Exception", "error:", "Failed", "failed"))),
+            lines[-1] if lines else tail[:200],
+        )
     head = f"{label}: " if label else ""
-    return f"{head}rc={rc}: {last[:400]}"
+    return f"{head}rc={rc}: {matched.strip()[:400]}"
 
 
 class NativePyTorchBackend:
