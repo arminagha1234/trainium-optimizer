@@ -1,6 +1,16 @@
-Here is a list of website to check
-NKI Lib = https://github.com/aws-neuron/nki-library/blob/main/README.md
-torch neuronX repo = https://github.com/aws-neuron/torch-neuronx
-neuron SKills 
-jim kernels = https://huggingface.co/kernels?sort=trending&search=jburt
-jims repo = https://github.com/jimburtoft/NeuronStuff
+Harvest sources ("borrow before invent" — where to find an existing kernel
+before authoring one) now live in a proper, maintained place:
+
+  * Human-readable, categorized (jburtoft kernels, aws-neuron/nki-library,
+    nki-samples, wafer-ai perf resources, Neuron NKI docs, HF kernels hub) with
+    a harvest-priority list:
+        docs/kernel-sources.md
+
+  * Machine-readable (what the framework reads):
+        kernel_sources.yaml
+
+  * Consult it in code / from an agent:
+        from harvest_sources import load_sources, summary   # implementation/src/
+        python implementation/src/harvest_sources.py        # prints the list
+
+This file is kept only as a pointer; edit kernel_sources.yaml (+ docs/kernel-sources.md) to add a source.
