@@ -4,6 +4,82 @@ Phased so we ship visible artifacts early and don't scope-creep the outer
 loop into a research project. Each phase has a concrete deliverable and a
 "why we stop here" checkpoint.
 
+---
+
+## Strategic direction & roadmap — updated 2026-08-28 (now on-device-grounded)
+
+The phased plan below is the build history. This section is the **current
+north star and the calibration behind it**, validated on real trn2 silicon —
+not assumptions.
+
+### Backend strategy: native-PyTorch now → vLLM-native when it's public
+
+- **Native-PyTorch is the PRIMARY substrate.** Examples, published recipes, and
+  the engine's kernel race all run native. It's the *stable* layer, and the
+  optimization (config search + kernel authoring/harvest) is backend-agnostic —
+  a property of the kernel on the NeuronCore, not the serving framework.
+- **Keep exactly ONE canonical vLLM serving example** (optimize on native →
+  serve the recipe under vLLM-Neuron → measure end-to-end). **No native/vLLM
+  example parity** — two full example sets double a surface that already rots.
+- **vLLM-Neuron is XLA-based today and going NATIVE** (~months out; vLLM 0.24 on
+  Neuron already leans `inductor` / `ir_op_priority: native`). **When
+  native-vLLM is public it becomes the unified substrate and the native
+  examples *are* the vLLM path — pivot then.** Leading native now is the
+  lower-regret bet: at the transition the question dissolves.
+- Encode the split as a **`ServeBackend` adapter** — *optimize on native, ACCEPT
+  on vLLM*. `host_path` already routes host-vs-device per backend.
+
+### Targeting principle: author ONLY where the compiler is weak (measured, not assumed)
+
+On-device calibration (trn2, hd=128, fair fresh-input timing, 2026-08-28):
+- **Attention is mostly compiler-STRONG** — single-head dense beats/ties a flash
+  kernel S=8k–65k and doesn't OOM; only **batched-multi-head past the ~24GB
+  HBM/OOM boundary** (`B*H*S*S ≳ 6e9`) is a real flash win. Ranked by *measured
+  %SOL / score-matrix pressure*, never a blanket prior.
+- **Scan / GatedDeltaNet is genuinely compiler-WEAK** — the chunked NKI kernel is
+  **22.75× the naive recurrence**, whose graph is compile-intractable at
+  S=2048. Author/harvest freely here.
+- The opportunity sweep drives target selection off measured %SOL; **skip what
+  the compiler already wins.**
+
+### What we're shooting for (expanded goals)
+
+1. **Cross-agent compounding bank** — the trn2.3xl + trn2.48xl instances share
+   ONE bank so model N+1 measurably reuses model N's kernels (the flywheel, at
+   fleet scale *and* across agents).
+2. **Kernel corpus growth on the compiler-weak frontier** — GLM-5.2 `GlmMoeDsa`,
+   sliding-window / sparse attention, KDA, Mamba-2/3 — plus the validated
+   batched-flash OOM-regime win.
+3. **Serving-path perf hygiene as a first-class gate** — every harvested kernel
+   invoked *device-native*, never via a host/numpy round-trip (the GatedDeltaNet
+   numpy→device fix was ~1000× on the decode hot path). Audit all adapters; add
+   a perf-regression guard.
+4. **Fair device-timing everywhere** — distinct inputs per iteration + consume
+   the output (both agents independently hit and fixed the identical-input
+   result-cache trap). Promote it to a shared test helper.
+5. **Correctness trust to a production bar** — `task_eval` (logprob/KL) on every
+   publish; extend to held-out perplexity / small-MMLU; settle per-family
+   tolerances (open Q6).
+6. **End-to-end at scale on the 48xl** — real multi-node / TP>4 / MoE models
+   through the full optimize→verify→publish loop, unattended, to a *truthful*
+   leaderboard.
+7. **Autonomy** — the author learns from its own bank (few-shot from validated
+   kernels), auto-discovers each new model's compiler-weak ops, self-selects
+   targets.
+8. **Trustworthy public artifacts** — runnable recipes (done: `pip install -e .`
+   + `python -m optimizer.{apply,measure,run}`); single-source-of-truth
+   leaderboard (only list models whose bundle exists, numbers from
+   `recipe.json`); publish safe-by-default (dry-run default, no hardcoded
+   identity).
+9. **Research bet — O(1)-compile batched kernels.** Today loop-vs-grid both
+   scale ~linearly in B*H (a real compiler limitation); crack it by treating the
+   batch as a runtime DMA-descriptor dim without per-head instruction expansion.
+10. **Beyond Track A** — the deferred tracks (diffusion, video, ASR/TTS) once the
+    text flywheel compounds; the per-family adapter seam already keeps the core
+    track-agnostic.
+
+---
+
 ## Phase 0 — Scope-check (1 week)
 
 Agree on the answers in `open-questions.md` before writing code.
