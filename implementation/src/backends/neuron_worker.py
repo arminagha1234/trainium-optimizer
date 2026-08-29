@@ -284,6 +284,33 @@ def _param_count(cfg) -> float:
 
 
 def main() -> None:
+    # transformers fp8 MoE workaround (seen on 5.16.1).
+    #
+    # quantizers/quantizer_finegrained_fp8.py::update_tp_plan does:
+    #     impl = getattr(config, "_experts_implementation", None)
+    #     layer_overrides = FP8Experts._impl_tp_layer_overrides.get(impl)
+    #     ... {k: layer_overrides.get(v, v) for k, v in base_plan.items()}
+    # `_experts_implementation` is unset on fp8 checkpoints, so the lookup returns
+    # None and the comprehension raises AttributeError. It is reached through
+    # `base_model_ep_plan`, which MoE models carry and dense ones do not -- which
+    # is why every fp8 MoE died here (DeepSeek-V4-Flash) while dense fp8 loaded.
+    #
+    # Setting config._experts_implementation does NOT help: from_pretrained
+    # re-reads the config from the model id, so the instance we touched is not the
+    # one used. Make the LOOKUP total instead -- map None to {} so the plan
+    # rewrite becomes the identity.
+    #
+    # Deliberately not forcing the only registered impl ('deepgemm_megamoe'):
+    # that is a CUDA MegaMoE path and selecting it on Neuron would trade this
+    # crash for a worse one.
+    try:
+        from transformers.integrations.finegrained_fp8 import FP8Experts as _FP8E
+        if None not in _FP8E._impl_tp_layer_overrides:
+            _FP8E._impl_tp_layer_overrides[None] = {}
+            _log("fp8 workaround: _impl_tp_layer_overrides[None] = {} "
+                 "(transformers update_tp_plan guard)")
+    except Exception as _e:  # noqa: BLE001 - absent/renamed upstream: nothing to guard
+        _log(f"fp8 workaround skipped: {_e!r}")
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--tp", type=int, default=1)
