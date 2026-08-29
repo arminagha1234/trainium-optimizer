@@ -144,3 +144,18 @@ def test_empty_and_nothing_worthwhile():
     assert select_targets([]) == []
     # a model of only standard ops -> nothing worth authoring (compiler wins all)
     assert select_targets([_Spec("rmsnorm"), _Spec("gelu_tanh")]) == []
+
+
+# --- borrow-before-invent wire (harvest sources surfaced at authoring time) ---
+def test_select_targets_appends_borrow_hint():
+    from invent_kernels import gated_delta_rule_spec
+    targets = select_targets([gated_delta_rule_spec(64, 128, 128)])   # scan -> worth
+    assert targets and "borrow-check" in targets[0].reason
+    assert "docs/kernel-sources.md" in targets[0].reason
+
+
+def test_harvest_hint_returns_sources():
+    from opportunity import harvest_hint
+    srcs = harvest_hint()
+    assert isinstance(srcs, list) and srcs                     # non-empty
+    assert any("jburtoft" in (s.get("url", "")) for s in srcs)  # the kernel goldmine
