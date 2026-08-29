@@ -70,6 +70,15 @@ _SERIALIZE_MIN = 0.30
 # margin over the busiest compute engine (a clear data-movement bind, not a tie).
 _DMA_MARGIN = 1.10
 
+# --- NKI Performance Guide threshold bars (docs/nki-perf-guide.md) ------------
+# The guide's "good" targets, used to turn a raw metric into a pass/fail symptom
+# token the perf loop / perf_hints route on. A metric BELOW its bar is a symptom.
+MFU_GOOD = 0.90          # matmul-dominated compute-bound kernel: MFU >= 90% is good
+MBU_GOOD = 0.60          # memory-bound kernel: MBU >= 60% is good
+COMPUTE_GOOD = 0.90      # compute-bound: busiest engine active >= 90% is good
+SPILL_INVESTIGATE = 0.30 # spill traffic > 30% of SBUF<->device traffic -> investigate
+DMA_IDEAL_KIB = 32.0     # a DMA transfer smaller than this is packet-rate bound
+
 
 @dataclass(frozen=True)
 class ProfileReport:
@@ -82,12 +91,22 @@ class ProfileReport:
     ``kernel_perf``. ``reason`` is the human, keyword-bearing string the perf
     loop's ``classify_bottleneck`` greps (so the analytic fallback is bypassed in
     favour of this real measurement). ``device_us`` is the profiled device
-    latency in microseconds (0.0 if the profiler did not report one)."""
+    latency in microseconds (0.0 if the profiler did not report one).
+
+    ``mfu`` / ``mbu`` are the model-FLOPs / memory-bandwidth utilization fractions
+    the profiler reports (-1.0 = not reported). ``spill_ratio`` is spill traffic
+    as a fraction of SBUF<->device traffic (-1.0 = unknown). ``dma_transfer_kib``
+    is the average DMA transfer size in KiB (-1.0 = unknown). These are the NKI
+    Performance Guide signals ``perf_symptoms`` turns into routing tokens."""
 
     engine_busy: dict = field(default_factory=dict)
     dominant: str = MEMORY_BOUND
     reason: str = ""
     device_us: float = 0.0
+    mfu: float = -1.0
+    mbu: float = -1.0
+    spill_ratio: float = -1.0
+    dma_transfer_kib: float = -1.0
 
     @property
     def measured(self) -> bool:
@@ -107,7 +126,9 @@ def _busiest(engine_busy: dict, names: tuple) -> tuple[str, float]:
     return best_name, best
 
 
-def summarize(engine_busy: dict, device_us: float = 0.0) -> ProfileReport:
+def summarize(engine_busy: dict, device_us: float = 0.0, *, mfu: float = -1.0,
+              mbu: float = -1.0, spill_ratio: float = -1.0,
+              dma_transfer_kib: float = -1.0) -> ProfileReport:
     """Reduce a per-engine busy map to a ``ProfileReport`` — the PURE core.
 
     Decision (best-first, mirrors the physical bind):
@@ -121,23 +142,32 @@ def summarize(engine_busy: dict, device_us: float = 0.0) -> ProfileReport:
         low arithmetic intensity) -> ``memory_bound``: the op is bandwidth-bound;
         the fix is fusion + hoisting invariant loads.
 
+    The optional ``mfu``/``mbu``/``spill_ratio``/``dma_transfer_kib`` metrics (the
+    NKI Perf Guide signals; -1.0 = not reported) are stored on the report and
+    their threshold breaches appended to ``reason`` (so ``classify_bottleneck``'s
+    grep and ``perf_symptoms`` both see them).
+
     Empty input -> a fail-open ``memory_bound`` report with ``measured=False`` so
     the caller falls back to the analytic label rather than trusting an empty
     profile. Never raises."""
+    metrics = dict(mfu=mfu, mbu=mbu, spill_ratio=spill_ratio,
+                   dma_transfer_kib=dma_transfer_kib)
     if not engine_busy:
         return ProfileReport({}, MEMORY_BOUND,
-                             "no per-engine profile — analytic fallback", device_us)
+                             "no per-engine profile — analytic fallback",
+                             device_us, **metrics)
     busy = {k: float(v or 0.0) for k, v in engine_busy.items()}
     dma_name, dma = _busiest(busy, _MOVEMENT_ENGINES)
     ce_name, ce = _busiest(busy, _COMPUTE_ENGINES)
     peak = max(busy.values(), default=0.0)
+    extra = _metric_breach_note(metrics)
 
     if dma > 0.0 and dma >= ce * _DMA_MARGIN and dma >= ce:
         return ProfileReport(
             busy, DMA_BLOCKED,
             f"dma-blocked: DMA engine {dma*100:.0f}% busy vs compute "
             f"{ce_name.upper() or 'PE'} {ce*100:.0f}% — data movement is the "
-            f"limiter (double-buffer + widen tiles)", device_us)
+            f"limiter (double-buffer + widen tiles){extra}", device_us, **metrics)
 
     if ce >= _SERIALIZE_MIN and peak < _SATURATED and ce >= dma:
         idle = ", ".join(f"{n.upper()} {busy.get(n, 0.0)*100:.0f}%"
@@ -146,14 +176,56 @@ def summarize(engine_busy: dict, device_us: float = 0.0) -> ProfileReport:
             busy, SINGLE_ENGINE,
             f"single-engine serialize: {ce_name.upper()} {ce*100:.0f}% busy while "
             f"{idle or 'other engines'} sit idle — no engine saturated, the "
-            f"pipeline serializes on one engine (activation-fuse + overlap)",
-            device_us)
+            f"pipeline serializes on one engine (activation-fuse + overlap){extra}",
+            device_us, **metrics)
 
     return ProfileReport(
         busy, MEMORY_BOUND,
         f"memory-bound: busiest engine only {peak*100:.0f}% busy — bandwidth-bound, "
         f"likely spilling an intermediate through HBM (fuse + hoist invariant "
-        f"loads)", device_us)
+        f"loads){extra}", device_us, **metrics)
+
+
+def _metric_breach_note(metrics: dict) -> str:
+    """A short ' | ...' suffix naming the NKI-Guide threshold breaches present in
+    ``metrics`` (spill > 30%, small DMA, low MFU/MBU) so the reason string carries
+    them for the grep/token path. Empty when nothing is reported or in-bounds."""
+    notes = []
+    sr = metrics.get("spill_ratio", -1.0)
+    if sr is not None and sr >= 0.0 and sr > SPILL_INVESTIGATE:
+        notes.append(f"spill {sr*100:.0f}% > {SPILL_INVESTIGATE*100:.0f}% (spill-high)")
+    kib = metrics.get("dma_transfer_kib", -1.0)
+    if kib is not None and kib >= 0.0 and kib < DMA_IDEAL_KIB:
+        notes.append(f"DMA {kib:.0f} KiB < {DMA_IDEAL_KIB:.0f} KiB (small-dma)")
+    mfu = metrics.get("mfu", -1.0)
+    if mfu is not None and mfu >= 0.0 and mfu < MFU_GOOD:
+        notes.append(f"MFU {mfu*100:.0f}% < {MFU_GOOD*100:.0f}% (low-mfu)")
+    mbu = metrics.get("mbu", -1.0)
+    if mbu is not None and mbu >= 0.0 and mbu < MBU_GOOD:
+        notes.append(f"MBU {mbu*100:.0f}% < {MBU_GOOD*100:.0f}% (low-mbu)")
+    return (" | " + "; ".join(notes)) if notes else ""
+
+
+def perf_symptoms(report: ProfileReport) -> tuple[str, ...]:
+    """The NKI-Guide symptom tokens for a report — the vocabulary ``perf_hints``
+    routes on (shared with ``perf_hints.SYMPTOM_TOKENS``). Combines the coarse
+    bottleneck label with any threshold breach (low-mfu/low-mbu/spill-high/
+    small-dma). Empty tuple for an unmeasured report. Never raises."""
+    if not report.measured:
+        return ()
+    toks: list[str] = []
+    dom = (report.dominant or "").replace("_", "-")
+    if dom:
+        toks.append(dom)                                  # memory-bound|single-engine|dma-blocked
+    if 0.0 <= report.mfu < MFU_GOOD:
+        toks.append("low-mfu")
+    if 0.0 <= report.mbu < MBU_GOOD:
+        toks.append("low-mbu")
+    if report.spill_ratio >= 0.0 and report.spill_ratio > SPILL_INVESTIGATE:
+        toks.append("spill-high")
+    if report.dma_transfer_kib >= 0.0 and report.dma_transfer_kib < DMA_IDEAL_KIB:
+        toks.append("small-dma")
+    return tuple(toks)
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +282,71 @@ _EXPLORER_ENGINE_KEYS = {
 # utilization) — surfaced on the report reason when present.
 _EXPLORER_MFU_KEY = "mfu_estimated_percent"
 _EXPLORER_MBU_KEY = "mbu_estimated_percent"
+# Spill / DMA-size signals (Opt #2 / Opt #9). The spill and SBUF-traffic byte
+# counters vary in spelling across SDK versions; try a few. dma transfer size is
+# reported directly by some versions, else derived from total DMA bytes / count.
+_EXPLORER_SPILL_KEYS = ("spill_save_bytes", "spill_reload_bytes", "spill_bytes")
+_EXPLORER_SB_KEYS = ("sb_read_bytes", "sb_write_bytes", "sbuf_bytes")
+_EXPLORER_DMA_KIB_KEYS = ("dma_avg_transfer_kib", "dma_transfer_kib",
+                          "avg_dma_transfer_size_kib")
+_EXPLORER_DMA_BYTES_KEYS = ("dma_total_bytes", "dma_bytes")
+_EXPLORER_DMA_COUNT_KEYS = ("dma_transfer_count", "dma_count", "dma_instruction_count")
+
+
+def _first_num(node: dict, keys: tuple, default: float = -1.0) -> float:
+    """First numeric value among ``keys`` present in ``node`` (fraction-coerced
+    only via float, NOT _as_fraction — these are byte/count/percent raw values).
+    ``default`` when none present. Never raises."""
+    for k in keys:
+        if k in node:
+            try:
+                return float(node[k])
+            except (TypeError, ValueError):
+                continue
+    return default
+
+
+def parse_neuron_explorer_metrics(obj: Any) -> dict:
+    """Extract the NKI-Guide scalar metrics (mfu, mbu, spill_ratio,
+    dma_transfer_kib) from a neuron-explorer summary object. Same node-selection
+    as ``parse_neuron_explorer_summary``. Returns only the metrics actually present
+    (missing -> omitted, so the caller keeps the -1.0 'unknown' default). Never
+    raises; ``{}`` on any miss."""
+    try:
+        node = obj
+        if isinstance(obj, dict) and not _is_explorer_node(obj):
+            nodes = [v for v in obj.values() if _is_explorer_node(v)]
+            if not nodes:
+                return {}
+            node = max(nodes, key=lambda n: (
+                _as_fraction(n.get(_EXPLORER_ENGINE_KEYS["dma"], 0)) +
+                _as_fraction(n.get(_EXPLORER_ENGINE_KEYS["pe"], 0))))
+        if not isinstance(node, dict):
+            return {}
+        out: dict = {}
+        if _EXPLORER_MFU_KEY in node:
+            out["mfu"] = _as_fraction(node[_EXPLORER_MFU_KEY])
+        if _EXPLORER_MBU_KEY in node:
+            out["mbu"] = _as_fraction(node[_EXPLORER_MBU_KEY])
+        # spill_ratio = spill traffic / SBUF<->device traffic (guide's >30% bar).
+        spill = sum(max(0.0, _first_num(node, (k,), 0.0)) for k in _EXPLORER_SPILL_KEYS
+                    if k in node)
+        sb = sum(max(0.0, _first_num(node, (k,), 0.0)) for k in _EXPLORER_SB_KEYS
+                 if k in node)
+        if sb > 0.0 and any(k in node for k in _EXPLORER_SPILL_KEYS):
+            out["spill_ratio"] = spill / sb
+        # dma transfer size: direct if reported, else total_bytes / count / 1024.
+        kib = _first_num(node, _EXPLORER_DMA_KIB_KEYS)
+        if kib < 0.0:
+            b = _first_num(node, _EXPLORER_DMA_BYTES_KEYS)
+            c = _first_num(node, _EXPLORER_DMA_COUNT_KEYS)
+            if b >= 0.0 and c > 0.0:
+                kib = (b / c) / 1024.0
+        if kib >= 0.0:
+            out["dma_transfer_kib"] = kib
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _is_explorer_node(d: Any) -> bool:
@@ -325,14 +462,19 @@ def profile_kernel(run_fn: Callable[[], Any], device: Any = None, *,
         return None
     busy = raw if _looks_normalized(raw) else parse_profile_json(raw)
     device_us = 0.0
+    metrics: dict = {}
     if isinstance(raw, dict):
         try:
             device_us = float(raw.get("device_us", raw.get("total_us", 0.0)) or 0.0)
         except (TypeError, ValueError):
             device_us = 0.0
+        # Pull the NKI-Guide scalar metrics (mfu/mbu/spill/dma-size) when present;
+        # a pre-normalized busy dict carries no metrics (they stay unknown).
+        if not _looks_normalized(raw):
+            metrics = parse_neuron_explorer_metrics(raw)
     if not busy:
         return None
-    return summarize(busy, device_us)
+    return summarize(busy, device_us, **metrics)
 
 
 def _looks_normalized(d: Any) -> bool:

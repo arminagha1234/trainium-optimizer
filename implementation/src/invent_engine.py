@@ -1271,10 +1271,21 @@ class InventEngine:
         ``_device_race``) so it RE-VALIDATES correctness AND re-measures each
         round — a perf rewrite that breaks correctness is caught and stops the
         loop (``regressed_or_broke``), never banked as a win."""
+        # Give the loop the op's name + op-family so ``diagnose`` can route a
+        # SHAPE-specific NKI-Guide optimization (fast-weight-load for a decode
+        # matmul, tensor_tensor_scan for a scan) via perf_hints, not just the
+        # coarse bottleneck lever.
+        try:
+            from nki_knowledge import classify_op
+            _op_family = classify_op(spec.name, getattr(spec, "family", None),
+                                     getattr(spec, "notes", None))
+        except Exception:  # noqa: BLE001
+            _op_family = ""
         loop = KernelPerfLoop(
             max_rounds=self.max_perf_rounds,
             min_gain_pct=self.guards.marginal_improvement_pct,
-            min_utilization=self.guards.min_utilization)
+            min_utilization=self.guards.min_utilization,
+            op_name=spec.name, op_family=_op_family)
         measure = race_fn or self._device_race
 
         # WHO re-authors each round. Default: the STRUCTURAL mutator — keep the

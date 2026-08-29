@@ -90,6 +90,26 @@ def guidance_for(bottleneck: str) -> list[str]:
     return _GUIDANCE.get(bottleneck or "", _GUIDANCE[MEMORY_BOUND])
 
 
+def specific_guidance(bottleneck: str, *, reason: str = "", op_name: str = "",
+                      op_family: str = "", max_hints: int = 2) -> list[str]:
+    """The SPECIFIC NKI-Guide optimizations (Opt #5a/#5b/#7/#8/…) for a measured
+    symptom, via ``perf_hints`` — the fine-grained lever the compiler misses (fast
+    weight load for a short-dim matmul, tensor_tensor_scan for a per-element scan,
+    partition vectorization, transpose-swap). Falls back to the coarse
+    ``guidance_for`` lever when nothing specific matches, so the loop always has a
+    fix. Never raises (a missing perf_hints module degrades to coarse guidance)."""
+    try:
+        import perf_hints  # noqa: PLC0415 — optional, self-contained
+        hints = perf_hints.guidance_from_symptoms(
+            bottleneck, reason=reason, op_name=op_name, op_family=op_family,
+            max_hints=max_hints)
+        if hints:
+            return hints
+    except Exception:  # noqa: BLE001
+        pass
+    return guidance_for(bottleneck)
+
+
 def classify_bottleneck(race: Any) -> str:
     """Reduce a measured ``RaceResult`` to ONE dominant, actionable bottleneck
     label among {memory_bound, single_engine, dma_blocked}.
@@ -186,33 +206,57 @@ class KernelPerfLoop:
     HONESTLY (never a fabricated speedup)."""
 
     def __init__(self, max_rounds: int = 6, min_gain_pct: float = 2.0,
-                 stall_patience: int = 2, min_utilization: float = 0.85) -> None:
+                 stall_patience: int = 2, min_utilization: float = 0.85,
+                 op_name: str = "", op_family: str = "") -> None:
         # min_gain_pct: a candidate must be at least this much faster than the
         #   running-best to be ADOPTED (below it is noise — mirrors
         #   guardrails.marginal_improvement_pct).
         # stall_patience: this many consecutive rounds with no adopted gain -> bail.
         # min_utilization: the roofline saturation bar for "converged" (mirrors
         #   guardrails.min_utilization); at/above it, more rounds cannot help.
+        # op_name/op_family: OPTIONAL op context so ``diagnose`` can route a
+        #   shape-specific NKI-Guide optimization (fast weight load for a decode
+        #   matmul, tensor_tensor_scan for a scan) via perf_hints — safe to omit.
         self.max_rounds = max_rounds
         self.min_gain_pct = min_gain_pct
         self.stall_patience = stall_patience
         self.min_utilization = min_utilization
+        self.op_name = op_name
+        self.op_family = op_family
 
     def diagnose(self, race: Any) -> tuple[str, list[str]]:
         """Measured result -> (dominant bottleneck, ONE targeted fix). The
-        retrieval that turns a bare latency into a named, actionable lever."""
+        retrieval that turns a bare latency into a named, actionable lever.
+
+        Prefers the SPECIFIC NKI-Guide optimization for the measured symptom
+        (``specific_guidance`` via perf_hints — reads the ``reason`` string's
+        threshold-breach tokens + the op shape), and falls back to the coarse
+        per-bottleneck lever when nothing specific matches."""
         bn = classify_bottleneck(race)
-        return bn, guidance_for(bn)
+        guidance = specific_guidance(
+            bn, reason=str(getattr(race, "reason", "")),
+            op_name=self.op_name, op_family=self.op_family)
+        return bn, guidance
 
     def _converged(self, race: Any) -> bool:
         """The running-best saturates the roofline -> optimizing further is not
         worth a round. True when model-FLOPs-utilization clears ``min_utilization``
-        OR the op is at/above the compute ridge (``roofline_ratio >= 1``): a
-        memory-bound op will (correctly) never trip this and instead stops via
-        no_gain / exhausted once the author runs out of levers."""
+        OR the measured %SOL clears the NKI-Guide's per-bottleneck 'good' bar (90%
+        compute-bound / 60% memory-bound — so a memory-bound op is judged CONVERGED
+        at the bar it can actually reach, not held to a 90% bar it never will) OR
+        the op is at/above the compute ridge (``roofline_ratio >= 1``)."""
         mfu = getattr(race, "mfu", -1.0)
         if mfu >= self.min_utilization:
             return True
+        sol = float(getattr(race, "sol", 0.0) or 0.0)
+        bn = (getattr(race, "bottleneck", "") or "").lower()
+        if sol > 0.0:
+            try:
+                import roofline  # noqa: PLC0415
+                if roofline.meets_good_bar(sol, bn):
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
         return getattr(race, "roofline_ratio", 0.0) >= 1.0
 
     def run(self, author_fn: AuthorFn, measure_fn: MeasureFn,

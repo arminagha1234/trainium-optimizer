@@ -142,6 +142,42 @@ TECHNIQUES: dict[str, str] = {
         "`nl.max(logits, axis=1, keepdims=True)` + argmax-via-iota, masking the "
         "winner to -inf before the next pass. Cheaper than a full sort and keeps "
         "every tile 2-D.",
+    # --- NKI Performance Guide Opt #5a/#5b/#7/#8 (docs/nki-perf-guide.md) --------
+    # These are the levers that BEAT the compiler where it is weak: the compiler
+    # already does coarse fusion/tiling/DMA-sizing (Opt #1/#2/#9), so the win is
+    # the low-level nki.isa trick it does not find.
+    "fast-weight-load":
+        "Opt #7 (up to 4x on a SHORT-dim matmul, e.g. bs=1 decode matrix-vector). "
+        "When one matmul dim << 128, map the SHORT tensor to the MOVING position "
+        "and the LARGE tensor to STATIONARY: fast LoadStationary is up to 4x faster "
+        "than MultiplyMoving of the same free size (Short-Moving: LS_II~=32 cyc, MM "
+        "every ~64 cyc; Short-Stationary: MM every ~128 cyc). Swap the nc_matmul "
+        "args and use A@B = (B^T@A^T)^T (swapping operands transposes the output) so "
+        "the result layout still matches. THE lever for autoregressive decode.",
+    "partition-vectorize":
+        "Opt #5b (2x). Two ops each spanning < 128 partitions run SERIALLY (half the "
+        "lanes idle). Write the two nc_matmul outputs to DISJOINT partitions of ONE "
+        "128-partition PSUM tile (0:63 and 64:127), then do a SINGLE full-width "
+        "nl.max/nl.sum(axis=1, keepdims=True) over the [128,F] tile — 2x vs two "
+        "[64,F] reduces. Always fill all 128 partitions (a [128,96] operand uses only "
+        "96 PE columns; widening to 128 is FREE) — never leave lanes idle.",
+    "tensor-tensor-scan":
+        "Opt #5a. A scan written as seq_len back-to-back single-element "
+        "nisa.tensor_scalar ops pays the ~100-cycle STATIC instruction overhead every "
+        "step (measured 189 ns / 264 cyc overhead vs 1 cyc useful work) — overhead, "
+        "not math, dominates. Replace the per-element recurrence with the fused "
+        "VectorE primitive `nisa.tensor_tensor_scan` (ONE instruction over the free "
+        "axis). Generally: make each instruction touch a free dim >= 128 so the "
+        "static overhead amortizes; read-after-write chains make tiny tiles worse.",
+    "transpose-swap-for-layout":
+        "Opt #8. Do not pay for an intermediate transpose the matmul can absorb. "
+        "SWAP stationary/moving in nc_matmul so the OUTPUT layout already matches the "
+        "NEXT op (e.g. feeding layernorm bn_stats which wants the feature dim on the "
+        "FREE axis: map the WEIGHT to moving -> output comes out pre-transposed, no "
+        "nc_transpose). Or move the reduce to the engine whose native layout you have "
+        "(TensorE partition-reduce via matmul-against-ones vs VectorE free-axis "
+        "tensor_reduce). If a transpose is unavoidable AND memory-bound, use nl.load()"
+        " + nisa.nc_transpose() tiled, NOT nl.load_transpose2d (lower DMA bandwidth).",
     # --- harvested from AWShtokoyo/vllm-neuron (see docs/vllm-neuron-harvest.md) ---
     "sequential-range-for-scan":
         "A loop-carried read-modify-write (a scan's recurrent state, a flash "
@@ -511,7 +547,8 @@ KNOWLEDGE: dict[str, KnowledgeEntry] = {
         "A GEMM on the systolic array. Contraction on the PARTITION axis; tile the "
         "moving free dim to <=512 and accumulate natively in PSUM.",
         ("isa-return-form", "tile-to-hw-limits", "psum-native-accumulation",
-         "bf16-in-fp32-accumulate", "downcast-before-transpose"),
+         "bf16-in-fp32-accumulate", "downcast-before-transpose",
+         "fast-weight-load", "partition-vectorize", "transpose-swap-for-layout"),
         ("nc_matmul", "nc_transpose"),
         ("no-dst-param", "moving-free-512", "partition-le-128"),
         (_EX_TILED_MATMUL,),
@@ -534,7 +571,8 @@ KNOWLEDGE: dict[str, KnowledgeEntry] = {
         ("isa-return-form", "tile-to-hw-limits", "delayed-softmax-division",
          "activation-reduce-fusion", "psum-native-accumulation",
          "downcast-before-transpose", "negated-max-online-softmax",
-         "sequential-range-for-scan"),
+         "sequential-range-for-scan", "fast-weight-load",
+         "transpose-swap-for-layout"),
         ("nc_matmul", "nc_transpose", "activation", "reduce", "reciprocal"),
         ("no-dst-param", "moving-free-512", "no-1d-collapse", "partition-le-128",
          "size-1-partition", "attn-scores-on-partition", "packed-axis-dma-alias",
@@ -549,8 +587,8 @@ KNOWLEDGE: dict[str, KnowledgeEntry] = {
         "neuronx-cc the SEQUENTIAL form is preferred for GatedDeltaNet — see "
         "sequential-gdn-not-chunked.",
         ("chunked-scan", "sequential-range-for-scan", "sequential-gdn-not-chunked",
-         "paged-32bit-safe-addressing", "isa-return-form", "tile-to-hw-limits",
-         "psum-native-accumulation", "keepdims-2d"),
+         "tensor-tensor-scan", "paged-32bit-safe-addressing", "isa-return-form",
+         "tile-to-hw-limits", "psum-native-accumulation", "keepdims-2d"),
         ("nc_matmul", "activation", "reduce"),
         ("chunk-partition-limit", "no-dst-param", "partition-le-128",
          "no-1d-collapse", "rmsnormgated-plain-weight"),
@@ -561,7 +599,7 @@ KNOWLEDGE: dict[str, KnowledgeEntry] = {
         "Router: logits = x@w -> gate activation -> top-K selection + affinity "
         "scatter. Top-K (K<=8) is sort-free (K max+mask passes).",
         ("sort-free-topk", "isa-return-form", "keepdims-2d",
-         "delayed-softmax-division", "tile-to-hw-limits"),
+         "delayed-softmax-division", "tile-to-hw-limits", "partition-vectorize"),
         ("nc_matmul", "reduce", "iota", "activation", "reciprocal"),
         ("topk-k-limit", "no-1d-collapse", "no-dst-param", "moving-free-512"),
         (_EX_MOE_ROUTER,),

@@ -30,6 +30,16 @@ official_libraries:      # AWS-maintained reference kernels / runtime
   - name: aws-neuron/torch-neuronx
     url: https://github.com/aws-neuron/torch-neuronx
     covers: [torch-neuronx runtime + integration]
+  - name: NVIDIA/Model-Optimizer (ModelOpt)
+    url: https://github.com/NVIDIA/Model-Optimizer
+    covers: [speculative decoding (Medusa/EAGLE draft-head architectures + training),
+             fp8 PTQ calibration methodology]
+    note: >-
+      NOT a Trainium kernel source — GPU/TRT-LLM library. Harvest the
+      speculative-decoding draft-head ARCHITECTURES (modelopt.torch.speculative,
+      fastgen) as the portable steal for the bs=1 host-bound decode axis (see
+      references-analysis.md section 5). Its quantization menu is GPU-only
+      (fp8 is the only trn2-relevant format; mxfp4=trn3, NVFP4/INT4/INT8=GPU).
 
 tutorials:               # optimization ladders / perf learning
   - name: aws-neuron/nki-samples
@@ -46,6 +56,16 @@ docs:                    # reference docs to consult
   - name: Neuron NKI docs
     url: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/
     covers: [NKI programming model, nki.language / nki.isa API, Trainium2/3 arch, perf guide]
+  - name: NKI Kernel Performance Guide (Opt #1-#10)
+    url: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/deep-dives/nki_perf_guide.html
+    covers: [the 10 numbered perf optimizations, utilization/MFU/MBU/spill/DMA
+             thresholds, profile-driven bottleneck diagnosis, fast-weight-load,
+             partition-vectorization, tensor_tensor_scan, transpose mitigation]
+    note: >-
+      banked distilled at docs/nki-perf-guide.md; wired via perf_hints.py
+      (symptom->Opt) + the threshold constants in neuron_profile.py / roofline.py.
+      This is the "beat the compiler" reference — the low-level nki.isa levers the
+      compiler does not find.
   - name: HuggingFace kernels hub (trending)
     url: https://huggingface.co/kernels?sort=trending
     covers: [community Triton/CUDA/Neuron kernels]

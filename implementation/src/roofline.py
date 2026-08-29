@@ -57,6 +57,37 @@ RIDGE_FLOPS_PER_BYTE = PEAK_TFLOPS_BF16_PER_CORE / PEAK_HBM_BW_PER_CORE
 OPPORTUNITY_MAX_SOL = 0.40   # <= 40% of SOL -> a real authoring opportunity
 NEAR_SOL_MIN = 0.80          # >= 80% of SOL -> compiler already ~wins; skip
 
+# --- NKI Performance Guide "good utilization" bars (docs/nki-perf-guide.md) ---
+# The guide states different SOL bars per bottleneck: a compute-bound kernel is
+# "good" at >= 90% engine-active/MFU, a memory-bound kernel at >= 60% MBU. These
+# are finer than the single NEAR_SOL_MIN and let the perf loop declare a kernel
+# CONVERGED against the RIGHT bar for its bottleneck (so a memory-bound op is not
+# held to a 90% bar it can never hit, nor a compute-bound op let off at 60%).
+COMPUTE_BOUND_GOOD_SOL = 0.90   # compute-bound: >= 90% of SOL / MFU is good
+MEMORY_BOUND_GOOD_SOL = 0.60    # memory-bound:  >= 60% of SOL / MBU is good
+# Static shape bars the author should meet BEFORE measuring (Opt #5/#9): every
+# instruction needs >= 128 elements/partition to be efficient; DMA transfers want
+# >= 32 KiB; the ideal DMA free-dim is ~1024 (beyond it has diminishing return).
+MIN_ELEMS_PER_PARTITION = 128
+IDEAL_DMA_TRANSFER_KIB = 32
+IDEAL_DMA_FREE_DIM = 1024
+
+
+def good_sol_bar(bottleneck: str) -> float:
+    """The guide's 'good utilization' SOL bar for a bottleneck: 90% for
+    compute-bound, 60% for memory-bound (the default — the ops this framework
+    authors are mostly memory-bound). Use this as the per-bottleneck convergence
+    target instead of a single flat threshold."""
+    return (COMPUTE_BOUND_GOOD_SOL if bottleneck == "compute_bound"
+            else MEMORY_BOUND_GOOD_SOL)
+
+
+def meets_good_bar(sol: float, bottleneck: str) -> bool:
+    """True when a measured %SOL clears the guide's good bar for its bottleneck —
+    i.e. the kernel is as close to the roofline as the guide calls 'good' and more
+    optimization rounds are unlikely to pay off."""
+    return sol > 0.0 and sol >= good_sol_bar(bottleneck)
+
 
 def sol_memory_bound(bytes_moved: float, device_s: float) -> float:
     """%SOL (0..1+) for a memory-bound op: achieved HBM bandwidth / peak.
