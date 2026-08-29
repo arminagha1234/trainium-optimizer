@@ -1,0 +1,59 @@
+# Canonical harvest-source list — the "borrow before invent" inputs.
+#
+# Where the framework looks for an EXISTING kernel before authoring a new one.
+# Human-readable version (categorized, with notes + harvest priority):
+#   docs/kernel-sources.md
+# Read programmatically by: implementation/src/harvest_sources.py
+#   (from harvest_sources import load_sources)
+#
+# Edit here to add a source; keep docs/kernel-sources.md in sync for humans.
+
+kernel_repos:            # community / vendor kernel repos to harvest from
+  - name: jburtoft (HuggingFace)
+    url: https://huggingface.co/jburtoft
+    kernels_view: https://huggingface.co/kernels?search=jburtoft
+    covers: [KDA (Kimi-K3), Mamba-2 SSD, Mamba-3, MiniMax-M3 linear-attn,
+             Qwen3.5 GatedDeltaNet, FNet, gelu-erf]
+    note: >-
+      model-type repos clone with GIT_LFS_SKIP_SMUDGE=1; kernels-hub repos via
+      the `kernels` pip package / HF kernels API (plain git clone 404s).
+  - name: jimburtoft/NeuronStuff
+    url: https://github.com/jimburtoft/NeuronStuff
+    covers: [misc Neuron kernels + examples]
+
+official_libraries:      # AWS-maintained reference kernels / runtime
+  - name: aws-neuron/nki-library
+    url: https://github.com/aws-neuron/nki-library
+    covers: [SSD (Mamba-2), selective-scan, attention CTE/TKG, MoE CTE/TKG,
+             router-topk, QKV, output-proj, cumsum, depthwise-conv1d, rope,
+             rmsnorm-quant, mlp, cross-entropy]
+  - name: aws-neuron/torch-neuronx
+    url: https://github.com/aws-neuron/torch-neuronx
+    covers: [torch-neuronx runtime + integration]
+
+tutorials:               # optimization ladders / perf learning
+  - name: aws-neuron/nki-samples
+    url: https://github.com/aws-neuron/nki-samples
+    covers: [attention opt ladder v1-v8a, matmul PSUM tiling, mxfp8 matmul,
+             fused_mamba, pipelined_attention]
+    note: samples use the `nki` package (dst-first ISA); our stack compiles with
+          neuronxcc.nki (return-form) — translate signatures + verify on-device.
+  - name: wafer-ai/gpu-perf-engineering-resources
+    url: https://github.com/wafer-ai/gpu-perf-engineering-resources
+    covers: [roofline, FlashAttention 1-4, online-softmax, SOL benchmarks]
+
+docs:                    # reference docs to consult
+  - name: Neuron NKI docs
+    url: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/
+    covers: [NKI programming model, nki.language / nki.isa API, Trainium2/3 arch, perf guide]
+  - name: HuggingFace kernels hub (trending)
+    url: https://huggingface.co/kernels?sort=trending
+    covers: [community Triton/CUDA/Neuron kernels]
+
+# What to harvest first — the differentiator is architectures the compiler
+# can't lower (compiler-weak: linear-attention/scan, sparse/long-context attn).
+harvest_priority:
+  - qwen35-deltanet + nki-library router-topk  ->  Qwen3.5 / Qwen3-Next
+  - mamba2-ssd / nki-library SSD               ->  Mamba-2
+  - kda                                        ->  Kimi-K3 / Kimi-Linear
+  - mamba3, minimax-m3                         ->  the frontier
