@@ -51,6 +51,8 @@ __all__ = [
     "estimate_params",
     "max_clean_tp",
     "assess",
+    "profile_for",
+    "measured_weight_gb",
 ]
 
 # Bytes per parameter by dtype string.
@@ -61,9 +63,13 @@ _DTYPE_BYTES = {"bf16": 2, "fp16": 2, "float16": 2, "bfloat16": 2,
 # native_pytorch._fit_baseline_tp so the gate predicts the SAME tp the backend
 # will actually pick -- a gate that models different hardware than the runner is
 # worse than no gate.
-_TP_CAPS: tuple[tuple[str, int], ...] = (
-    ("Gemma4", 4),    # Global layers: head_dim 512 with 4 KV heads
-    ("Qwen3_5", 4),   # DeltaNet manual head-parallel adapter validated at tp4
+# None means "no cap beyond the head count", which the `heads % tp` test already
+# enforces. MUST stay in lockstep with native_pytorch._fit_baseline_tp: a gate that
+# models a different tp than the runner picks is worse than no gate, because it
+# either rejects models that run or passes models that cannot.
+_TP_CAPS: tuple[tuple[str, int | None], ...] = (
+    ("Gemma4", 4),      # HARD: Global layers use head_dim 512 with only 4 KV heads
+    ("Qwen3_5", None),  # was 4 (a validation limit); #121 raised the runner to heads
 )
 
 
@@ -107,6 +113,43 @@ class HardwareProfile:
 # LNC=2: 16 devices x 4 logical cores, 24 GB per logical core.
 TRN2_48XLARGE = HardwareProfile("trn2.48xlarge", cores=64, hbm_gb_per_core=24.0)
 TRN2_3XLARGE = HardwareProfile("trn2.3xlarge", cores=4, hbm_gb_per_core=24.0)
+TRN1_32XLARGE = HardwareProfile("trn1.32xlarge", cores=32, hbm_gb_per_core=16.0)
+TRN1_2XLARGE = HardwareProfile("trn1.2xlarge", cores=2, hbm_gb_per_core=16.0)
+
+_PROFILES = {p.name: p for p in
+             (TRN2_48XLARGE, TRN2_3XLARGE, TRN1_32XLARGE, TRN1_2XLARGE)}
+
+
+def profile_for(instance_type: str | None) -> HardwareProfile | None:
+    """HardwareProfile for an instance-type string, or None if unmodelled.
+
+    None is the signal to SKIP the gate rather than guess. Modelling the wrong
+    box is worse than not gating: a profile with too little HBM would reject
+    models that run, and one with too much would pass models that cannot.
+    """
+    return _PROFILES.get((instance_type or "").strip())
+
+
+def measured_weight_gb(model_id: str, timeout: float = 6.0) -> float | None:
+    """Total weight bytes from the HF repo's file metadata, in GB, or None.
+
+    Metadata only -- no weights are downloaded. This beats the config estimate,
+    which is a model of the architecture and is wrong by 3.5x on DeepSeek-V4-Flash
+    and 7x on Kimi-K3. Best-effort by design: any failure (offline, private repo,
+    rate limit) returns None so the caller falls back to the estimate rather than
+    failing a run over a metadata lookup.
+    """
+    import json
+    import urllib.request
+    try:
+        url = f"https://huggingface.co/api/models/{model_id}?blobs=true"
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            d = json.load(r)
+        total = sum(f.get("size") or 0 for f in d.get("siblings", [])
+                    if str(f.get("rfilename", "")).endswith((".safetensors", ".bin")))
+        return total / 1e9 if total else None
+    except Exception:  # noqa: BLE001 - advisory only
+        return None
 
 
 @dataclass
@@ -195,12 +238,13 @@ def max_clean_tp(config: dict[str, Any], hw: HardwareProfile) -> int:
     """
     tc = _text_config(config)
     archs = " ".join(architectures(config))
+    heads = _int(tc, "num_attention_heads", 32)
     cap = hw.cores
     for needle, capped in _TP_CAPS:
         if needle.lower() in archs.lower():
-            cap = min(cap, capped)
+            # None -> bounded only by the head count (and cores).
+            cap = min(cap, capped if capped is not None else heads)
             break
-    heads = _int(tc, "num_attention_heads", 32)
     best = 1
     for tp in (1, 2, 4, 8, 16, 32, 64):
         if tp <= cap and heads and heads % tp == 0:
