@@ -494,7 +494,13 @@ class InventEngine:
             if env_kdir:
                 kdir: str | None = env_kdir
             else:
-                _repo_kernels = Path(__file__).resolve().parent / "kernels"
+                # ONE kernel home: knowledge-bank/kernels/ at the repo root.
+                # KernelLibrary.DEFAULT_ROOT already points there, so registry
+                # (harvest/reuse) and library (bank-on-win) now share a single
+                # root -- everything authored or harvested from here on lands in
+                # the same place. src/../.. == repo root.
+                _repo_kernels = (Path(__file__).resolve().parents[2]
+                                 / "knowledge-bank" / "kernels")
                 kdir = str(_repo_kernels) if _repo_kernels.is_dir() else None
             registry = KernelRegistry(kernel_dir=kdir)
         self.registry = registry

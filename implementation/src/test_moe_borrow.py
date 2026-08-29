@@ -24,7 +24,23 @@ from types import SimpleNamespace
 from backends.mock import MockBackend
 from bank import KnowledgeBank
 from guardrails import Guardrails
-from kernels.moe_fused import (
+import importlib.util as _ilu
+import sys as _sys
+from pathlib import Path as _P
+
+# knowledge-bank/kernels/ cannot be an import package (the directory name has a
+# hyphen), so load moe_fused by path and register it under a synthetic name that
+# the import below can resolve.
+_moe_init = (_P(__file__).resolve().parents[2] / "knowledge-bank" / "kernels"
+             / "moe_fused" / "__init__.py")
+if "_kb_moe_fused" not in _sys.modules and _moe_init.is_file():
+    _spec = _ilu.spec_from_file_location("_kb_moe_fused", _moe_init,
+                                         submodule_search_locations=[str(_moe_init.parent)])
+    _mod = _ilu.module_from_spec(_spec)
+    _sys.modules["_kb_moe_fused"] = _mod
+    _spec.loader.exec_module(_mod)
+
+from _kb_moe_fused import (
     FUSED_NKI,
     KERNEL_SOURCE,
     MOE_KERNEL_KEY,
@@ -192,7 +208,7 @@ def test_fused_moe_kernel_uses_broadcast_to_not_broadcast():
     the old form raises AttributeError on-device. The vendored fused-MoE kernel
     source must use the new API. (Text check: importing needs nkilib, absent in
     the unit-test env.)"""
-    src = (Path(__file__).parent / "kernels" / "moe_fused"
+    src = (Path(__file__).resolve().parents[2] / "knowledge-bank" / "kernels" / "moe_fused"
            / "moe_fused_nki.py").read_text()
     assert ".broadcast_to((" in src, "kernel should use the nki 0.6.0 broadcast_to API"
     # No bare .broadcast(dim=... / .broadcast( call survives (comments describing
