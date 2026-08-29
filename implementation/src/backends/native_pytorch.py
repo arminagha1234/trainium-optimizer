@@ -96,6 +96,59 @@ _ERR_SIGNATURES: tuple[tuple[str, str], ...] = (
 )
 
 
+# Files transformers needs to build a model. Deliberately not "*" -- a repo can
+# carry GGUF/ONNX/consolidated variants that would never be read but would make a
+# completeness check fail and defeat the prewarm.
+_HF_WEIGHT_PATTERNS = ("*.safetensors", "*.json", "*.txt", "*.model", "*.py")
+
+
+def prewarm_hf_cache(model_id: str, log=None) -> bool:
+    """Resolve the checkpoint ONCE here, so every rank can then read it locally.
+
+    Returns True when the cache is complete and the workers can be put in
+    HF_HUB_OFFLINE mode.
+
+    Why: measurement runs one worker process per core, and each one resolves the
+    checkpoint independently. At tp=16 that is 16 concurrent unauthenticated Hub
+    lookups; a rate-limited rank falls back to a local lookup that reports an
+    already-cached shard as absent::
+
+        [rank6] OSError: Qwen/Qwen3.5-35B-A3B does not appear to have a file named
+                model.safetensors-00001-of-00014.safetensors
+
+    A different rank and a different shard each run, which reads exactly like a
+    corrupt cache. It is not: the cache was verified complete -- 14/14 shards,
+    correct sizes, a real read at the tail of each -- by the parent process
+    seconds before a run that then failed this way. One resolution here plus
+    offline workers removes the contention entirely, and also stops `tp` ranks
+    downloading the same file on a cold cache.
+
+    Never raises. If prewarming fails (offline box, gated repo, no hub package)
+    the caller leaves the workers online and they behave as before.
+    """
+    if not model_id or os.sep in model_id and Path(model_id).exists():
+        return False                      # explicit local path: nothing to resolve
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception:  # noqa: BLE001 - advisory only
+        return False
+    try:
+        snapshot_download(model_id, allow_patterns=_HF_WEIGHT_PATTERNS,
+                          local_files_only=True)
+        return True                       # already complete; no network at all
+    except Exception:  # noqa: BLE001 - means "not fully cached", not an error
+        pass
+    try:
+        snapshot_download(model_id, allow_patterns=_HF_WEIGHT_PATTERNS, max_workers=8)
+        if log:
+            log(f"hf prewarm: cached {model_id} once; workers will read offline")
+        return True
+    except Exception as e:  # noqa: BLE001
+        if log:
+            log(f"hf prewarm failed ({e!r}); each rank will resolve on its own")
+        return False
+
+
 def _is_noise(line: str) -> bool:
     """Separator banners and rule lines carry no diagnostic information."""
     t = line.strip()
@@ -446,6 +499,11 @@ class NativePyTorchBackend:
         env = {**os.environ,
                "HF_HUB_DISABLE_PROGRESS_BARS": "1",
                "TOKENIZERS_PARALLELISM": "false"}
+        # One Hub resolution here beats `tp` concurrent ones in the workers. Only
+        # flip the workers offline once the cache is provably complete, so a cold
+        # cache still downloads normally.
+        if prewarm_hf_cache(neff.artifact.model_id, log=None):
+            env["HF_HUB_OFFLINE"] = "1"
         # Capture the worker's stderr instead of discarding it. Every silent
         # metric=0.0 below used to be indistinguishable -- an OOM, an unsupported
         # architecture, a missing dependency and a plain import error all looked
