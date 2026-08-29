@@ -299,6 +299,8 @@ def preflight_check(
     registry: Any = None,
     kernels_wired: bool = False,
     rewrites_wired: bool = False,
+    hardware: Any = None,
+    weight_gb: float | None = None,
 ) -> tuple[bool, str | None]:
     """Cheap, no-compile gate run before `establish_baseline`.
 
@@ -351,6 +353,26 @@ def preflight_check(
         if need and need.available and kernels_wired:
             return True, None
         return False, (need.reason if need else LINEAR_ATTN_REASON)
+
+    # 1b. Capability gate — can this model physically run on this box?
+    #
+    # Runs on the config only (no weights, no compile), so a model that cannot
+    # fit is rejected in milliseconds instead of after a multi-GB download and a
+    # device OOM. This is the check that would have caught Qwen3.5-35B-A3B: the
+    # backend's dense parameter formula sized that 256-expert MoE at 7.4 GB when
+    # it is ~72 GB, chose tp=1, and OOM'd. Pass `weight_gb` (summed from the HF
+    # repo's file metadata) when available — it beats any config estimate.
+    #
+    # Fails OPEN by construction: capability.assess returns UNKNOWN/ok for a
+    # config it cannot size, so an unfamiliar architecture is never blocked here.
+    if hardware is not None and cfg:
+        try:
+            from capability import assess as _assess  # local: keeps preflight import-light
+            verdict = _assess(cfg, hardware, weight_gb=weight_gb)
+            if not verdict.ok:
+                return False, f"capability: {verdict.reason}"
+        except Exception:  # noqa: BLE001 — a broken gate must never block a run
+            pass
 
     # 2. Bank consultation — a class that already failed the expensive way.
     if bank is not None and hasattr(bank, "preflight_antipatterns"):

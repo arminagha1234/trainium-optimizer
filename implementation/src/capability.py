@@ -1,0 +1,300 @@
+"""Capability gate — decide from the CONFIG ALONE whether a model can run here.
+
+Why this exists
+---------------
+The north star is "point it at any HuggingFace model". In practice that meant
+*attempting* any model and discovering the answer on hardware, which is the
+expensive way to be told no. Three 256-expert MoE models each burned a
+trn2.48xlarge and returned an indistinguishable ``metric=0.0``.
+
+They were not close calls. Two of them cannot fit at any TP this backend will
+choose, and that is provable from ``config.json`` in milliseconds — no weights
+downloaded, no compile, no device touched.
+
+The load-bearing fix: MoE parameter counting
+--------------------------------------------
+``native_pytorch._fit_baseline_tp`` sizes a model with a DENSE formula::
+
+    params = (4*h*h + 3*h*inter) * L + 2*V*h
+
+That ignores the expert dimension entirely, so for a 256-expert MoE it
+undercounts by an order of magnitude (measured against on-disk weights):
+
+    Qwen3.5-35B-A3B      dense  7.4 GB   MoE-aware  67.8 GB   actual  71.9 GB
+    Qwen3.5-122B-A10B    dense 17.5 GB   MoE-aware 238.6 GB   actual 250.2 GB
+
+A 7.4 GB estimate satisfies the "keep weights under ~10 GB/rank" rule at tp=1,
+so the backend puts a 71.9 GB model on a single 24 GB core. The OOM was decided
+before the run started.
+
+Design notes
+------------
+- Pure and dependency-free: takes a config dict, returns a verdict. No torch, no
+  transformers, no network, so it is trivially testable and cannot itself fail
+  on an unsupported model.
+- Fails OPEN. When the config is too unusual to size confidently, the verdict is
+  ``UNKNOWN`` and the caller proceeds. A gate that blocks a model that would
+  have worked is a worse failure than one that lets a doomed model through: the
+  first silently shrinks the reachable model set, the second costs one run.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+__all__ = [
+    "Verdict",
+    "HardwareProfile",
+    "TRN2_48XLARGE",
+    "TRN2_3XLARGE",
+    "estimate_params",
+    "max_clean_tp",
+    "assess",
+]
+
+# Bytes per parameter by dtype string.
+_DTYPE_BYTES = {"bf16": 2, "fp16": 2, "float16": 2, "bfloat16": 2,
+                "fp32": 4, "float32": 4, "fp8": 1, "int8": 1, "int4": 0.5}
+
+# Architectures whose clean TP is capped below head-count by the adapter. Mirrors
+# native_pytorch._fit_baseline_tp so the gate predicts the SAME tp the backend
+# will actually pick -- a gate that models different hardware than the runner is
+# worse than no gate.
+_TP_CAPS: tuple[tuple[str, int], ...] = (
+    ("Gemma4", 4),    # Global layers: head_dim 512 with 4 KV heads
+    ("Qwen3_5", 4),   # DeltaNet manual head-parallel adapter validated at tp4
+)
+
+
+@dataclass(frozen=True)
+class HardwareProfile:
+    """What a box actually offers. ``hbm_gb_per_core`` is the binding number."""
+
+    name: str
+    cores: int
+    hbm_gb_per_core: float
+    # Fraction of a core's HBM the weights may occupy; the rest is activations,
+    # KV cache and compiler scratch.
+    #
+    # CALIBRATED against observed trn2.48xlarge outcomes, not guessed. The
+    # backend's own comment suggests ~10 GB on a 24 GB core (0.42), but that is
+    # demonstrably too strict:
+    #
+    #   Qwen3.8-27B      13.3 GB/rank at tp=4  -> RAN, grader-verified 344 tok/s
+    #   Qwen3.5-35B-A3B  17.0 GB/rank at tp=4  -> OOM
+    #
+    # 0.60 (14.4 GB on a 24 GB core) is the only budget that puts the observed
+    # pass on one side and the observed OOM on the other. A stricter value would
+    # have rejected a model that works, which is the failure this gate must not
+    # make. Anything above `tight_frac` still runs but is reported as tight.
+    weight_budget_frac: float = 0.60
+    tight_frac: float = 0.42
+
+    @property
+    def usable_gb_per_core(self) -> float:
+        return self.hbm_gb_per_core * self.weight_budget_frac
+
+    @property
+    def comfortable_gb_per_core(self) -> float:
+        return self.hbm_gb_per_core * self.tight_frac
+
+    @property
+    def total_hbm_gb(self) -> float:
+        return self.hbm_gb_per_core * self.cores
+
+
+# LNC=2: 16 devices x 4 logical cores, 24 GB per logical core.
+TRN2_48XLARGE = HardwareProfile("trn2.48xlarge", cores=64, hbm_gb_per_core=24.0)
+TRN2_3XLARGE = HardwareProfile("trn2.3xlarge", cores=4, hbm_gb_per_core=24.0)
+
+
+@dataclass
+class Verdict:
+    """Outcome of a capability assessment.
+
+    ``ok`` False means do not spend a run. ``reason`` is written to be pasted
+    into a ticket: it carries the numbers, not just a category.
+    """
+
+    ok: bool
+    status: str                     # RUNNABLE | TOO_LARGE | NEEDS_MULTINODE | UNKNOWN
+    reason: str = ""
+    params: int = 0
+    weight_gb: float = 0.0
+    chosen_tp: int = 0
+    gb_per_rank: float = 0.0
+    budget_gb_per_rank: float = 0.0
+    min_tp_needed: int = 0
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def __bool__(self) -> bool:  # so `if assess(...):` reads naturally
+        return self.ok
+
+
+def _text_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Multimodal wrappers nest the LM config under ``text_config``."""
+    tc = config.get("text_config")
+    return tc if isinstance(tc, dict) else config
+
+
+def _int(cfg: dict[str, Any], key: str, default: int = 0) -> int:
+    v = cfg.get(key)
+    return v if isinstance(v, int) and not isinstance(v, bool) else default
+
+
+def architectures(config: dict[str, Any]) -> list[str]:
+    a = (config or {}).get("architectures")
+    return [str(x) for x in a] if isinstance(a, list) else []
+
+
+def estimate_params(config: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """Estimate total parameters, counting MoE experts.
+
+    Returns ``(params, breakdown)``. ``params == 0`` means the config could not
+    be sized (missing hidden_size/num_hidden_layers) -- callers must treat that
+    as UNKNOWN and proceed, never as "small".
+    """
+    tc = _text_config(config)
+    h = _int(tc, "hidden_size")
+    L = _int(tc, "num_hidden_layers")
+    if not h or not L:
+        return 0, {"reason": "config lacks hidden_size / num_hidden_layers"}
+
+    vocab = _int(tc, "vocab_size", 151936)
+    inter = _int(tc, "intermediate_size", 4 * h)
+    n_exp = _int(tc, "num_experts") or _int(tc, "n_routed_experts")
+    n_shared = _int(tc, "n_shared_experts") or _int(tc, "num_shared_experts")
+    moe_inter = _int(tc, "moe_intermediate_size", inter)
+
+    # Attention + norms, per layer. 4*h*h covers q/k/v/o at full width; GQA makes
+    # this a slight overestimate, which is the safe direction for a gate.
+    attn = 4 * h * h * L
+    if n_exp:
+        # Every expert carries its own gate/up/down (3 matrices of h x moe_inter).
+        # This is the term the dense formula drops.
+        mlp = 3 * h * moe_inter * (n_exp + n_shared) * L
+    else:
+        mlp = 3 * h * inter * L
+    embed = 2 * vocab * h          # input embedding + lm_head
+    params = attn + mlp + embed
+    return params, {
+        "hidden_size": h, "layers": L, "vocab": vocab,
+        "intermediate_size": inter, "moe_intermediate_size": moe_inter,
+        "num_experts": n_exp, "num_shared_experts": n_shared,
+        "attn_params": attn, "mlp_params": mlp, "embed_params": embed,
+        "is_moe": bool(n_exp),
+    }
+
+
+def max_clean_tp(config: dict[str, Any], hw: HardwareProfile) -> int:
+    """Largest TP this backend will actually use for the model.
+
+    Bounded by the adapter caps, the head count (TP must divide the query heads)
+    and the physical core count.
+    """
+    tc = _text_config(config)
+    archs = " ".join(architectures(config))
+    cap = hw.cores
+    for needle, capped in _TP_CAPS:
+        if needle.lower() in archs.lower():
+            cap = min(cap, capped)
+            break
+    heads = _int(tc, "num_attention_heads", 32)
+    best = 1
+    for tp in (1, 2, 4, 8, 16, 32, 64):
+        if tp <= cap and heads and heads % tp == 0:
+            best = tp
+    return best
+
+
+def _dtype_bytes(config: dict[str, Any], dtype: str | None) -> float:
+    key = (dtype or _text_config(config).get("dtype")
+           or config.get("torch_dtype") or "bf16")
+    return _DTYPE_BYTES.get(str(key).lower(), 2)
+
+
+def assess(
+    config: dict[str, Any],
+    hw: HardwareProfile = TRN2_48XLARGE,
+    *,
+    dtype: str | None = None,
+    node_count: int = 1,
+    weight_gb: float | None = None,
+) -> Verdict:
+    """Decide whether ``config`` can run on ``hw`` before spending anything.
+
+    ``weight_gb`` — measured total weight size, e.g. summed from the HF repo's
+    file metadata (one cheap API call, no download). PREFER IT. The config
+    estimate is a model of the architecture and it is only as good as that model:
+    it tracks Qwen3.5 MoE well (68 vs 71.9 GB actual; 239 vs 250.2) but is wrong
+    by 3.5x on DeepSeek-V4-Flash (564 vs 159.6, which uses compressed-KV
+    attention) and 7x on Kimi-K3. Sizing a model from a formula that does not
+    know its architecture is exactly the mistake this module exists to correct,
+    so when the real number is available it wins.
+
+    Never raises: an unsizeable config with no measured size yields UNKNOWN
+    (fail open).
+    """
+    params, breakdown = estimate_params(config)
+    if not params and weight_gb is None:
+        return Verdict(True, "UNKNOWN",
+                       reason=("cannot size this config ("
+                               f"{breakdown.get('reason', 'unknown shape')}) -- "
+                               "proceeding rather than blocking a model that may work"),
+                       details=breakdown)
+
+    if weight_gb is not None:
+        breakdown["weight_source"] = "measured"
+        breakdown["config_estimate_gb"] = round(
+            params * _dtype_bytes(config, dtype) / 1e9, 1) if params else None
+    else:
+        breakdown["weight_source"] = "config-estimate"
+        weight_gb = params * _dtype_bytes(config, dtype) / 1e9
+    tp = max_clean_tp(config, hw)
+    ranks = tp * max(1, node_count)
+    gb_per_rank = weight_gb / ranks
+    budget = hw.usable_gb_per_core
+    # Smallest power-of-two TP that would fit, ignoring the adapter cap.
+    min_tp = 1
+    while min_tp < 4096 and weight_gb / min_tp > budget:
+        min_tp *= 2
+
+    common = dict(params=params, weight_gb=round(weight_gb, 1), chosen_tp=tp,
+                  gb_per_rank=round(gb_per_rank, 1),
+                  budget_gb_per_rank=round(budget, 1),
+                  min_tp_needed=min_tp, details=breakdown)
+
+    if weight_gb > hw.total_hbm_gb * max(1, node_count):
+        return Verdict(
+            False, "NEEDS_MULTINODE",
+            reason=(f"{weight_gb:.0f} GB of weights exceeds the whole "
+                    f"{hw.name} ({hw.total_hbm_gb:.0f} GB HBM across "
+                    f"{hw.cores} cores) -- needs nodeCount>1, not a bigger TP"),
+            **common)
+
+    if gb_per_rank > budget:
+        moe = " (MoE: expert weights dominate)" if breakdown.get("is_moe") else ""
+        return Verdict(
+            False, "TOO_LARGE",
+            reason=(f"{weight_gb:.0f} GB of weights at tp={tp} is "
+                    f"{gb_per_rank:.0f} GB/rank, over the {budget:.0f} GB/rank "
+                    f"budget on {hw.name}{moe}; needs tp>={min_tp}"
+                    + (f", but this architecture is capped at tp={tp}"
+                       if min_tp > tp else "")),
+            **common)
+
+    if gb_per_rank > hw.comfortable_gb_per_core:
+        return Verdict(
+            True, "TIGHT",
+            reason=(f"{weight_gb:.0f} GB at tp={tp} = {gb_per_rank:.1f} GB/rank "
+                    f"fits the {budget:.0f} GB/rank ceiling but exceeds the "
+                    f"{hw.comfortable_gb_per_core:.0f} GB comfortable mark -- "
+                    f"expect high HBM occupancy and configs that add memory "
+                    f"(larger batch, cp>1) to OOM"),
+            **common)
+
+    return Verdict(True, "RUNNABLE",
+                   reason=(f"{weight_gb:.0f} GB at tp={tp} = {gb_per_rank:.1f} "
+                           f"GB/rank, within the {budget:.0f} GB/rank budget"),
+                   **common)
