@@ -463,6 +463,42 @@ def would_change(
 
 
 # --------------------------------------------------------------------------- #
+# consistency guard — LEADERBOARD.md rows MUST have a bundle in the same repo
+# --------------------------------------------------------------------------- #
+# Every leaderboard recipe link is `[recipe](./optimized_models/<rel>/)`. This is
+# the invariant that was silently violated (38 rows, 9 folders → 30 dead links).
+_RECIPE_LINK_RE = re.compile(r"\(\.?/?optimized_models/([^)\s]+?)/?\)")
+
+
+def leaderboard_recipe_dirs(leaderboard_text: str) -> list[str]:
+    """The ``optimized_models/<rel>`` dirs a LEADERBOARD.md links to (one per row).
+    Pure text parse — no filesystem. Empty for empty/None."""
+    if not leaderboard_text:
+        return []
+    return [m.group(1) for m in _RECIPE_LINK_RE.finditer(leaderboard_text)]
+
+
+def check_consistency(repo_dir: Path | str) -> list[str]:
+    """The anti-divergence guard: return the ``optimized_models/<rel>`` dirs that
+    ``LEADERBOARD.md`` links to but whose bundle (``recipe.json``) is NOT present
+    in ``repo_dir``. Empty list == consistent (every row has real, takeable code).
+
+    This is the single check that would have caught the 30 dead links: it does not
+    care WHICH writer produced the leaderboard — it only enforces that a row cannot
+    exist without its folder. Runs anywhere (CI, pre-push, publish preflight); no
+    deploy key, no network. Never raises."""
+    repo_dir = Path(repo_dir)
+    lb = _read(repo_dir / "LEADERBOARD.md")
+    if lb is None:
+        return []
+    broken: list[str] = []
+    for rel in leaderboard_recipe_dirs(lb):
+        if not (repo_dir / "optimized_models" / rel / "recipe.json").exists():
+            broken.append(rel)
+    return broken
+
+
+# --------------------------------------------------------------------------- #
 # Git plumbing (deploy-key, least privilege)
 # --------------------------------------------------------------------------- #
 def _ssh_env(deploy_key: str) -> dict[str, str]:
@@ -599,6 +635,31 @@ def publish(
             result["noop"] = True
             return result
 
+        # 3b. ANTI-DIVERGENCE GUARD — refuse to push a LEADERBOARD.md that links to
+        # a bundle not present in the repo. Belt-and-suspenders (render_leaderboard
+        # only lists collect_verified folders, so this is consistent by
+        # construction), but it also catches the vector that actually bit us: a
+        # folder hidden from git (e.g. .gitignore) so `git add` staged the
+        # leaderboard but not the folders it references. Two checks: (a) the folder
+        # exists on disk, (b) git actually TRACKS the referenced recipe.json.
+        broken_disk = check_consistency(repo_dir)
+        tracked = set(_git(["ls-files", "optimized_models"], repo_dir, env,
+                           check=False).stdout.splitlines())
+        lb_text = _read(repo_dir / "LEADERBOARD.md") or ""
+        broken_git = [rel for rel in leaderboard_recipe_dirs(lb_text)
+                      if f"optimized_models/{rel}/recipe.json" not in tracked]
+        broken = sorted(set(broken_disk) | set(broken_git))
+        if broken:
+            msg = ("ABORT: LEADERBOARD.md links to bundle(s) not present/tracked in "
+                   f"the repo — would create dead links: {broken}. Not committing or "
+                   "pushing. (Publish the folders, or check .gitignore is not hiding "
+                   "optimized_models/.)")
+            _log(msg)
+            result["error"] = "leaderboard_folder_divergence"
+            result["broken_links"] = broken
+            _git(["reset"], repo_dir, env, check=False)  # unstage; leave tree clean
+            return result
+
         # 4. Commit as the showcase author, then rebase-safe push via deploy key.
         n = len(deliverables)
         msg = f"auto-publish: {n} verified model{'s' if n != 1 else ''} + leaderboard"
@@ -639,11 +700,25 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="(default) report what would change and write nothing")
     p.add_argument("--push", dest="dry_run", action="store_false",
                    help="actually commit and push the showcase")
+    p.add_argument("--check", action="store_true",
+                   help="CONSISTENCY GUARD ONLY: verify every LEADERBOARD.md recipe "
+                        "link resolves to a bundle in --repo-dir; exit 1 on any dead "
+                        "link. No deploy key / network — for CI and pre-push hooks.")
     return p
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
+    # --check is the standalone anti-divergence guard (CI / pre-push). It never
+    # writes or pushes, so it needs no deploy key.
+    if args.check:
+        broken = check_consistency(args.repo_dir)
+        if broken:
+            _log(f"CONSISTENCY FAIL: {len(broken)} LEADERBOARD.md row(s) link to a "
+                 f"missing bundle (dead links): {broken}")
+            return 1
+        _log("consistency OK: every LEADERBOARD.md row has a bundle in the repo")
+        return 0
     result = publish(
         repo_dir=args.repo_dir,
         deploy_key=args.deploy_key,

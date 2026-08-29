@@ -54,7 +54,9 @@ def test_latency_and_fill_lessons_seeded():
 
 def test_overnight_runs_multiple_cycles(tmp_path: Path, monkeypatch):
     """The driver must keep working across cycles (not run once and exit), write
-    a leaderboard each cycle, and invoke auto-promotion so cycles compound."""
+    a per-cycle RUN_SUMMARY each cycle, and invoke auto-promotion so cycles
+    compound. (overnight writes RUN_SUMMARY.md — the canonical LEADERBOARD.md is
+    owned by publish_deliverables, derived from the optimized_models/ bundles.)"""
     import overnight
     art = tmp_path / "art"
     argv = [
@@ -65,7 +67,7 @@ def test_overnight_runs_multiple_cycles(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(sys, "argv", argv)
     overnight.main()
 
-    assert (art / "LEADERBOARD.md").exists()
+    assert (art / "RUN_SUMMARY.md").exists()   # per-cycle summary, not the canonical board
     log = (art / "OVERNIGHT_LOG.md").read_text()
     assert "cycle 1 done" in log
     assert "cycle 2 done" in log            # it did NOT stop after one pass

@@ -262,6 +262,81 @@ def test_would_change_detects_noop_after_publish():
 
 
 # --------------------------------------------------------------------------- #
+# check_consistency — the anti-divergence guard (the 38-rows / 9-folders bug)
+# --------------------------------------------------------------------------- #
+from publish_deliverables import check_consistency, leaderboard_recipe_dirs
+
+
+def test_leaderboard_recipe_dirs_parses_links():
+    lb = (
+        "| 🥇 | A | f | 1B | 1 | 2 | 2× | c | trn2.3xlarge | ✅ | "
+        "[recipe](./optimized_models/model-a/) |\n"
+        "| 2 | B | f | 1B | 1 | 2 | 2× | c | trn2.3xlarge | ✅ | "
+        "[recipe](./optimized_models/fam/model-b/) |\n"
+    )
+    assert leaderboard_recipe_dirs(lb) == ["model-a", "fam/model-b"]
+    assert leaderboard_recipe_dirs("") == []
+
+
+def test_check_consistency_passes_when_every_row_has_a_bundle():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp)
+        _write_bundle(repo / "optimized_models", "model-a",
+                      _recipe("org/Model-A", speedup=2.0, baseline=1, best=2))
+        (repo / "LEADERBOARD.md").write_text(
+            "x [recipe](./optimized_models/model-a/) y")
+        assert check_consistency(repo) == []
+
+
+def test_check_consistency_flags_dead_links():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp)
+        _write_bundle(repo / "optimized_models", "model-a",
+                      _recipe("org/Model-A", speedup=2.0, baseline=1, best=2))
+        # leaderboard links a-and-b, but only a has a folder -> b is a dead link
+        (repo / "LEADERBOARD.md").write_text(
+            "[recipe](./optimized_models/model-a/) "
+            "[recipe](./optimized_models/model-b/)")
+        broken = check_consistency(repo)
+        assert broken == ["model-b"]
+
+
+def test_check_consistency_no_leaderboard_is_clean():
+    with tempfile.TemporaryDirectory() as tmp:
+        assert check_consistency(Path(tmp)) == []
+
+
+def test_render_leaderboard_output_is_self_consistent():
+    # render_leaderboard is the source of truth: what it emits must always pass
+    # check_consistency against the same bundle tree it was rendered from.
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp)
+        src = repo / "optimized_models"
+        _standard_tree(src)
+        dels = collect_verified(src)
+        (repo / "LEADERBOARD.md").write_text(render_leaderboard(dels))
+        assert check_consistency(repo) == []
+
+
+def test_overnight_writes_run_summary_not_leaderboard():
+    # overnight's per-cycle summary must NOT clobber the canonical LEADERBOARD.md.
+    import overnight
+    from dataclasses import dataclass
+
+    @dataclass
+    class _R:
+        slug: str; ok: bool; baseline: float; best: float
+        speedup: float; attempts: int; error: str = ""; skipped: bool = False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        p = overnight.write_leaderboard(
+            [_R("m", True, 100.0, 200.0, 2.0, 1)], out, "mock", cycle=1)
+        assert p.name == "RUN_SUMMARY.md"
+        assert not (out / "LEADERBOARD.md").exists()
+
+
+# --------------------------------------------------------------------------- #
 # Standalone runner (no pytest needed)
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
