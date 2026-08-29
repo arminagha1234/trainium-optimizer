@@ -194,6 +194,7 @@ most speculative last. Full detail in
 | 3 **Borrow** | port patterns from vLLM/SGLang/TRT-LLM/FA | Med | Steal first — references encode years of tuning |
 | 4 **Invent** | novel NKI from profile + roofline | High | Only wins if it beats Stage 3 by **5%** |
 | 5 Graph rewrite | fusion, reordering, layout | High | Last, because it interacts with everything prior |
+| 6 **Decode algorithm** (candidate) | speculative decoding (draft-heads + verify) | Med-high | New axis — attacks the bs=1 *host-bound* decode floor that kernels can't; portable, see below |
 
 **Borrow before invent** is the governing principle. A CUDA paged-attention
 kernel represents thousands of engineer-hours and millions of production
@@ -208,6 +209,39 @@ us, today, on our shapes. On a near-tie, prefer the better-tested artifact.
 
 Losing invented kernels are **not discarded** — they become `provisional`
 lessons recording the attempt and why it lost.
+
+### Stage 6 — speculative decoding as a candidate technique axis (from ModelOpt)
+
+Stages 0-5 optimize a model's *ops*. But our on-device truth is that bs=1
+decode is **host-bound** (device >99% idle) — a bottleneck no faster kernel can
+move, because the device is already waiting on the host. The only lever that
+attacks it is a change to the *decode algorithm itself*. NVIDIA Model-Optimizer
+(ModelOpt) is the reference to steal from here — see
+[`references-analysis.md` §5](./references-analysis.md).
+
+- **Steal speculative decoding (Medusa / EAGLE), not quantization.** Of
+  ModelOpt's menu, spec-decode is the one technique that is fully **portable**
+  to trn2 (draft-heads + a verify pass — no special precision), directly hits
+  our *measured* bottleneck, and has mature reference implementations
+  (`modelopt.torch.speculative`, `fastgen`) we can **harvest** rather than
+  invent. Quantization is a weak trn2 lever (fp8-only; NVFP4/INT4/INT8 are
+  GPU-only; mxfp4 is trn3-only — see the precision table above), so it is *not*
+  the steal.
+- **The deeper steal is the abstraction, not the technique.** ModelOpt models
+  every technique as one composable transform (`apply(model, cfg) → export`).
+  Adopting that — a uniform `OptimizationTechnique` interface that config-search,
+  kernel-swap, and spec-decode all implement — turns "add a new axis" from loop
+  surgery into writing one pluggable module, which is what lets the autonomous
+  loop explore a richer space. Spec-decode becomes the first technique that
+  proves the interface; fp8 PTQ and (future) prune+distill slot in behind it.
+- **Correctness gate reuses `task_eval`.** A spec-decode candidate is *exactly*
+  the case the logprob/KL-agreement gate (Milestone B) was built for: verify the
+  draft-verified output agrees with the baseline, measure decode speedup, publish
+  per-(model, hardware).
+- **Status: candidate, not committed.** Sequenced after the Milestone A→E
+  closure; it is a decode-latency axis for the 48xl serving targets, not a
+  Phase-1 kernel task. Harvest ModelOpt's draft-head architectures first (borrow
+  before invent); add ModelOpt to `kernel_sources.yaml` as a spec-decode source.
 
 ### Phase-1 instrumentation: does it ever invent anything?
 
