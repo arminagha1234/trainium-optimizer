@@ -62,6 +62,9 @@ def _shape_input_len(shape: str) -> int:
 
 _ERR_TAIL_CHARS = 4000
 
+# torchrun --tee prefixes each rank's own stream, e.g. "[rank1]: ...".
+_RANK_PREFIX = re.compile(r"^\s*\[rank\d+\]:")
+
 # Ordered, most-specific-first. Recognising the common shapes turns an opaque
 # metric=0.0 into an actionable line without needing the full log.
 _ERR_SIGNATURES: tuple[tuple[str, str], ...] = (
@@ -75,7 +78,15 @@ _ERR_SIGNATURES: tuple[tuple[str, str], ...] = (
                                        "(set dynamic=False / pin the batch)"),
     ("not supported", "unsupported architecture/op for this backend"),
     ("CUDA", "worker tried a CUDA path on a Neuron device"),
-    ("torch.distributed", "collective/TP initialisation failed"),
+    # NOT a bare "torch.distributed" match: torchrun's own ChildFailedError
+    # wrapper names torch.distributed on EVERY worker failure, so that
+    # signature mislabelled unrelated crashes as collective failures (a real
+    # AttributeError on rank1 was reported as "collective/TP initialisation
+    # failed"). Match only markers that genuinely mean the collective failed.
+    ("init_process_group", "collective/TP initialisation failed"),
+    ("device barrier", "collective/TP initialisation failed"),
+    ("ProcessGroup", "collective/TP initialisation failed"),
+    ("aws-ofi-nccl", "collective transport init failed"),
     ("Killed", "worker was killed (OOM-killer / host memory)"),
 )
 
@@ -123,6 +134,13 @@ def _worker_failure_reason(rc: int | None, err_tail: str) -> str:
     if not tail:
         return f"worker exited rc={rc} with no stderr"
     lines = [ln for ln in tail.splitlines() if not _is_noise(ln)]
+    # Under --tee each rank's own output is prefixed "[rankN]:". Those lines are
+    # the CHILD speaking; everything else is torchrun framing. When any exist,
+    # restrict the search to them so the launcher's boilerplate cannot outrank
+    # the actual exception.
+    rank_lines = [ln for ln in lines if _RANK_PREFIX.search(ln)]
+    if rank_lines:
+        lines = rank_lines
     label, matched = "", ""
     for pat, lbl in _ERR_SIGNATURES:
         hit = next((ln for ln in reversed(lines) if pat.lower() in ln.lower()), "")
