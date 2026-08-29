@@ -97,6 +97,11 @@ def shard_model(model, r, tp):
             shard_attention(L.self_attn, r, tp); n_attn += 1
         if hasattr(L, "linear_attn"):
             shard_deltanet(L.linear_attn, r, tp); n_dn += 1
+        # NOTE: a sparse MoE block has L.mlp.experts + L.mlp.gate and NO top-level
+        # gate_proj, so this dense branch SKIPS it — leaving every expert whole on
+        # every rank (the Qwen3.5-30B OOM). To shard MoE experts add a shard_moe
+        # (expert-TP) branch gated on hasattr(L.mlp, "experts"). Full method +
+        # ready snippet: docs/large-model-playbook.md ("MoE placement fix").
         if hasattr(L, "mlp") and hasattr(L.mlp, "gate_proj"):
             shard_mlp(L.mlp, r, tp); n_mlp += 1
     return n_attn, n_dn, n_mlp
