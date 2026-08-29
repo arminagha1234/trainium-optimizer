@@ -3,7 +3,9 @@ Overnight driver — the autonomous, no-human-in-the-loop run.
 
 Loops over the seed models, runs the stage pipeline on each within phase
 budgets, publishes each recipe, emits lessons to the knowledge bank, and
-writes a running log plus a final cross-model leaderboard. Never stops to ask.
+writes a running log plus a per-cycle RUN_SUMMARY.md (the canonical LEADERBOARD.md
+is owned by publish_deliverables, derived from the optimized_models/ bundles).
+Never stops to ask.
 
 Backend-agnostic by design: pass --backend mock to prove the whole thing end
 to end in minutes (synthetic numbers), or --backend native-pytorch-beta3 once
@@ -539,11 +541,19 @@ def _emit_lesson(bank, slug, spec, best, sdk_version, log,
 
 def write_leaderboard(results: list[ModelResult], out_root: Path, backend: str,
                       cycle: int | None = None) -> Path:
-    """Cross-model summary — the morning artifact. Rewritten each cycle so the
-    file is always the latest snapshot of a continuous run."""
+    """Per-cycle RUN SUMMARY — the morning artifact (ok / skipped / FAILED per
+    model this cycle). Rewritten each cycle so the file is always the latest
+    snapshot of a continuous run.
+
+    NOTE: writes ``RUN_SUMMARY.md``, NOT ``LEADERBOARD.md``. The canonical
+    leaderboard is owned SOLELY by ``publish_deliverables.render_leaderboard`` and
+    is derived from the on-disk ``optimized_models/`` bundles — so a row can never
+    exist without its folder. This summary is generated from in-memory run results
+    (which include failed/skipped models with no bundle), so it must NOT clobber
+    the canonical file — doing so is exactly what created 30 dead recipe links."""
     cyc = f"  |  Cycle: {cycle}" if cycle else ""
     lines = [
-        "# Overnight Run — Leaderboard",
+        "# Overnight Run — Summary (this cycle)",
         "",
         f"Backend: `{backend}`  |  Generated: "
         f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}{cyc}",
@@ -574,7 +584,9 @@ def write_leaderboard(results: list[ModelResult], out_root: Path, backend: str,
         else:
             lines.append(f"| {r.slug} | FAILED | — | — | — | — |")
             lines.append(f"|  |  ↳ {r.error[:80]} |  |  |  |  |")
-    path = out_root / "LEADERBOARD.md"
+    # RUN_SUMMARY.md, never LEADERBOARD.md — the canonical leaderboard is owned by
+    # publish_deliverables (folder-derived). See the docstring.
+    path = out_root / "RUN_SUMMARY.md"
     path.write_text("\n".join(lines) + "\n")
     return path
 
@@ -761,7 +773,7 @@ def main() -> None:
                 if n:
                     log(f"auto-promoted {n} provisional lesson(s) -> verified")
 
-            board = write_leaderboard(results, out_root, a.backend, cycle)
+            board = write_leaderboard(results, out_root, a.backend, cycle)  # RUN_SUMMARY.md
             # And the picture next to the table — the cross-model bar chart.
             # Failure to render is non-fatal so it never breaks the run loop.
             try:
