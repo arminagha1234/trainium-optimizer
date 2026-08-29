@@ -99,3 +99,58 @@ Opt #3 (pipeline). Waiting on a `q`-prefixed semaphore (`qSyncIO0` load,
   tokens; `roofline.py` — per-bottleneck `good_sol_bar` (90%/60%).
 - `kernel_perf.KernelPerfLoop.diagnose` — routes to `specific_guidance`
   (perf_hints) and converges against the per-bottleneck bar.
+
+## Trainium2 / NeuronCore-v3 arch numbers (banked, 2026-08-29)
+
+From the official Trn2 arch doc
+(<https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/guides/architecture/trainium2_arch.html>).
+These set/confirm our roofline constants and engine model.
+
+| Quantity | Value | Notes |
+|---|---|---|
+| NeuronCores / chip | **8** (v3) | our "per core" = one NeuronCore-v3 |
+| Tensor engine — **dense bf16/fp16/tf32** | **79 TFLOPS/core** | 128×128 @ 2.4 GHz × 2 flop; `roofline.PEAK_TFLOPS_BF16_PER_CORE` (was 380, **corrected**) |
+| Tensor engine — dense fp8 | 158 TFLOPS/core | 256×128 effective; `PEAK_TFLOPS_FP8_PER_CORE` |
+| Tensor engine — dense fp32 | 20 TFLOPS/core | `PEAK_TFLOPS_FP32_PER_CORE` |
+| Tensor engine — 2:4 sparse | 316 TFLOPS/core | `PEAK_TFLOPS_BF16_SPARSE_PER_CORE` |
+| HBM | **96 GiB @ 3 TB/s device** | ÷8 = 375 GB/s/core ≈ measured 385 GB/s ✓ |
+| SBUF | **28 MiB/core** (128 × 224 KiB) | — |
+| PSUM | **2 MiB/core** | — |
+| DMA engines | **16/core** (128/device) | confirms Opt #9 "all 16 DMA engines" |
+| GpSimd integrated DMA | **307 GB/s (153 GB/s/dir)** | quantifies why an indirect gather is slow |
+| Engine clocks | Tensor 2.4, Scalar/GpSimd 1.2, Vector 0.96 GHz | — |
+| NeuronLink | **4× v3** device-to-device | keep multi-core intermediates in HBM, gather over NeuronLink (UniVR 98→14.5 ms) |
+
+**⚠️ Correction banked:** the prior `380e12` bf16 compute constant was ~4.8× too
+high — it matched no dense figure and made `sol_compute_bound` read ~4.8× too low,
+so the profitability gate wrongly flagged near-SOL GEMMs as "worth authoring."
+Corrected to 79e12 (dense bf16) from the doc + first principles; worth one
+on-device compute-bound race to confirm.
+
+## Static-addressing / gather-as-matmul (the UniVR win — a new op class)
+
+The UniVR shutter-unroll optimization is our thesis on a new op family: it turned
+a compiler-weak **indirect-DMA** op (`F.interpolate` bilinear) into compiler-strong
+TensorE work, **13× cumulative**.
+
+- **GpSimd-bound is a first-class bottleneck.** An indirect/dynamic gather runs on
+  GpSimd's programmable procs + its slow integrated DMA (153 GB/s/dir) and
+  serializes while TensorE idles. UniVR measured GpSimd 71% → 33.8%, TensorE 2.4%
+  → 21.9% → 67%. `neuron_profile` now emits `gpsimd_bound` (distinct from
+  `single_engine`); `perf_hints` routes it to the two levers below.
+- **Lever 1 — host-static-addressing** (`nki_knowledge` technique): if sampling
+  indices are data-independent at trace time, compute them on the host and bake as
+  compile-time constants → every DMA static-addressed (758.9 → 106 ms, 7×).
+- **Lever 2 — gather-as-matmul** (`nki_knowledge` technique + `indirect_gather` op
+  family in `opportunity.py`): a fixed-pattern gather/interpolate/upsample is
+  linear → `out = W @ x` with a precomputed mostly-zero weight matrix, run on
+  TensorE (107 → 55.6 ms, 1.92×, TensorE → 67% busiest).
+- **Honest limit:** STATIC access patterns only. Data-dependent gathers (KV-cache
+  paging, MoE token dispatch) can't bake indices as constants — do NOT apply there.
+- **Multi-core lesson (48xl playbook):** per-core tile ownership + halo; collect
+  results in HBM over NeuronLink, never round-trip host memory (98 → 14.5 ms, 6.8×).
+  And sequence the search "maximize single-core FLOPs first, THEN re-derive tile
+  size + core count" — a faster tile changes both.
+- **Reporting discipline:** report a domain fidelity metric (PSNR / max-error, e.g.
+  UniVR's 97.22 dB / 0.73 LSB) *and* a GPU baseline (trn3 268 ms vs L40S 351 ms)
+  next to the speed number — for `task_eval` and the leaderboard.

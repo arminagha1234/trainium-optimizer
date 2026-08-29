@@ -13,7 +13,16 @@ import roofline as rf
 
 def test_peak_constants_are_the_measured_ones():
     assert rf.PEAK_HBM_BW_PER_CORE == 385e9
-    assert rf.PEAK_TFLOPS_BF16_PER_CORE == 380e12
+    # dense bf16 per NeuronCore-v3, corrected from 380e12 (arch doc + first principles)
+    assert rf.PEAK_TFLOPS_BF16_PER_CORE == 79e12
+    assert rf.PEAK_TFLOPS_FP8_PER_CORE == 158e12
+    assert rf.PEAK_TFLOPS_FP32_PER_CORE == 20e12
+    assert rf.PEAK_TFLOPS_BF16_SPARSE_PER_CORE == 316e12
+    # dtype-aware ceiling picker
+    assert rf.peak_tflops("bf16") == 79e12
+    assert rf.peak_tflops("fp8") == 158e12
+    assert rf.peak_tflops("fp32") == 20e12
+    assert rf.peak_tflops("bf16", sparse=True) == 316e12
 
 
 def test_memory_bound_sol_at_peak_is_one():
@@ -69,7 +78,8 @@ def test_profitability_picks_right_ceiling():
     pm = rf.profitability(bytes_moved=385e6, flops=0.0, device_s=385e6 / 385e9,
                           bottleneck="memory_bound")
     assert pm.bottleneck == "memory_bound" and abs(pm.sol - 1.0) < 1e-9
-    pc = rf.profitability(bytes_moved=0.0, flops=380e9, device_s=380e9 / 380e12,
+    pc = rf.profitability(bytes_moved=0.0, flops=79e9,
+                          device_s=79e9 / rf.PEAK_TFLOPS_BF16_PER_CORE,
                           bottleneck="compute_bound")
     assert pc.bottleneck == "compute_bound" and abs(pc.sol - 1.0) < 1e-9
 

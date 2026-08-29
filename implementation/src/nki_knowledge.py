@@ -52,10 +52,12 @@ SOFTMAX = "softmax"
 ATTENTION = "attention"
 SCAN = "scan"          # scan / SSM / linear-attention (Mamba-2, GatedDeltaNet, KDA)
 MOE_ROUTER = "moe_router"
+INDIRECT_GATHER = "indirect_gather"   # gather/interpolate/resample/scatter w/ a STATIC
+                                      # access pattern — win = gather-as-matmul on TensorE
 
 OP_FAMILIES = (
     ELEMENTWISE, REDUCTION, NORMALIZATION, MATMUL,
-    SOFTMAX, ATTENTION, SCAN, MOE_ROUTER,
+    SOFTMAX, ATTENTION, SCAN, MOE_ROUTER, INDIRECT_GATHER,
 )
 
 
@@ -178,6 +180,29 @@ TECHNIQUES: dict[str, str] = {
         "(TensorE partition-reduce via matmul-against-ones vs VectorE free-axis "
         "tensor_reduce). If a transpose is unavoidable AND memory-bound, use nl.load()"
         " + nisa.nc_transpose() tiled, NOT nl.load_transpose2d (lower DMA bandwidth).",
+    # --- static-addressing / gather-as-matmul (UniVR shutter-unroll win) --------
+    # An indirect/dynamic gather (data-dependent DMA addresses) runs on GpSimd's
+    # programmable procs + slow integrated DMA (~153 GB/s/dir) and serializes while
+    # TensorE sits idle. Two levers turn it into compiler-strong work — proven on
+    # the UniVR model: F.interpolate 758.9->106 ms (7x) by static addressing, then
+    # ->55.6 ms (1.92x) by the gather-as-matmul, TensorE 2.4%->67%, 13x cumulative.
+    "host-static-addressing":
+        "If sampling indices / DMA offsets are DATA-INDEPENDENT at trace time, "
+        "compute them on the HOST and bake them in as COMPILE-TIME CONSTANTS so "
+        "every load is STATIC-addressed. An indirect/dynamic gather runs on GpSimd's "
+        "~153 GB/s/dir integrated DMA and serializes on a programmable engine; static "
+        "addressing frees GpSimd and lets the load stream at HBM peak. Diagnostic: "
+        "GpSimd busiest while TensorE idle (gpsimd_bound). Applies ONLY to static "
+        "access patterns — NOT data-dependent gathers (KV-paging, MoE dispatch).",
+    "gather-as-matmul":
+        "A gather / interpolate / resample / scatter with a FIXED (data-independent) "
+        "access pattern is a LINEAR op — express it as `out = W @ x` with a "
+        "precomputed, mostly-ZERO weight matrix (e.g. bilinear = 4 non-zeros per "
+        "output row at the corner taps; upsample / one-hot dispatch similarly). "
+        "Trades the indirect-DMA/GpSimd bottleneck for a single STATIC-addressed "
+        "matmul on TensorE (the strongest engine). Build W on the HOST once. This is "
+        "the framework's whole thesis on a new op class: move a compiler-weak "
+        "indirect op onto the compiler-strong systolic array. STATIC patterns only.",
     # --- harvested from AWShtokoyo/vllm-neuron (see docs/vllm-neuron-harvest.md) ---
     "sequential-range-for-scan":
         "A loop-carried read-modify-write (a scan's recurrent state, a flash "
@@ -276,6 +301,13 @@ LANDMINES: dict[str, str] = {
         "collapse to the FIRST index under torch-xla — aliasing every head/expert to "
         "index 0 (silent wrong output, compiles clean). Do ONE multi-partition DMA "
         "(the varying axis on the partition dim) + an on-chip nc_transpose instead.",
+    "static-pattern-only":
+        "The gather-as-matmul / host-static-addressing win applies ONLY when the "
+        "access pattern is DATA-INDEPENDENT (known at trace time): image "
+        "interpolate/upsample, fixed resample grids, one-hot dispatch. Do NOT apply "
+        "it to DATA-DEPENDENT gathers whose indices come from runtime values "
+        "(KV-cache paging, MoE token dispatch, argmax-driven selection) — there the "
+        "indices cannot be baked as constants and the weight matrix is not fixed.",
     "partial-rope-zero-freq":
         "Partial RoPE (only the first r dims rotate): the inv_freq denominator is "
         "still the FULL head_dim; the non-rotary tail gets zero-frequency "
@@ -487,6 +519,25 @@ _EX_MOE_ROUTER = WorkedExample(
 )
 
 
+_EX_GATHER_MATMUL = WorkedExample(
+    "Bilinear interpolate as a static matmul (gather-as-matmul; UniVR shutter-unroll)",
+    """# INDIRECT gather (SLOW): out[i] = bilinear(in, sample_xy[i]) via 4 data-
+# dependent DMA reads per output -> runs on GpSimd's ~153 GB/s/dir integrated
+# DMA, serializes while TensorE idles (gpsimd_bound).
+#
+# STATIC-MATMUL form (FAST) — the sample grid is data-INDEPENDENT, so:
+#   1. HOST: build W [n_out, n_in], ZERO except the 4 bilinear corner taps per
+#      output row (weights = the fractional areas). Bake W as a constant.
+#   2. DEVICE: out = W @ x   -> ONE static-addressed nc_matmul on TensorE.
+#      psum = nisa.nc_matmul(W_tile, x_tile)   # W [K<=128, n_out<=128] stationary
+#                                              # x [K<=128, n_in_free<=512] moving
+# W is sparse but STATIC -> no indirect DMA, no GpSimd. TensorE 2.4% -> 67%.""",
+    "From the UniVR shutter-unroll optimization: F.interpolate 758.9->106 ms (7x) by "
+    "host-static addressing, then ->55.6 ms (1.92x) by this gather-as-matmul, 13x "
+    "cumulative. STATIC access patterns ONLY (static-pattern-only landmine).",
+)
+
+
 # ---------------------------------------------------------------------------
 # the knowledge entries — one per op family
 # ---------------------------------------------------------------------------
@@ -604,6 +655,21 @@ KNOWLEDGE: dict[str, KnowledgeEntry] = {
         ("topk-k-limit", "no-1d-collapse", "no-dst-param", "moving-free-512"),
         (_EX_MOE_ROUTER,),
     ),
+    INDIRECT_GATHER: KnowledgeEntry(
+        INDIRECT_GATHER,
+        "A gather / interpolate / resample / upsample / scatter with a STATIC "
+        "(data-independent) access pattern. The naive lowering is an indirect DMA "
+        "on GpSimd — slow (~153 GB/s/dir) and serial while TensorE idles. THE win: "
+        "compute the access indices on the host (static addressing), then express "
+        "the whole linear resample as ONE matmul `out = W @ x` with a precomputed "
+        "mostly-zero weight matrix — moving the work onto TensorE. Static patterns "
+        "ONLY (not KV-paging / MoE dispatch).",
+        ("gather-as-matmul", "host-static-addressing", "isa-return-form",
+         "tile-to-hw-limits", "psum-native-accumulation", "wide-aligned-tiles"),
+        ("nc_matmul", "nc_transpose"),
+        ("static-pattern-only", "no-dst-param", "moving-free-512", "partition-le-128"),
+        (_EX_GATHER_MATMUL,),
+    ),
 }
 
 
@@ -624,6 +690,12 @@ _FAMILY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
                    "selective_scan", "state space", "state-space")),
     (MOE_ROUTER,  ("router", "topk", "top_k", "top-k", "moe", "expert",
                    "gating", "gate_logits", "affinit")),
+    # indirect_gather BEFORE the generic families so interpolate/upsample/gather
+    # ops don't fall through to elementwise (they are a high-value authoring
+    # target — the gather-as-matmul win — not a cheap pointwise op).
+    (INDIRECT_GATHER, ("interpolate", "grid_sample", "grid-sample", "resample",
+                       "upsample", "bilinear", "index_select", "gather", "scatter",
+                       "warp", "remap")),
     (SOFTMAX,     ("softmax",)),
     (NORMALIZATION, ("rmsnorm", "layernorm", "rms_norm", "layer_norm", "groupnorm",
                      "group_norm", "batchnorm", "norm")),

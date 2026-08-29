@@ -89,7 +89,7 @@ def test_parse_list_of_records():
     b = parse_profile_json([
         {"name": "PE", "busy": 0.5},
         {"name": "VectorEngine", "busy": 0.3}])
-    assert b["pe"] == 0.5 and b["pool"] == 0.3
+    assert b["pe"] == 0.5 and b["vector"] == 0.3   # Vector is its own engine now
 
 
 def test_parse_garbage_is_empty():
@@ -154,8 +154,9 @@ def test_parse_explorer_node_maps_engines():
     b = parse_neuron_explorer_summary(_EXPLORER_NODE)
     assert abs(b["pe"] - 0.110) < 1e-9      # tensor_engine, NOT instruction_count(55)
     assert abs(b["act"] - 0.383) < 1e-9     # scalar_engine
-    assert abs(b["pool"] - 0.563) < 1e-9    # gpsimd_engine
+    assert abs(b["gpsimd"] - 0.563) < 1e-9  # gpsimd_engine — its OWN engine now
     assert abs(b["dma"] - 0.476) < 1e-9
+    assert "vector" not in b                # node has no vector key -> omitted
 
 
 def test_parse_explorer_wrapped_by_node_id():
@@ -170,12 +171,16 @@ def test_parse_profile_json_detects_explorer_schema():
     assert b["pe"] == 0.110 and "pe" in b and b["pe"] < 1.0
 
 
-def test_explorer_node_routes_to_single_engine_via_summarize():
-    from neuron_profile import summarize, SINGLE_ENGINE
+def test_explorer_node_routes_to_gpsimd_bound_via_summarize():
+    from neuron_profile import summarize, GPSIMD_BOUND, perf_symptoms
     b = parse_neuron_explorer_summary(_EXPLORER_NODE)
-    # gpsimd(pool) 56% busiest, nothing saturated, dma 48% (not >= pool*1.1) -> pool serial
+    # GpSimd 56% busiest while TensorE sits at 11% (dma 48% < gpsimd*1.1) — this real
+    # capture is an INDIRECT-GATHER profile; the old code mislabelled it single_engine.
     r = summarize(b)
-    assert r.dominant in (SINGLE_ENGINE,)  # pool 0.563 busiest, dma 0.476 < 0.563*1.1
+    assert r.dominant == GPSIMD_BOUND
+    assert "gpsimd" in r.reason.lower()
+    toks = set(perf_symptoms(r))
+    assert "gpsimd-bound" in toks and "indirect-dma" in toks
 
 
 def test_multiple_explorer_nodes_picks_busiest():

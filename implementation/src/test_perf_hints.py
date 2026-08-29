@@ -179,3 +179,73 @@ def test_converged_honors_per_bottleneck_bar():
     assert loop._converged(_Race(bottleneck="memory_bound", sol=0.62))
     # compute-bound at 62% is NOT converged (< 90% bar)
     assert not loop._converged(_Race(bottleneck="compute_bound", sol=0.62))
+
+
+# --- UniVR: GpSimd-bound / indirect-gather -> static-addressing + gather-as-matmul
+def test_gpsimd_bound_summarize_and_symptoms():
+    # GpSimd busiest while TensorE idle -> gpsimd_bound (not single_engine).
+    rep = np_mod.summarize({"pe": 0.05, "act": 0.10, "gpsimd": 0.70, "dma": 0.30})
+    assert rep.dominant == np_mod.GPSIMD_BOUND
+    toks = set(np_mod.perf_symptoms(rep))
+    assert "gpsimd-bound" in toks and "indirect-dma" in toks
+    assert toks <= set(perf_hints.SYMPTOM_TOKENS)
+
+
+def test_gpsimd_reason_routes_classifier_and_hint():
+    rep = np_mod.summarize({"pe": 0.05, "gpsimd": 0.70, "dma": 0.30})
+    assert kernel_perf.classify_bottleneck(_Race(reason=rep.reason)) == kernel_perf.GPSIMD_BOUND
+    hits = [h.key for h in perf_hints.match_perf_hints(perf_hints.symptoms_from(
+        "gpsimd_bound", reason=rep.reason))]
+    assert "indirect-gather-static-or-matmul" in hits
+
+
+def test_interpolate_op_name_routes_to_gather_as_matmul():
+    g = perf_hints.guidance_from_symptoms("", op_name="F_interpolate",
+                                          op_family="indirect_gather")
+    assert g and "matmul" in g[0].lower()
+
+
+def test_single_engine_reason_does_not_misroute_to_gpsimd():
+    # a single-engine reason must NOT list "GPSIMD 0%" and trip the gpsimd path
+    rep = np_mod.summarize({"act": 0.5, "pe": 0.05, "dma": 0.05})
+    assert rep.dominant == np_mod.SINGLE_ENGINE
+    assert kernel_perf.classify_bottleneck(_Race(reason=rep.reason)) == kernel_perf.SINGLE_ENGINE
+    # and perf_hints must not fire the INDIRECT-GATHER hint on it (a single-engine
+    # reason may legitimately fire the Opt #6 combine/overlap hint — that's fine).
+    hits = [h.key for h in perf_hints.match_perf_hints(perf_hints.symptoms_from(
+        "single_engine", reason=rep.reason, op_family="normalization"))]
+    assert "indirect-gather-static-or-matmul" not in hits
+
+
+# --- indirect_gather op family (classify + opportunity) ---------------------
+def test_indirect_gather_classification_and_knowledge():
+    assert nki_knowledge.classify_op("F.interpolate") == "indirect_gather"
+    assert nki_knowledge.classify_op("grid_sample") == "indirect_gather"
+    entry = nki_knowledge.KNOWLEDGE["indirect_gather"]
+    assert "gather-as-matmul" in entry.techniques
+    assert "static-pattern-only" in entry.landmines
+    assert entry.examples  # has a worked example
+
+
+def test_indirect_gather_is_worth_authoring_in_opportunity():
+    import opportunity
+    class _Spec:
+        name = "bilinear_interpolate"
+        family = None
+        notes = None
+        shape_class = ""
+    t = opportunity.analytic_opportunity(_Spec())
+    assert t.worth_authoring and t.score >= 0.5
+
+
+def test_gather_op_does_not_fall_through_to_elementwise():
+    # the whole point: an interpolate op is NOT classified as a cheap pointwise op
+    assert nki_knowledge.classify_op("upsample_bilinear") != "elementwise"
+
+
+def test_dtype_aware_compute_sol():
+    import roofline as rf
+    # an fp8 matmul at the fp8 ceiling reads 100% SOL; scoring it against the bf16
+    # ceiling (half) would wrongly read 200%.
+    flops, device_s = 158e9, 158e9 / rf.PEAK_TFLOPS_FP8_PER_CORE
+    assert abs(rf.sol_compute_bound(flops, device_s, rf.peak_tflops("fp8")) - 1.0) < 1e-9

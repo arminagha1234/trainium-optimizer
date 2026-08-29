@@ -31,26 +31,51 @@ Peak constants are per SINGLE NeuronCore (what the framework authors), trn2:
     memory-bound SOL reference. This is an ACHIEVED ceiling (what a perfect
     single-core streaming kernel gets), which is the honest bar for a memory-bound
     op — not a spec-sheet aggregate-device number a single core can never reach.
-  * ``PEAK_TFLOPS_BF16_PER_CORE`` — 380 TFLOP/s, the value already used by
-    ``backends/neuron_worker.py`` (Trn2 per-core bf16 peak).
+  * ``PEAK_TFLOPS_BF16_PER_CORE`` — 79 TFLOP/s DENSE bf16. CORRECTED 2026-08-29
+    from the official Trainium2 arch doc (NeuronCore-v3 Tensor Engine: 79 BF16/
+    FP16/TF32 dense TFLOPS) + first principles (128x128 array x 2.4 GHz x 2
+    flop/MAC = 78.6 TFLOPS). The prior 380e12 was ~4.8x too high — it matched no
+    dense figure (fp8 dense 158, bf16 SPARSE 316, fp32 20) and made every
+    compute-bound op read ~4.8x BELOW its true %SOL, so the profitability gate
+    wrongly flagged near-SOL GEMMs as "worth authoring". Dense per-dtype ceilings
+    below (``peak_tflops``); pick the ceiling for the op's actual compute dtype.
+    NOTE: doc-derived — worth one on-device compute-bound race to confirm.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-# --- measured single-core roofline ceilings (trn2) ---------------------------
-PEAK_HBM_BW_PER_CORE = 385e9          # bytes/s — MEASURED (streaming-copy, 2026-08-27)
-PEAK_TFLOPS_BF16_PER_CORE = 380e12    # FLOP/s — matches neuron_worker.PEAK_TFLOPS_BF16
+# --- single-core roofline ceilings (trn2 / NeuronCore-v3) --------------------
+PEAK_HBM_BW_PER_CORE = 385e9          # bytes/s — MEASURED (streaming-copy, 2026-08-27);
+                                      # matches doc 3 TB/s / 8 cores = 375 GB/s/core (~3%)
+# Tensor-engine DENSE peak per NeuronCore-v3, by input dtype (arch doc, 2.4 GHz,
+# 128x128 array). bf16 is the default authoring dtype; fp8 doubles the datapath
+# (256x128), fp32 quarters it, and 2:4 SPARSE quadruples bf16.
+PEAK_TFLOPS_BF16_PER_CORE = 79e12     # FLOP/s — DENSE bf16/fp16/tf32 (was 380e12; corrected)
+PEAK_TFLOPS_FP32_PER_CORE = 20e12     # FLOP/s — dense fp32
+PEAK_TFLOPS_FP8_PER_CORE = 158e12     # FLOP/s — dense fp8 (e4m3/e5m2)
+PEAK_TFLOPS_BF16_SPARSE_PER_CORE = 316e12  # FLOP/s — 2:4 structured-sparse bf16/fp8
 
 # The bf16 arithmetic-intensity ridge point (FLOP per byte): above it an op is
-# compute-bound, below it memory-bound. Consistent with invent_engine's
-# _BF16_RIDGE_FLOPS_PER_BYTE; recomputed here from the two peak constants so the
-# module is self-contained (380e12 / 385e9 ~= 987 — note this per-CORE ridge is
-# higher than the 222 figure invent_engine carries, which is a different
-# normalization; the CLASSIFICATION below never needs the exact ridge, only the
-# bottleneck label the caller already has).
+# compute-bound, below it memory-bound. Recomputed from the two peak constants so
+# the module is self-contained (79e12 / 385e9 ~= 205 flop/byte for dense bf16).
 RIDGE_FLOPS_PER_BYTE = PEAK_TFLOPS_BF16_PER_CORE / PEAK_HBM_BW_PER_CORE
+
+
+def peak_tflops(dtype: str = "bf16", *, sparse: bool = False) -> float:
+    """The Tensor-engine dense (or 2:4-sparse) FLOP/s ceiling for a compute
+    dtype — so ``sol_compute_bound`` can be held to the RIGHT roofline (an fp8
+    matmul has 2x the bf16 ceiling; an fp32 op has 1/4). Defaults to dense bf16.
+    Unknown dtype -> dense bf16 (the safe default)."""
+    d = (dtype or "").lower()
+    if sparse:
+        return PEAK_TFLOPS_BF16_SPARSE_PER_CORE
+    if "fp8" in d or "e4m3" in d or "e5m2" in d or "float8" in d:
+        return PEAK_TFLOPS_FP8_PER_CORE
+    if "fp32" in d or "float32" in d or d == "f32":
+        return PEAK_TFLOPS_FP32_PER_CORE
+    return PEAK_TFLOPS_BF16_PER_CORE
 
 # Profitability thresholds (fractions of SOL). Tunable; the pivot's guidance is
 # "low %SOL = opportunity, ~80% = don't bother".
@@ -100,13 +125,17 @@ def sol_memory_bound(bytes_moved: float, device_s: float) -> float:
     return achieved_bw / PEAK_HBM_BW_PER_CORE
 
 
-def sol_compute_bound(flops: float, device_s: float) -> float:
-    """%SOL (0..1+) for a compute-bound op: achieved FLOP/s / peak bf16 FLOP/s.
-    ``device_s`` MUST be a device-timed latency in seconds."""
+def sol_compute_bound(flops: float, device_s: float,
+                      peak_flops: float = PEAK_TFLOPS_BF16_PER_CORE) -> float:
+    """%SOL (0..1+) for a compute-bound op: achieved FLOP/s / peak FLOP/s.
+    ``device_s`` MUST be a device-timed latency in seconds. ``peak_flops`` is the
+    Tensor-engine ceiling for the op's compute dtype (default dense bf16; pass
+    ``peak_tflops("fp8")`` / ``peak_tflops("fp32")`` for those paths so the op is
+    held to the RIGHT roofline)."""
     if flops <= 0 or device_s <= 0:
         return 0.0
     achieved = flops / device_s
-    return achieved / PEAK_TFLOPS_BF16_PER_CORE
+    return achieved / (peak_flops if peak_flops > 0 else PEAK_TFLOPS_BF16_PER_CORE)
 
 
 @dataclass(frozen=True)

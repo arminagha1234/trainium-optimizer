@@ -45,13 +45,23 @@ from typing import Any, Callable
 MEMORY_BOUND = "memory_bound"
 SINGLE_ENGINE = "single_engine"
 DMA_BLOCKED = "dma_blocked"
+GPSIMD_BOUND = "gpsimd_bound"   # GpSimd serializes — usually an INDIRECT/dynamic
+                                # DMA (data-dependent gather) on GpSimd's ~153
+                                # GB/s/dir integrated DMA; fix = static addressing
+                                # / express the gather as a matmul (see perf_hints).
 
-# The Trainium2 compute/movement engines a neuron-profile reports a busy fraction
-# for. Keys are the normalized names this module uses; ``parse_profile_json``
-# maps the many spellings a profiler emits (PE/Per/TensorE, Act/Scalar,
-# Pool/Vector, DMA/DVE/SP) onto them.
-_COMPUTE_ENGINES = ("pe", "act", "pool")   # the three on-core compute engines
-_MOVEMENT_ENGINES = ("dma",)               # off-core data movement
+# The four Trainium2 (NeuronCore-v3) on-core compute engines + the movement path.
+# Keys are the normalized names this module uses; ``parse_profile_json`` /
+# ``_normalize_engine`` map the many spellings a profiler emits onto them.
+#   pe     = Tensor engine (matmul, 128x128 systolic array)
+#   act    = Scalar/Activation engine (non-linear: exp/gelu/sqrt)
+#   vector = Vector/Pool engine (reductions, element-wise)
+#   gpsimd = GpSimd engine (8 programmable procs; indirect DMA / dynamic gather)
+# NOTE (2026-08-29): vector + gpsimd were previously CONFLATED into one "pool"
+# engine whose explorer key read GpSimd — so the Vector engine was never captured
+# and a GpSimd-bound kernel (indirect gather) was mislabelled. Now split.
+_COMPUTE_ENGINES = ("pe", "act", "vector", "gpsimd")   # the four on-core compute engines
+_MOVEMENT_ENGINES = ("dma",)                           # off-core data movement
 
 # A compute engine is "dominant" (one engine serializes the pipeline) when it is
 # the busiest AND no engine is near-saturated — i.e. the kernel is latency-bound
@@ -135,9 +145,13 @@ def summarize(engine_busy: dict, device_us: float = 0.0, *, mfu: float = -1.0,
       * DMA the clear busiest engine (>= ``_DMA_MARGIN`` over the busiest compute
         engine) -> ``dma_blocked``: the load/store path is the limiter; the fix is
         double-buffering + wider tiles.
-      * one compute engine busiest but NOTHING near-saturated -> ``single_engine``:
-        the pipeline serializes on one engine while the others sit idle; the fix
-        is activation-fusion + engine overlap.
+      * GpSimd the busiest COMPUTE engine and serializing -> ``gpsimd_bound``: an
+        indirect/dynamic gather is running on GpSimd's programmable procs + its
+        slow integrated DMA (153 GB/s/dir) while TensorE sits idle; the fix is
+        static addressing / expressing the gather as a matmul (NOT generic fusion).
+      * one (other) compute engine busiest but NOTHING near-saturated ->
+        ``single_engine``: the pipeline serializes on one engine while the others
+        sit idle; the fix is activation-fusion + engine overlap.
       * otherwise (all engines lightly used, or a compute engine saturated with
         low arithmetic intensity) -> ``memory_bound``: the op is bandwidth-bound;
         the fix is fusion + hoisting invariant loads.
@@ -169,9 +183,25 @@ def summarize(engine_busy: dict, device_us: float = 0.0, *, mfu: float = -1.0,
             f"{ce_name.upper() or 'PE'} {ce*100:.0f}% — data movement is the "
             f"limiter (double-buffer + widen tiles){extra}", device_us, **metrics)
 
+    # GpSimd serializing while TensorE sits idle is the indirect-gather signature
+    # (its own label + fix — static addressing / gather-as-matmul), distinct from
+    # a generic single-engine serialize. Checked before SINGLE_ENGINE.
+    gp = float(busy.get("gpsimd", 0.0) or 0.0)
+    if (gp >= _SERIALIZE_MIN and gp >= ce and gp >= dma
+            and float(busy.get("pe", 0.0) or 0.0) < gp):
+        return ProfileReport(
+            busy, GPSIMD_BOUND,
+            f"gpsimd-bound: GpSimd {gp*100:.0f}% busy while TensorE "
+            f"{float(busy.get('pe', 0.0))*100:.0f}% sits idle — an indirect/dynamic "
+            f"gather is running on GpSimd (slow integrated DMA); make the addressing "
+            f"static or express the gather as a matmul{extra}", device_us, **metrics)
+
     if ce >= _SERIALIZE_MIN and peak < _SATURATED and ce >= dma:
+        # Only name engines actually PRESENT in the profile (avoid emitting
+        # "GPSIMD 0%" for an unmeasured engine, which would pollute the reason
+        # string that kernel_perf.classify_bottleneck / perf_hints grep).
         idle = ", ".join(f"{n.upper()} {busy.get(n, 0.0)*100:.0f}%"
-                         for n in _COMPUTE_ENGINES if n != ce_name)
+                         for n in _COMPUTE_ENGINES if n != ce_name and n in busy)
         return ProfileReport(
             busy, SINGLE_ENGINE,
             f"single-engine serialize: {ce_name.upper()} {ce*100:.0f}% busy while "
@@ -216,7 +246,9 @@ def perf_symptoms(report: ProfileReport) -> tuple[str, ...]:
     toks: list[str] = []
     dom = (report.dominant or "").replace("_", "-")
     if dom:
-        toks.append(dom)                                  # memory-bound|single-engine|dma-blocked
+        toks.append(dom)                     # memory-bound|single-engine|dma-blocked|gpsimd-bound
+    if report.dominant == GPSIMD_BOUND:
+        toks.append("indirect-dma")          # the fix-relevant symptom for perf_hints
     if 0.0 <= report.mfu < MFU_GOOD:
         toks.append("low-mfu")
     if 0.0 <= report.mbu < MBU_GOOD:
@@ -232,18 +264,22 @@ def perf_symptoms(report: ProfileReport) -> tuple[str, ...]:
 # tolerant parse of a neuron-profile summary
 # ---------------------------------------------------------------------------
 # neuron-profile emits engine names in several spellings across SDK versions; map
-# each onto this module's normalized {pe, act, pool, dma}. Substring match, first
-# hit wins, so "PE utilization" / "TensorEngine" both land on "pe".
+# each onto this module's normalized {pe, act, vector, gpsimd, dma}. Substring
+# match, first hit wins, so "PE utilization" / "TensorEngine" both land on "pe".
+# Order matters: gpsimd BEFORE vector so "gpsimd"/"gp-simd" is not swallowed, and
+# both BEFORE the generic dma/pe checks.
 _ENGINE_ALIASES = (
+    ("gpsimd", ("gpsimd", "gp_simd", "gp-simd", "gp simd", "simd")),
     ("dma", ("dma", "dve", " sp ", "sp_", "movement", "hbm", "bandwidth")),
     ("pe", ("pe", "tensor", "matmul", "pooling_matmul")),
     ("act", ("act", "scalar", "activation")),
-    ("pool", ("pool", "vector", "gpsimd")),
+    ("vector", ("vector", "pool")),   # Vector/Pool engine (reductions, elementwise)
 )
 
 
 def _normalize_engine(name: str) -> str:
-    """Map a profiler's engine name onto {pe, act, pool, dma}; "" if unknown."""
+    """Map a profiler's engine name onto {pe, act, vector, gpsimd, dma}; "" if
+    unknown."""
     n = f" {(name or '').lower()} "
     for norm, aliases in _ENGINE_ALIASES:
         if any(a in n for a in aliases):
@@ -271,13 +307,26 @@ def _as_fraction(v: Any) -> float:
 # per-engine utilization lives in SPECIFIC keys (values are 0..1 fractions
 # despite the ``_percent`` suffix). We map ONLY those keys — a naive flatten
 # would misread e.g. ``tensor_engine_instruction_count=55`` as 5500% util.
-# Captured from a real trn2 run (neuron-explorer 2.32.0, 2026-08-28).
+# Captured from a real trn2 run (neuron-explorer 2.32.0, 2026-08-28). Values are
+# TUPLES of candidate key spellings (first present wins) — the Vector engine's key
+# name varies (vector_/pool_) and some SDK versions omit it; gpsimd is now its OWN
+# engine (previously mis-mapped under "pool", hiding the Vector engine entirely).
 _EXPLORER_ENGINE_KEYS = {
-    "pe": "tensor_engine_active_time_percent",
-    "act": "scalar_engine_active_time_percent",
-    "pool": "gpsimd_engine_active_time_percent",
-    "dma": "dma_active_time_percent",
+    "pe": ("tensor_engine_active_time_percent",),
+    "act": ("scalar_engine_active_time_percent",),
+    "vector": ("vector_engine_active_time_percent", "pool_engine_active_time_percent"),
+    "gpsimd": ("gpsimd_engine_active_time_percent", "gp_simd_engine_active_time_percent"),
+    "dma": ("dma_active_time_percent",),
 }
+
+
+def _engine_frac(node: dict, eng: str) -> float:
+    """The busy fraction for a normalized engine from an explorer node, trying each
+    candidate key spelling (first present wins). 0.0 when none present."""
+    for k in _EXPLORER_ENGINE_KEYS.get(eng, ()):  # noqa: SIM110
+        if k in node:
+            return _as_fraction(node.get(k, 0.0))
+    return 0.0
 # Extra roofline signals neuron-explorer reports (compute / memory-bandwidth
 # utilization) — surfaced on the report reason when present.
 _EXPLORER_MFU_KEY = "mfu_estimated_percent"
@@ -318,9 +367,7 @@ def parse_neuron_explorer_metrics(obj: Any) -> dict:
             nodes = [v for v in obj.values() if _is_explorer_node(v)]
             if not nodes:
                 return {}
-            node = max(nodes, key=lambda n: (
-                _as_fraction(n.get(_EXPLORER_ENGINE_KEYS["dma"], 0)) +
-                _as_fraction(n.get(_EXPLORER_ENGINE_KEYS["pe"], 0))))
+            node = max(nodes, key=lambda n: _engine_frac(n, "dma") + _engine_frac(n, "pe"))
         if not isinstance(node, dict):
             return {}
         out: dict = {}
@@ -351,15 +398,17 @@ def parse_neuron_explorer_metrics(obj: Any) -> dict:
 
 def _is_explorer_node(d: Any) -> bool:
     """True when ``d`` is a neuron-explorer per-node metrics dict."""
-    return isinstance(d, dict) and any(k in d for k in _EXPLORER_ENGINE_KEYS.values())
+    return isinstance(d, dict) and any(
+        k in d for keys in _EXPLORER_ENGINE_KEYS.values() for k in keys)
 
 
 def parse_neuron_explorer_summary(obj: Any) -> dict:
-    """Extract the normalized ``{pe,act,pool,dma: fraction}`` map from a
+    """Extract the normalized ``{pe,act,vector,gpsimd,dma: fraction}`` map from a
     neuron-explorer ``summary-json`` object (``{"n_<id>": {...}}`` or a bare
-    per-node metrics dict). Reads ONLY the known engine-utilization keys, so
-    instruction counts / times never leak in as bogus utilization. Uses the
-    busiest node when several are present. Never raises; ``{}`` on any miss."""
+    per-node metrics dict). Reads ONLY the known engine-utilization keys (trying
+    each candidate spelling via ``_engine_frac``), so instruction counts / times
+    never leak in as bogus utilization. Uses the busiest node when several are
+    present. Never raises; ``{}`` on any miss."""
     try:
         node = obj
         if isinstance(obj, dict) and not _is_explorer_node(obj):
@@ -367,14 +416,13 @@ def parse_neuron_explorer_summary(obj: Any) -> dict:
             nodes = [v for v in obj.values() if _is_explorer_node(v)]
             if not nodes:
                 return {}
-            node = max(nodes, key=lambda n: (
-                _as_fraction(n.get(_EXPLORER_ENGINE_KEYS["dma"], 0)) +
-                _as_fraction(n.get(_EXPLORER_ENGINE_KEYS["pe"], 0))))
+            node = max(nodes, key=lambda n: _engine_frac(n, "dma") + _engine_frac(n, "pe"))
         if not _is_explorer_node(node):
             return {}
-        return {eng: _as_fraction(node.get(key, 0.0))
-                for eng, key in _EXPLORER_ENGINE_KEYS.items()
-                if key in node}
+        out = {eng: _engine_frac(node, eng) for eng in _EXPLORER_ENGINE_KEYS}
+        # keep only engines whose key was actually present (a candidate key in node)
+        return {eng: v for eng, v in out.items()
+                if any(k in node for k in _EXPLORER_ENGINE_KEYS[eng])}
     except Exception:  # noqa: BLE001
         return {}
 
@@ -477,14 +525,17 @@ def profile_kernel(run_fn: Callable[[], Any], device: Any = None, *,
     return summarize(busy, device_us, **metrics)
 
 
+_NORMALIZED_KEYS = {"pe", "act", "vector", "gpsimd", "dma", "pool"}  # 'pool' = legacy alias
+
+
 def _looks_normalized(d: Any) -> bool:
-    """True when ``d`` is already a normalized ``{pe|act|pool|dma: fraction}`` map
-    (so we skip ``parse_profile_json`` and use it directly)."""
+    """True when ``d`` is already a normalized ``{pe|act|vector|gpsimd|dma:
+    fraction}`` map (so we skip ``parse_profile_json`` and use it directly). The
+    legacy ``pool`` key is still accepted for back-compat."""
     if not isinstance(d, dict) or not d:
         return False
     keys = set(d.keys())
-    return keys.issubset({"pe", "act", "pool", "dma"}) and bool(
-        keys & {"pe", "act", "pool", "dma"})
+    return keys.issubset(_NORMALIZED_KEYS) and bool(keys & _NORMALIZED_KEYS)
 
 
 def capture_profiler(neff_path: str, *, core: int = 1,
