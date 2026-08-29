@@ -214,6 +214,37 @@ def _dtype_bytes(config: dict[str, Any], dtype: str | None) -> float:
     return _DTYPE_BYTES.get(str(key).lower(), 2)
 
 
+def dequant_factor(config: dict[str, Any], compute_dtype: str = "bf16") -> tuple[float, str]:
+    """How much a quantized checkpoint EXPANDS when loaded, and why.
+
+    A measured on-disk size is the right input for an unquantized model, but it
+    understates a quantized one, because Neuron has no fp8/int4 compute path and
+    transformers says so explicitly at load:
+
+        Using FP8 quantized models requires a GPU or XPU, we will default to
+        dequantizing the model to bf16 since no GPU or XPU is available
+
+    So DeepSeek-V4-Flash's 159.6 GB of fp8 weights become ~319 GB of bf16 in HBM.
+    Sizing off the download would under-count it by 2x and call an infeasible
+    model runnable -- which is exactly what happened before this existed.
+
+    Returns ``(factor, note)``; ``(1.0, "")`` when unquantized.
+    """
+    qc = config.get("quantization_config") or _text_config(config).get("quantization_config")
+    if not isinstance(qc, dict):
+        return 1.0, ""
+    method = str(qc.get("quant_method", "") or "").lower()
+    stored = {"fp8": 1.0, "int8": 1.0, "gptq": 0.5, "awq": 0.5,
+              "int4": 0.5, "nf4": 0.5, "bitsandbytes": 0.5}.get(method)
+    if stored is None:
+        return 1.0, f" (quant_method={method or 'unknown'}: expansion unknown)"
+    factor = _DTYPE_BYTES.get(compute_dtype.lower(), 2) / stored
+    if factor <= 1.0:
+        return 1.0, ""
+    return factor, (f" ({method} dequantized to {compute_dtype} at load: "
+                    f"{factor:g}x the on-disk size)")
+
+
 def assess(
     config: dict[str, Any],
     hw: HardwareProfile = TRN2_48XLARGE,
@@ -244,13 +275,22 @@ def assess(
                                "proceeding rather than blocking a model that may work"),
                        details=breakdown)
 
+    dq, dq_note = dequant_factor(config, dtype or "bf16")
     if weight_gb is not None:
+        # A measured size is the ON-DISK size. If the checkpoint is quantized and
+        # gets dequantized at load, HBM sees the expanded size, so scale it.
         breakdown["weight_source"] = "measured"
+        breakdown["on_disk_gb"] = round(weight_gb, 1)
+        breakdown["dequant_factor"] = dq
         breakdown["config_estimate_gb"] = round(
             params * _dtype_bytes(config, dtype) / 1e9, 1) if params else None
+        weight_gb = weight_gb * dq
     else:
+        # The config estimate is already in compute dtype, so no expansion.
         breakdown["weight_source"] = "config-estimate"
+        breakdown["dequant_factor"] = 1.0
         weight_gb = params * _dtype_bytes(config, dtype) / 1e9
+        dq_note = ""
     tp = max_clean_tp(config, hw)
     ranks = tp * max(1, node_count)
     gb_per_rank = weight_gb / ranks
@@ -270,11 +310,13 @@ def assess(
             False, "NEEDS_MULTINODE",
             reason=(f"{weight_gb:.0f} GB of weights exceeds the whole "
                     f"{hw.name} ({hw.total_hbm_gb:.0f} GB HBM across "
-                    f"{hw.cores} cores) -- needs nodeCount>1, not a bigger TP"),
+                    f"{hw.cores} cores){dq_note} -- needs nodeCount>1, "
+                    f"not a bigger TP"),
             **common)
 
     if gb_per_rank > budget:
         moe = " (MoE: expert weights dominate)" if breakdown.get("is_moe") else ""
+        moe += dq_note
         return Verdict(
             False, "TOO_LARGE",
             reason=(f"{weight_gb:.0f} GB of weights at tp={tp} is "

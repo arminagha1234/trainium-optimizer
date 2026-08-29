@@ -142,3 +142,52 @@ def test_smaller_box_is_stricter():
 def test_verdict_is_truthy_by_ok():
     assert bool(assess(_dense(), TRN2_48XLARGE, weight_gb=1.0)) is True
     assert bool(assess(_moe(), TRN2_48XLARGE, weight_gb=500.0)) is False
+
+
+# --- quantized checkpoints expand at load ------------------------------------
+
+def test_fp8_measured_size_is_scaled_to_bf16():
+    """DeepSeek-V4-Flash ships 159.6 GB of fp8; Neuron dequantizes it to bf16.
+
+    Sizing off the download under-counts it 2x and calls an infeasible model
+    runnable, which is exactly what happened before dequant_factor existed.
+    """
+    cfg = _moe(h=4096, L=43, moe_inter=2048, experts=256,
+               arch="DeepseekV4ForCausalLM")
+    cfg["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3",
+                                  "weight_block_size": [128, 128]}
+    v = assess(cfg, TRN2_48XLARGE, weight_gb=159.6)
+    assert v.details["on_disk_gb"] == 159.6
+    assert v.details["dequant_factor"] == 2.0
+    assert abs(v.weight_gb - 319.2) < 0.5, v.weight_gb
+    assert "dequantized to bf16" in v.reason
+
+
+def test_unquantized_measured_size_is_untouched():
+    v = assess(_moe(), TRN2_48XLARGE, weight_gb=71.9)
+    assert v.details["dequant_factor"] == 1.0
+    assert v.weight_gb == 71.9
+
+
+def test_int4_expands_fourfold():
+    cfg = _dense(arch="LlamaForCausalLM")
+    cfg["quantization_config"] = {"quant_method": "awq"}
+    v = assess(cfg, TRN2_48XLARGE, weight_gb=10.0)
+    assert v.details["dequant_factor"] == 4.0
+    assert v.weight_gb == 40.0
+
+
+def test_unknown_quant_method_does_not_invent_a_factor():
+    cfg = _dense(arch="LlamaForCausalLM")
+    cfg["quantization_config"] = {"quant_method": "some_future_scheme"}
+    v = assess(cfg, TRN2_48XLARGE, weight_gb=10.0)
+    assert v.details["dequant_factor"] == 1.0   # fail open, do not guess
+    assert v.weight_gb == 10.0
+
+
+def test_config_estimate_is_not_double_counted():
+    """The config estimate is already in compute dtype; it must not be scaled."""
+    cfg = _moe()
+    cfg["quantization_config"] = {"quant_method": "fp8"}
+    v = assess(cfg, TRN2_48XLARGE)               # no measured size
+    assert v.details["dequant_factor"] == 1.0
