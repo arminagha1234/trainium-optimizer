@@ -41,7 +41,11 @@ from backends.base import (
 from transformers import AutoConfig
 
 _WORKER = Path(__file__).resolve().parent / "neuron_worker.py"
-_COMPILE_TIMEOUT_S = 1800  # 30-min guardrail, enforced on the subprocess itself
+# 30-min guardrail, enforced on the subprocess itself. Overridable because a
+# very large or dequantized checkpoint can spend longer than this just
+# loading: DeepSeek-V4-Flash (159.6 GB fp8 -> ~319 GB bf16) hit exactly this
+# wall with no compile error, which reads as a failure but is only a budget.
+_COMPILE_TIMEOUT_S = int(os.environ.get("TRN_OPT_COMPILE_TIMEOUT_S", "1800"))
 
 
 def _shape_input_len(shape: str) -> int:
@@ -179,6 +183,21 @@ class NativePyTorchBackend:
                 model_id, trust_remote_code=True)
         return self._cfg_cache[model_id]
 
+    def _raw_config_dict(self, model_id: str) -> dict[str, Any]:
+        """The HF config as a plain dict (what capability.estimate_params takes)."""
+        cfg = self._hf_config(model_id)
+        try:
+            d = cfg.to_dict()
+        except Exception:  # noqa: BLE001
+            return {}
+        tc = getattr(cfg, "text_config", None)
+        if tc is not None and not isinstance(d.get("text_config"), dict):
+            try:
+                d["text_config"] = tc.to_dict()
+            except Exception:  # noqa: BLE001
+                pass
+        return d
+
     def _fit_baseline_tp(self, model_id: str) -> int:
         """Smallest tp whose bf16 weights fit ~30GB/core, dividing both the
         attention- and KV-head counts (so the DTensor plan is valid)."""
@@ -200,7 +219,20 @@ class NativePyTorchBackend:
         L = _int("num_hidden_layers", 32)
         inter = _int("intermediate_size", 4 * h)
         vocab = _int("vocab_size", 32000)
-        params = (4 * h * h + 3 * h * inter) * L + 2 * vocab * h
+        # MoE-AWARE. The dense formula below drops the expert dimension, which
+        # undercounts a 256-expert model by ~10x -- measured against on-disk
+        # weights: Qwen3.5-35B-A3B 7.4 GB dense vs 71.9 GB actual. That made the
+        # "< 10 GB/rank" test below pass at tp=1 and put a 72 GB model on one
+        # 24 GB core, so it OOM'd before the run started. capability.estimate_params
+        # counts (n_experts + shared) x 3 x h x moe_intermediate.
+        params = 0
+        try:
+            from capability import estimate_params as _est
+            params, _bd = _est(self._raw_config_dict(model_id))
+        except Exception:  # noqa: BLE001 - fall back to the dense estimate
+            params = 0
+        if not params:
+            params = (4 * h * h + 3 * h * inter) * L + 2 * vocab * h
         weight_gb = params * 2 / 1e9  # bf16
         heads = _int("num_attention_heads", 32)
         # Some architectures bind the max clean TP below head-count. Gemma4's
@@ -209,7 +241,18 @@ class NativePyTorchBackend:
         archs = " ".join(getattr(self._hf_config(model_id), "architectures", []) or [])
         # Gemma4 Global layers cap at tp4 (head_dim 512, 4 kv). Qwen3.5/3.8
         # DeltaNet is validated at tp4 (manual head-parallel adapter).
-        max_tp = 4 if ("Gemma4" in archs or "Qwen3_5" in archs) else 64
+        # Gemma4 stays at 4: head_dim 512 with 4 KV heads is a HARD limit -- tp>4
+        # shards a KV head below one head_dim and crashes.
+        #
+        # Qwen3_5's 4 was a VALIDATION limit, not an arithmetic one, and it is what
+        # made the large MoEs unreachable. The real bound is the head count, which
+        # the `heads % tp` test below already enforces, so raise the cap to it:
+        #     35B-A3B  (68 GB)  tp=8  ->  8.5 GB/rank
+        #     122B-A10B (239 GB) tp=16 -> 14.9 GB/rank
+        # both inside the 24 GB/core budget, where a cap of 4 left them at 17 and
+        # 60 GB/rank respectively. Nothing above the head count is expressible
+        # anyway, so this is the widest correct value rather than a new guess.
+        max_tp = 4 if "Gemma4" in archs else (heads if "Qwen3_5" in archs else 64)
         max_tp = min(max_tp, self.core_count)   # never exceed physical cores
         best = None
         # 24GB per NeuronCore -> keep weights under ~10GB/rank so there is room
