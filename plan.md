@@ -78,6 +78,38 @@ On-device calibration (trn2, hd=128, fair fresh-input timing, 2026-08-28):
     text flywheel compounds; the per-family adapter seam already keeps the core
     track-agnostic.
 
+### 48xl model target queue (frontier flagships)
+
+The models to run through the loop, **prioritized by compiler-weak surface** —
+that's where the framework wins and the bank compounds. Hybrid/linear-attention
+(scan — on-device-CONFIRMED weak) and MoE-with-sparse/novel-attention first;
+dense flagships as broad-coverage control. Each run publishes per-(model,
+hardware), is verified by `task_eval`, and should emit its **measured %SOL
+heatmap** so the 3xl can aim kernel R&D at the *real* bottlenecks.
+
+| Pri | Model | Key compiler-weak op(s) | Why it's a target | Instance |
+|-----|-------|-------------------------|-------------------|----------|
+| P0 | **Qwen3.5 / Qwen3-Next** | GatedDeltaNet (scan) + full-attn hybrid | scan is a **confirmed 22.75× kernel win**; DeltaNet kernels already banked → immediate compounding | trn2.3xl / 48xl |
+| P0 | **Kimi-Linear** | linear-attention mixer (scan) | near-pure linear attn → our strongest win zone; proves the scan corpus generalizes | trn2.48xl |
+| P0 | **Kimi-K3** | KDA hybrid (scan) + mxfp4 routed MoE (+vision) | 2.8T KDA-hybrid — KDA is a scan variant (compiler-weak); mxfp4 experts | 48xl (multinode) |
+| P1 | **DeepSeek-V4 / V4-Flash** | fine-grained MoE (EP) + sparse/compress attention | routing + sparse attn → MoE-fused + sparse-attn kernels; V4-Flash trn2 bring-up in progress | 48xl (multinode) |
+| P1 | **GLM-5.2** | `GlmMoeDsa` (DeepSeek-style sparse attention + MoE) | net-new `GlmMoeDsa` kernel — a genuine compiler-weak backlog target | 48xl (multinode) |
+| P1 | **Kimi-K2** | ~1T MoE routing | large-MoE routing bottleneck; expert-parallel kernels | 48xl (multinode) |
+| P1 | **MiniMax-M2** | MoE + lightning/linear attention | hits *both* win families (MoE routing + linear attn) at scale | trn2.48xl |
+| P2 | **Gemma-4 31B** | dense, hetero attn (sliding-window + global), 256K ctx | control case + sliding-window attn (a compiler-weak attn variant) + long-context stress | trn2.3xl / 48xl |
+| P2 | **Gemma-4 12B** | dense hetero attn (per-layer config) | fast-iteration Gemma; exercises the per-layer-config parse path | trn2.3xl |
+| P2 | **Llama-4 (Scout / Maverick)** | MoE + interleaved attention | broad-usage MoE coverage | trn2.48xl |
+| P3 | **DeepSeek-V3.x** | MoE + MLA (absorbed) attention | MLA-absorbed attention kernel; widely deployed | 48xl (multinode) |
+| P3 | **Qwen3-235B** | large dense/MoE | high-download coverage; config-search ROI | trn2.48xl |
+
+Order of operations: **P0 first** (proven-weak scan → immediate bank reuse and
+the fastest compounding), then **P1** (MoE + sparse/novel attention — highest
+kernel-novelty, grows the corpus), then **P2/P3** for coverage. GLM version:
+`GLM-5.2` is the `GlmMoeDsa` target on the backlog; if a `GLM-4.6`-class model is
+requested, it slots at P1 as another MoE+sparse-attn case. Models too big for a
+single 48xl node (Kimi-K3 2.8T, DeepSeek-V4 full depth) run **multinode** once
+EFA/multi-box is wired.
+
 ---
 
 ## Phase 0 — Scope-check (1 week)
