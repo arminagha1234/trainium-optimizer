@@ -1,0 +1,27 @@
+{
+  "model_id": "facebook/opt-2.7b",
+  "backend": "native-pytorch-beta3",
+  "baseline_metric": 4810.4,
+  "best_metric": 11649.3,
+  "speedup": 2.422,
+  "metric_label": "tok/s",
+  "config": {
+    "_note": "winning knobs not recorded in the leaderboard summary ('config search (native-pytorch-beta3)'); reproduce by running the optimizer's config search on this model_id + backend."
+  },
+  "toolchain": {
+    "backend": "native-pytorch-beta3",
+    "stack": "native-pytorch-beta3",
+    "device_string": "neuron",
+    "instance_type": "trn2.3xlarge",
+    "neuronx_cc_recorded_sdk": "2.28.0",
+    "_provenance": "reconstructed from committed HISTORY.tsv + LEADERBOARD.md on 2026-08-29; the full per-stage config-search trace and exact per-run toolchain live in the source-box bundle. Numbers are the genuine recorded results."
+  },
+  "kernels": [],
+  "measurements": {},
+  "verified": "verified",
+  "instance_type": "trn2.3xlarge",
+  "generated_at": "2026-08-22T22:51:32Z",
+  "win_stage": "config",
+  "correctness_pct": "93.8",
+  "_provenance": "reconstructed from committed HISTORY.tsv + LEADERBOARD.md on 2026-08-29; the full per-stage config-search trace and exact per-run toolchain live in the source-box bundle. Numbers are the genuine recorded results."
+}

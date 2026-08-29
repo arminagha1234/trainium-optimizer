@@ -1,0 +1,3 @@
+commit	stage	origin	layer	source	metric	mfu	correctness	compile_s	status	description
+record	baseline				2097.3			0.0	keep	baseline (from HISTORY.tsv)
+record	graph_rewrite				38708.4		100.0	0.0	keep	winning stage graph_rewrite — 18.456x (from HISTORY.tsv; full search trace on source box)

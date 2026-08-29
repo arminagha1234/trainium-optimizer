@@ -1,0 +1,28 @@
+{
+  "model_id": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "backend": "native-pytorch-beta3",
+  "baseline_metric": 4354.6,
+  "best_metric": 48108.4,
+  "speedup": 11.048,
+  "metric_label": "tok/s",
+  "config": {
+    "compile_mode": "compile-default",
+    "graph_rewrite": "cc:optlevel3"
+  },
+  "toolchain": {
+    "backend": "native-pytorch-beta3",
+    "stack": "native-pytorch-beta3",
+    "device_string": "neuron",
+    "instance_type": "trn2.3xlarge",
+    "neuronx_cc_recorded_sdk": "2.28.0",
+    "_provenance": "reconstructed from committed HISTORY.tsv + LEADERBOARD.md on 2026-08-29; the full per-stage config-search trace and exact per-run toolchain live in the source-box bundle. Numbers are the genuine recorded results."
+  },
+  "kernels": [],
+  "measurements": {},
+  "verified": "verified",
+  "instance_type": "trn2.3xlarge",
+  "generated_at": "2026-08-23T09:45:22Z",
+  "win_stage": "graph_rewrite",
+  "correctness_pct": "93.8",
+  "_provenance": "reconstructed from committed HISTORY.tsv + LEADERBOARD.md on 2026-08-29; the full per-stage config-search trace and exact per-run toolchain live in the source-box bundle. Numbers are the genuine recorded results."
+}
