@@ -271,3 +271,121 @@ def test_gate_tp_tracks_the_runner_for_qwen35_moe():
     v122 = assess(m122, TRN2_48XLARGE, weight_gb=250.2)
     assert not v122.ok                                     # matches the real OOM
     assert v122.chosen_tp == 16
+
+
+# --- host DRAM: the constraint that actually binds on a 48xl -------------------
+#
+# Every expectation here is pinned to an observed trn2.48xlarge outcome. The host
+# term was missing entirely, which is why the gate cleared two models that then
+# OOM-killed the pod during load without ever touching a core.
+
+def test_host_dram_binds_before_hbm_above_16_ranks():
+    """The two budgets pull in OPPOSITE directions and cross over at 16 ranks.
+
+    HBM per rank wants MORE ranks; host DRAM wants FEWER, because
+    ``from_pretrained`` materialises a full private copy in every rank process
+    before any sharding happens. Below the crossover HBM binds, above it the host
+    does -- which is why "just raise tp" could never resolve the large MoE models.
+    """
+    from capability import host_load_peak_gb
+
+    hw = TRN2_48XLARGE
+    assert 8 * hw.usable_gb_per_core < hw.host_ram_gb / 8      # HBM is tighter
+    assert 32 * hw.usable_gb_per_core > hw.host_ram_gb / 32     # host is tighter
+    assert host_load_peak_gb(100.0, 16) == 1600.0              # ranks x model
+
+
+def test_35b_a3b_fits_the_host_budget_at_tp16():
+    """71.9 GB x 16 ranks = 1.15 TB of 2.1 TB -- the run that got past load."""
+    from capability import host_load_peak_gb
+
+    assert host_load_peak_gb(71.9, 16) < TRN2_48XLARGE.host_ram_gb
+
+
+def test_122b_a10b_is_host_limited_not_hbm_limited():
+    """The verdict must name the HOST, because HBM per rank is fine at tp=32.
+
+    250 GB over 32 ranks is 7.8 GB of a 14.4 GB budget -- comfortable. But loading
+    it needs 32 full copies = 8 TB against 2.1 TB of DRAM. Reporting this as
+    TOO_LARGE would send the next person off to raise tp, which makes it worse.
+    """
+    v = assess(_moe(h=2048, L=40, moe_inter=512, experts=256, heads=32),
+               TRN2_48XLARGE, weight_gb=250.2)
+    assert not v.ok
+    assert v.status == "HOST_LIMITED"
+    assert "host DRAM" in v.reason
+    assert "WORSE" in v.reason
+    assert v.gb_per_rank < v.budget_gb_per_rank    # HBM was never the problem
+
+
+def test_deepseek_v4_flash_host_limit_matches_the_observed_oomkill():
+    """Observed: WorkloadInterrupted-137-OOMKilled, with no device error at all."""
+    cfg = _moe(h=7168, L=61, moe_inter=2048, experts=256, heads=64)
+    cfg["quantization_config"] = {"quant_method": "fp8"}
+    v = assess(cfg, TRN2_48XLARGE, weight_gb=159.6)
+    assert not v.ok
+    assert v.status == "HOST_LIMITED"
+    # The dequantized size is what drives the host peak, so it must be named.
+    assert "dequantized to bf16" in v.reason
+
+
+def test_a_lean_loader_removes_the_rank_multiplier():
+    """Shard-on-read makes the peak model-sized instead of model x ranks."""
+    from capability import host_load_peak_gb
+
+    eager = host_load_peak_gb(250.2, 32)
+    lean = host_load_peak_gb(250.2, 32, lean_loader=True)
+    assert eager > TRN2_48XLARGE.host_ram_gb       # OOMs today
+    assert lean < TRN2_48XLARGE.host_ram_gb        # would fit
+    assert lean < eager / 10
+
+
+def test_host_check_is_skipped_when_the_box_is_unmodelled():
+    """Fail open. host_ram_gb is set only where it was measured off the box; an
+    invented DRAM size would start rejecting models on no evidence."""
+    from capability import HardwareProfile
+
+    unknown = HardwareProfile("mystery", cores=64, hbm_gb_per_core=24.0)
+    assert unknown.host_ram_gb == 0.0
+    assert TRN2_3XLARGE.host_ram_gb == 0.0         # never measured
+    v = assess(_moe(h=2048, L=40, moe_inter=512, experts=256, heads=32),
+               unknown, weight_gb=250.2)
+    assert v.status != "HOST_LIMITED"
+
+
+# --- how big a model can this box actually run? -------------------------------
+
+def test_ceiling_today_is_host_bound_and_says_so():
+    from capability import ceiling
+
+    c = ceiling(TRN2_48XLARGE)
+    assert c["binding"] == "host-dram"
+    assert c["ranks"] == 16                  # the crossover
+    assert 130 <= c["weight_gb"] <= 140      # ~134 GB
+    assert 60 <= c["params_b"] <= 70         # ~67B params in bf16
+
+
+def test_fixing_the_loader_moves_the_ceiling_by_almost_7x():
+    """The single highest-leverage change available for large models.
+
+    With shard-on-read the host stops multiplying by the rank count and HBM
+    becomes binding, which is the regime you want to be in.
+    """
+    from capability import ceiling
+
+    today = ceiling(TRN2_48XLARGE)
+    lean = ceiling(TRN2_48XLARGE, lean_loader=True)
+    assert lean["binding"] == "hbm-per-rank"
+    assert lean["ranks"] == 64
+    assert lean["params_b"] > 6 * today["params_b"]
+    assert 440 <= lean["params_b"] <= 480    # ~460B
+
+
+def test_a_1t_model_does_not_fit_one_node_even_with_a_perfect_loader():
+    """1T in bf16 is 2 TB of weights against 1.5 TB of HBM. Arithmetic, not tuning."""
+    from capability import ceiling
+
+    lean = ceiling(TRN2_48XLARGE, lean_loader=True)
+    assert lean["weight_gb"] < 2000.0
+    assert ceiling(TRN2_48XLARGE, lean_loader=True, node_count=2)["params_b"] \
+        > lean["params_b"]
