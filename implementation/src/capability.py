@@ -53,6 +53,8 @@ __all__ = [
     "assess",
     "profile_for",
     "measured_weight_gb",
+    "host_load_peak_gb",
+    "ceiling",
 ]
 
 # Bytes per parameter by dtype string.
@@ -75,11 +77,21 @@ _TP_CAPS: tuple[tuple[str, int | None], ...] = (
 
 @dataclass(frozen=True)
 class HardwareProfile:
-    """What a box actually offers. ``hbm_gb_per_core`` is the binding number."""
+    """What a box actually offers.
+
+    ``hbm_gb_per_core`` bounds the model AFTER sharding. ``host_ram_gb`` bounds it
+    DURING THE LOAD, and on a 48xl that is the wall you hit FIRST -- see
+    ``host_load_peak_gb``.
+    """
 
     name: str
     cores: int
     hbm_gb_per_core: float
+    # Total host DRAM in decimal GB, measured from /proc/meminfo where possible.
+    # trn2.48xlarge: MemTotal = 2_097_112_352 kB = 2147 GB (read off the box
+    # 2026-08-29). 0.0 means unmodelled, which SKIPS the host check rather than
+    # guessing a number that could block a model that would have run.
+    host_ram_gb: float = 0.0
     # Fraction of a core's HBM the weights may occupy; the rest is activations,
     # KV cache and compiler scratch.
     #
@@ -111,7 +123,11 @@ class HardwareProfile:
 
 
 # LNC=2: 16 devices x 4 logical cores, 24 GB per logical core.
-TRN2_48XLARGE = HardwareProfile("trn2.48xlarge", cores=64, hbm_gb_per_core=24.0)
+# host_ram_gb is set ONLY where it was read off the box. The others are left
+# unmodelled (0.0) so the host check is skipped rather than run against a guess:
+# an invented DRAM size would start rejecting models on no evidence.
+TRN2_48XLARGE = HardwareProfile("trn2.48xlarge", cores=64, hbm_gb_per_core=24.0,
+                                host_ram_gb=2147.0)   # /proc/meminfo, 2026-08-29
 TRN2_3XLARGE = HardwareProfile("trn2.3xlarge", cores=4, hbm_gb_per_core=24.0)
 TRN1_32XLARGE = HardwareProfile("trn1.32xlarge", cores=32, hbm_gb_per_core=16.0)
 TRN1_2XLARGE = HardwareProfile("trn1.2xlarge", cores=2, hbm_gb_per_core=16.0)
@@ -161,7 +177,8 @@ class Verdict:
     """
 
     ok: bool
-    status: str                     # RUNNABLE | TOO_LARGE | NEEDS_MULTINODE | UNKNOWN
+    status: str                     # RUNNABLE | TIGHT | TOO_LARGE | HOST_LIMITED
+                                    # | NEEDS_MULTINODE | UNKNOWN
     reason: str = ""
     params: int = 0
     weight_gb: float = 0.0
@@ -228,6 +245,83 @@ def estimate_params(config: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         "attn_params": attn, "mlp_params": mlp, "embed_params": embed,
         "is_moe": bool(n_exp),
     }
+
+
+# Host DRAM held by ONE rank while it streams a checkpoint shard-by-shard and
+# keeps only its own slice. One safetensors file is typically 4-5 GB.
+_LEAN_STREAM_GB = 5.0
+
+
+def host_load_peak_gb(
+    weight_gb: float,
+    ranks: int,
+    *,
+    lean_loader: bool = False,
+    stream_gb: float = _LEAN_STREAM_GB,
+) -> float:
+    """Peak HOST DRAM, summed over every rank on the node, during model load.
+
+    This is the constraint the HBM math misses, and on a trn2.48xlarge it binds
+    long before HBM does.
+
+    ``AutoModelForCausalLM.from_pretrained`` materialises the WHOLE model in the
+    calling process. Tensor parallelism runs one process per core, and sharding
+    happens only AFTER the model object exists, so the transient peak is
+    ``ranks * weight_gb`` -- every rank holds a full private copy at the same
+    moment. Nothing about a bigger tp helps; tp makes it strictly worse:
+
+        Qwen3.5-35B-A3B    72 GB x 16 ranks =  1.2 TB of 2.1 TB   survives
+        Qwen3.5-122B-A10B 250 GB x 32 ranks =  8.0 TB             OOMKilled
+        DeepSeek-V4-Flash 319 GB x 64 ranks = 20.4 TB             OOMKilled (137)
+
+    The two budgets therefore pull in OPPOSITE directions -- HBM per rank wants
+    more ranks, host DRAM wants fewer -- which is why "try a bigger tp" could
+    never resolve these models.
+
+    ``lean_loader=True`` models a shard-on-read loader: build on ``meta``, stream
+    one file at a time, slice this rank's portion, release the rest. Peak becomes
+    the resident sharded weights plus one file in flight per rank, so the rank
+    count stops multiplying the model size.
+    """
+    ranks = max(1, ranks)
+    if lean_loader:
+        return weight_gb + ranks * stream_gb
+    return ranks * weight_gb
+
+
+def ceiling(
+    hw: HardwareProfile = TRN2_48XLARGE,
+    *,
+    lean_loader: bool = False,
+    bytes_per_param: float = 2.0,
+    node_count: int = 1,
+) -> dict[str, Any]:
+    """Largest model ``hw`` can run, and which constraint binds.
+
+    Sweeps the power-of-two rank counts the backend actually chooses and keeps the
+    best. Answers "what is the biggest model that fits on this box" with the
+    binding constraint named, so the answer is actionable rather than a number.
+    """
+    best: dict[str, Any] = {"weight_gb": 0.0, "ranks": 0, "binding": "none"}
+    cores = hw.cores * max(1, node_count)
+    host = hw.host_ram_gb * max(1, node_count)
+    r = 1
+    while r <= cores:
+        hbm_cap = r * hw.usable_gb_per_core
+        caps = [("hbm-per-rank", hbm_cap), ("total-hbm", hw.total_hbm_gb * max(1, node_count))]
+        if host > 0:
+            if lean_loader:
+                caps.append(("host-dram", max(0.0, host - r * _LEAN_STREAM_GB)))
+            else:
+                caps.append(("host-dram", host / r))
+        binding, cap = min(caps, key=lambda kv: kv[1])
+        if cap > best["weight_gb"]:
+            best = {"weight_gb": round(cap, 1), "ranks": r, "binding": binding}
+        r *= 2
+    best["params_b"] = round(best["weight_gb"] * 1e9 / bytes_per_param / 1e9, 1)
+    best["hw"] = hw.name
+    best["lean_loader"] = lean_loader
+    return best
 
 
 def max_clean_tp(config: dict[str, Any], hw: HardwareProfile) -> int:
@@ -349,6 +443,12 @@ def assess(
                   budget_gb_per_rank=round(budget, 1),
                   min_tp_needed=min_tp, details=breakdown)
 
+    host_peak = host_load_peak_gb(weight_gb, ranks)
+    host_lean = host_load_peak_gb(weight_gb, ranks, lean_loader=True)
+    breakdown["host_ram_gb"] = hw.host_ram_gb
+    breakdown["host_peak_gb"] = round(host_peak, 1)
+    breakdown["host_peak_lean_gb"] = round(host_lean, 1)
+
     if weight_gb > hw.total_hbm_gb * max(1, node_count):
         return Verdict(
             False, "NEEDS_MULTINODE",
@@ -356,6 +456,24 @@ def assess(
                     f"{hw.name} ({hw.total_hbm_gb:.0f} GB HBM across "
                     f"{hw.cores} cores){dq_note} -- needs nodeCount>1, "
                     f"not a bigger TP"),
+            **common)
+
+    if hw.host_ram_gb > 0 and host_peak > hw.host_ram_gb * max(1, node_count):
+        fits_lean = host_lean <= hw.host_ram_gb * max(1, node_count)
+        return Verdict(
+            False, "HOST_LIMITED",
+            reason=(f"loading {weight_gb:.0f} GB on {ranks} ranks needs "
+                    f"{host_peak:.0f} GB of host DRAM ({ranks} full copies, one "
+                    f"per rank, because from_pretrained materialises the whole "
+                    f"model before sharding) but {hw.name} has "
+                    f"{hw.host_ram_gb:.0f} GB -- this OOM-kills the pod during "
+                    f"load, before any core is touched. A bigger tp makes it "
+                    f"WORSE, not better"
+                    + (f"; a shard-on-read loader would need only "
+                       f"{host_lean:.0f} GB and would fit" if fits_lean
+                       else f"; even a shard-on-read loader needs "
+                            f"{host_lean:.0f} GB")
+                    + dq_note),
             **common)
 
     if gb_per_rank > budget:
