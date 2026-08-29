@@ -363,6 +363,9 @@ def match_family(fp: ArchFingerprint | None, model_id: str = "") -> OnboardVerdi
     # is a parameterizable plan the dense adapter does not carry. Tier-1
     # synthesis (Phase 2), not a Tier-0 map. (Kept a distinct branch so a future
     # moe_causal_lm Tier-0 family can slot in here.)
+    # HOW TO BUILD THE EXPERT LAYOUT: see docs/large-model-playbook.md — experts
+    # are the memory bulk and the dense TP path does NOT shard them (that is the
+    # Qwen3.5-30B OOM); the fix is expert-TP in backends/qwen38_tp.py:shard_moe.
     if fp.is_moe:
         return OnboardVerdict(
             Verdict.TIER1_SYNTHESIZE,
