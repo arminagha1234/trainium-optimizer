@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trainium-optimizer"
+version = "0.1.0"
+description = "Autonomous Trainium (AWS Neuron/NKI) model optimizer — point it at a HuggingFace model, get a verified, published recipe."
+readme = "README.md"
+requires-python = ">=3.10"
+# Runtime deps are intentionally minimal so a laptop `--backend mock` run works
+# with no Neuron SDK. Real backends (native-pytorch/vllm) need the on-device
+# toolchain — see implementation/ENVIRONMENT.md.
+dependencies = ["pyyaml", "numpy", "matplotlib"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+# Discoverable console entry points (installed by `pip install -e .`):
+trainium-optimize = "optimizer.run:main"
+trainium-apply = "optimizer.apply:main"
+trainium-measure = "optimizer.measure:main"
+
+[tool.setuptools]
+# Only the thin CLI bridge package is a real package; the framework code stays
+# flat under implementation/src (added to sys.path by optimizer/__init__.py).
+packages = ["optimizer"]
