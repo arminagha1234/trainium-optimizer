@@ -44,13 +44,18 @@ from typing import Any, Callable
 # blanket "attention → author it" assumption. ``scan`` (linear-attention / SSM /
 # GatedDeltaNet) STAYS: its sequential recurrence genuinely can't be parallelized
 # by the compiler (validated separately).
-_COMPILER_WEAK_FAMILIES = frozenset({"scan"})
+_COMPILER_WEAK_FAMILIES = frozenset({"scan", "indirect_gather"})
 # A default analytic opportunity score per family (0..1, higher = more worth
 # authoring). scan high; standard families low; attention handled specially by
 # ``_attention_opportunity`` (shape-aware), so its entry here is only the
 # unknown-shape fallback.
 _FAMILY_OPPORTUNITY = {
     "attention": 0.40, "scan": 0.90, "moe_router": 0.55,
+    # indirect_gather (interpolate/upsample/resample with a STATIC pattern): the
+    # naive lowering is an indirect DMA on GpSimd (compiler-weak), and the
+    # gather-as-matmul rewrite is a big, on-device-proven win (UniVR 13x). High
+    # opportunity — do NOT let these fall through to elementwise's 0.15.
+    "indirect_gather": 0.85,
     "softmax": 0.35, "reduction": 0.30, "normalization": 0.25,
     "matmul": 0.15, "elementwise": 0.15,
 }

@@ -53,7 +53,8 @@ except Exception:  # noqa: BLE001
     _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
     from backends.kernel_inject import inject_kernel
 
-PEAK_TFLOPS_BF16 = 380.0  # per NeuronCore, Trn2 (trajectory-reporting.md)
+PEAK_TFLOPS_BF16 = 79.0  # DENSE bf16 per NeuronCore-v3, Trn2 (arch doc, corrected
+                         # 2026-08-29 from 380 — see roofline.PEAK_TFLOPS_BF16_PER_CORE)
 HBM_GB_PER_LOGICAL_CORE = 48.0  # 96 GB/device / 4 phys cores * LNC2 (2 phys/logical)
 
 

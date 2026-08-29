@@ -61,8 +61,19 @@ from typing import Any, Callable
 MEMORY_BOUND = "memory_bound"      # spilling intermediates through HBM
 SINGLE_ENGINE = "single_engine"    # one engine serializes; PE under-filled
 DMA_BLOCKED = "dma_blocked"        # bandwidth/packet-rate bound on the load path
+GPSIMD_BOUND = "gpsimd_bound"      # indirect/dynamic gather serializing on GpSimd
 
 _GUIDANCE: dict[str, list[str]] = {
+    GPSIMD_BOUND: [
+        "MAKE THE ADDRESSING STATIC / express the gather as a MATMUL. GpSimd is "
+        "serializing an indirect (data-dependent) gather on its slow integrated DMA "
+        "(~153 GB/s/dir) while TensorE sits idle. If the access pattern is known at "
+        "trace time, compute the indices on the HOST and bake them as compile-time "
+        "constants so every DMA is static-addressed; and if the gather is linear "
+        "(bilinear/interpolate/upsample/one-hot), rewrite it as `out = W @ x` with a "
+        "precomputed mostly-zero weight matrix so the work runs on TensorE (the "
+        "strongest engine), not GpSimd. Applies ONLY to STATIC access patterns — "
+        "not data-dependent gathers (KV-paging, MoE token dispatch)."],
     MEMORY_BOUND: [
         "FUSE the whole op into ONE kernel and HOIST loop-invariant loads "
         "(gamma/beta/cap/row-max) out of the tile loop: a memory-bound op that "
@@ -121,6 +132,12 @@ def classify_bottleneck(race: Any) -> str:
     lever without waiting on a real profiler. Never raises; defaults to
     memory_bound (fusion) when nothing is known."""
     hay = f"{getattr(race, 'bottleneck', '')} {getattr(race, 'reason', '')}".lower()
+    # gpsimd / indirect-gather FIRST — its reason contains "gpsimd-bound" and would
+    # otherwise be swallowed by the "dma"/"engine" checks below (wrong fix). Match
+    # the LABEL token "gpsimd-bound" (not bare "gpsimd") so a single-engine reason
+    # that merely lists "GPSIMD 0%" does not misroute here.
+    if "gpsimd-bound" in hay or "gpsimd_bound" in hay or "indirect" in hay:
+        return GPSIMD_BOUND
     if "dma" in hay or "bandwidth" in hay:
         return DMA_BLOCKED
     if "single" in hay or "serial" in hay or "engine" in hay:

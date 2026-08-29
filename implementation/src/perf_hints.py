@@ -72,6 +72,33 @@ class PerfHint:
 # the guide's own.
 HINTS: tuple[PerfHint, ...] = (
     PerfHint(
+        key="indirect-gather-static-or-matmul",
+        opt="GpSimd/indirect",
+        title="GpSimd-bound: an indirect/dynamic gather serializes while TensorE idles",
+        triggers=(
+            r"gpsimd[-_ ]?bound", r"indirect[-_ ]?dma", r"indirect[-_ ]?gather",
+            r"dynamic[-_ ]?dma", r"\binterpolate\b", r"grid[-_ ]?sample",
+            r"\bgather\b", r"\bupsample\b", r"\bresample\b",
+        ),
+        fix=(
+            "MAKE THE ADDRESSING STATIC, then EXPRESS THE GATHER AS A MATMUL. GpSimd\n"
+            "is serializing an indirect/dynamic gather on its slow integrated DMA\n"
+            "(~153 GB/s/dir) while TensorE sits idle — proven on UniVR: 758.9->106 ms\n"
+            "(7x) from static addressing, then ->55.6 ms (1.92x, TensorE 2.4%->67%)\n"
+            "from the matmul form, 13x cumulative. Two levers:\n"
+            "  1. If the sampling indices are DATA-INDEPENDENT at trace time, compute\n"
+            "     them on the HOST and bake them as COMPILE-TIME CONSTANTS so every\n"
+            "     DMA is static-addressed (frees GpSimd, streams at HBM peak).\n"
+            "  2. If the resample is LINEAR (bilinear/interpolate/upsample/one-hot),\n"
+            "     rewrite it as `out = W @ x` with a precomputed mostly-ZERO weight\n"
+            "     matrix (bilinear = 4 corner taps/row) — one static matmul on\n"
+            "     TensorE instead of an indirect gather on GpSimd.\n"
+            "ONLY for STATIC access patterns — NOT data-dependent gathers (KV-cache\n"
+            "paging, MoE token dispatch), whose indices depend on runtime values."
+        ),
+        technique="gather-as-matmul",
+    ),
+    PerfHint(
         key="fast-weight-load-matvec",
         opt="Opt #7",
         title="matmul with a SHORT dimension underfills the PE array (matrix-vector / decode)",
@@ -242,9 +269,10 @@ HINTS: tuple[PerfHint, ...] = (
 # share the vocabulary). These are the profile-threshold breaches + shape cues the
 # hints trigger on. Kept in sync with neuron_profile.perf_symptoms.
 SYMPTOM_TOKENS = (
-    "memory-bound", "single-engine", "dma-blocked",      # coarse bottleneck labels
+    "memory-bound", "single-engine", "dma-blocked", "gpsimd-bound",  # coarse bottleneck labels
     "low-mfu", "low-mbu", "spill-high", "small-dma",      # profile-threshold breaches
     "short-matmul-dim", "per-element-scan", "transpose",  # shape / structure cues
+    "indirect-dma", "indirect-gather",                    # GpSimd / static-addressing cues
 )
 
 
@@ -266,6 +294,10 @@ def symptoms_from(bottleneck: str = "", *, reason: str = "", op_name: str = "",
         hay += " per-element-scan"
     if op_family == "matmul" or any(k in hay for k in ("decode", "matvec", "gemv")):
         hay += " short-matmul-dim"
+    if op_family == "indirect_gather" or any(k in hay for k in (
+            "interpolate", "grid_sample", "grid-sample", "resample", "upsample",
+            "gather", "scatter", "bilinear", "warp", "remap")):
+        hay += " indirect-gather indirect-dma"
     return hay
 
 
