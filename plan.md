@@ -110,6 +110,20 @@ requested, it slots at P1 as another MoE+sparse-attn case. Models too big for a
 single 48xl node (Kimi-K3 2.8T, DeepSeek-V4 full depth) run **multinode** once
 EFA/multi-box is wired.
 
+### Precision / quantization by hardware (matters for the mxfp4 models)
+
+| Format | trn2 | trn3 |
+|---|---|---|
+| bf16 / fp16 / fp32 | ✅ | ✅ |
+| fp8 (e4m3 / e5m2) | ✅ | ✅ |
+| **mxfp4** | ❌ | ✅ (trn3-only) |
+| NVFP4 (Blackwell) · int8 / int4 | ❌ | ❌ |
+
+Consequences:
+- **Quantization is a weak lever on trn2** — the only sub-bf16 format is **fp8**, and whether fp8 PTQ beats bf16 + `torch.compile(neuron)` is *unproven* (measure first; the compiler is already strong). The NVIDIA (Model-Optimizer / TRT-LLM) quant menu — NVFP4, INT4-AWQ, INT8-SmoothQuant — does **not** apply to Trainium (fp-centric engine).
+- **mxfp4 models run dequant→bf16 on trn2, native mxfp4 on trn3.** Kimi-K3 and DeepSeek-V4 use mxfp4 routed experts; on the trn2 fleet those experts are **dequantized mxfp4→bf16 in-kernel** (the fp8/mxfp4-dequant idiom) — full-fidelity native mxfp4 waits for **trn3**. Publish per-(model, hardware) so the trn2-dequant and trn3-native results don't collide.
+- The portable ModelOpt idea for Trainium is **speculative decoding** (hardware-agnostic; targets the bs=1 host-bound decode bottleneck), *not* quantization.
+
 ---
 
 ## Phase 0 — Scope-check (1 week)
