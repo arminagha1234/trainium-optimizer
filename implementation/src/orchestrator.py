@@ -40,6 +40,33 @@ from ledger import (
 from proposer import BeamProposer, Candidate
 
 
+
+def _load_moe_kernel_source() -> str:
+    """Read moe_fused's KERNEL_SOURCE from knowledge-bank/kernels/.
+
+    Kernels now live at repo-root ``knowledge-bank/kernels/``, which cannot be an
+    import package (the directory name contains a hyphen), so the previous
+    ``from kernels.moe_fused import KERNEL_SOURCE`` is no longer possible. Load
+    the module by path instead. Returns "" when absent so a missing kernel tree
+    degrades to "no MoE borrow candidate" rather than breaking the run.
+    """
+    import importlib.util
+    from pathlib import Path as _P
+
+    pkg = (_P(__file__).resolve().parents[2] / "knowledge-bank" / "kernels"
+           / "moe_fused" / "__init__.py")
+    if not pkg.is_file():
+        return ""
+    try:
+        spec = importlib.util.spec_from_file_location("_kb_moe_fused", pkg)
+        if spec is None or spec.loader is None:
+            return ""
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return getattr(mod, "KERNEL_SOURCE", "") or ""
+    except Exception:  # noqa: BLE001 -- a missing/broken kernel tree must not
+        return ""      # take down the orchestrator
+
 class NoBaselineError(RuntimeError):
     """Raised when Stage 0 cannot establish a baseline (the worker crashed or
     produced 0 throughput). The optimization run is void: there is no incumbent
@@ -342,7 +369,7 @@ class Orchestrator:
         # method simply expose no candidates (getattr default []).
         moe_candidates = getattr(self.backend, "moe_kernel_candidates", None)
         if callable(moe_candidates):
-            from kernels.moe_fused import KERNEL_SOURCE
+            KERNEL_SOURCE = _load_moe_kernel_source()
             base_artifact = self.backend.build_baseline(spec.model_id)
             for label, patch in moe_candidates(base_artifact):
                 cand = Candidate(config={**base_cfg, **patch},

@@ -28,7 +28,9 @@ from invent_engine import InventEngine
 from invent_kernels import flash_attention_spec, nki_available
 
 # The in-repo kernel corpus dir (ships the FlashAttention manifest + source).
-KERNEL_DIR = Path(__file__).resolve().parent / "kernels"
+# Kernels live at repo-root knowledge-bank/kernels/ (one home for registry
+# + library). src/../.. == repo root.
+KERNEL_DIR = Path(__file__).resolve().parents[2] / "knowledge-bank" / "kernels"
 
 
 # -- mock nn-module-like target ----------------------------------------------

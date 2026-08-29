@@ -17,8 +17,9 @@ from pathlib import Path
 from kernel_registry import KernelRegistry, kernel_for_primitive
 from backends.kernel_inject import load_kernel_entry
 
-# The banked kernels live in implementation/src/kernels/ (next to this test's dir).
-_KERNEL_DIR = Path(__file__).resolve().parent / "kernels"
+# The banked kernels live at repo-root knowledge-bank/kernels/ -- the single
+# home shared by KernelRegistry (harvest) and KernelLibrary (bank-on-win).
+_KERNEL_DIR = Path(__file__).resolve().parents[2] / "knowledge-bank" / "kernels"
 
 
 class _MockModule:
