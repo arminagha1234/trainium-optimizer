@@ -61,12 +61,24 @@ DEFAULT_SSH_URL = os.environ.get(
 )
 DEFAULT_BRANCH = os.environ.get("PUB_BRANCH", "main")
 
-AUTHOR_NAME = "arminagha1234"
-AUTHOR_EMAIL = "arminagha1234@users.noreply.github.com"
+# Showcase commit identity. Overridable so this publisher is not welded to one
+# person's account -- a second agent, a CI runner or a fork needs to publish
+# under its own identity without editing source.
+AUTHOR_NAME = os.environ.get("PUB_AUTHOR_NAME", "arminagha1234")
+AUTHOR_EMAIL = os.environ.get(
+    "PUB_AUTHOR_EMAIL", "arminagha1234@users.noreply.github.com"
+)
 
 # The only paths this publisher is ever allowed to stage. Enforced with an
 # explicit `git add <these>` — we never `git add -A`.
 ALLOWED_PATHS = ("optimized_models", "LEADERBOARD.md", "README.md")
+
+# A row is auditable when its recipe.json exists and its bundle directory is
+# real -- that is the hard requirement, because every number is read from that
+# file and the row links to that directory. These extras make a bundle
+# reproducible rather than merely auditable, so their absence is reported but
+# does not remove a genuine verified result.
+_RECOMMENDED_BUNDLE_FILES = ("reproduce.sh", "RECIPE.md", "results.tsv")
 
 MARKER_START = "<!-- LEADERBOARD:START -->"
 MARKER_END = "<!-- LEADERBOARD:END -->"
@@ -186,6 +198,25 @@ def _deliverable_from_recipe(
         return None
 
     source_dir = recipe_path.parent
+    # SINGLE SOURCE OF TRUTH: a row may only exist if its deliverable bundle
+    # exists on disk next to the recipe it is rendered from. Historically the
+    # leaderboard carried rows whose linked optimized_models/<slug>/ directory
+    # was absent -- every such link 404s for a reader, and the number behind it
+    # cannot be checked against anything. A row with a dead link is worse than
+    # no row: it looks verified and cannot be audited.
+    if not source_dir.is_dir():
+        print(f"[publish] skipping {model_id or recipe_path}: bundle directory "
+              f"{source_dir} does not exist -- the row's link would 404",
+              file=sys.stderr)
+        return None
+    # Auditability is carried by recipe.json (already parsed above): every number
+    # in the row comes from it. Reproducibility extras are reported but never
+    # disqualify a genuine verified run -- dropping a real result over a missing
+    # PNG would be worse than an incomplete bundle.
+    incomplete = [f for f in _RECOMMENDED_BUNDLE_FILES if not (source_dir / f).exists()]
+    if incomplete:
+        print(f"[publish] {model_id}: bundle incomplete (missing {incomplete}) -- "
+              f"row still listed, numbers come from recipe.json", file=sys.stderr)
     config = recipe.get("config", {}) or {}
     toolchain = recipe.get("toolchain", {}) or {}
     return Deliverable(
@@ -321,6 +352,10 @@ def render_leaderboard(deliverables: list[Deliverable]) -> str:
         "[`optimized_models/`](./optimized_models/) — each folder holds "
         "`recipe.json`, `RECIPE.md`, `reproduce.sh`, `results.tsv`, and "
         "`optimization_timeline.png`.",
+        "",
+        "Every row is generated from a `recipe.json` in an existing bundle: no bundle, "
+        "no row, and no number that is not read straight out of that file. Rows are "
+        "never hand-added — a hand-added row is removed on the next publish.",
         "",
         "| Rank | Model | Family | Params | Baseline (tok/s) | Best (tok/s) | "
         "Speedup | Best config | Hardware | Verified | Recipe |",
@@ -475,13 +510,19 @@ def publish(
     optimized_models_dir: Path | str = DEFAULT_OPTIMIZED_MODELS_DIR,
     ssh_url: str = DEFAULT_SSH_URL,
     lock_path: str = DEFAULT_LOCK_PATH,
-    dry_run: bool = False,
+    dry_run: bool = True,
 ) -> dict[str, Any]:
     """Publish verified deliverables + refreshed leaderboard to ``branch``.
 
     Safe by construction: separate checkout, ``flock``, ``pull --rebase`` before
     push, scoped ``git add`` (only ``optimized_models/**`` + ``LEADERBOARD.md`` +
     README table region), deploy-key push, and a no-op when git sees no diff.
+
+    **``dry_run`` defaults to True.** This function rewrites the public showcase
+    of the repo, so the default has to be the harmless one -- an accidental or
+    mis-configured invocation should print what it *would* change and stop.
+    Writing requires opting in explicitly (``dry_run=False`` / ``--push``),
+    which makes every real publish an intentional act rather than a default.
     Returns a result dict for the loop to log.
     """
     repo_dir = Path(repo_dir)
@@ -592,7 +633,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ssh-url", default=DEFAULT_SSH_URL)
     p.add_argument("--branch", default=DEFAULT_BRANCH)
     p.add_argument("--lock-path", default=DEFAULT_LOCK_PATH)
-    p.add_argument("--dry-run", action="store_true")
+    # Writing is opt-in. --dry-run is kept for backwards compatibility but is
+    # now the default, so passing it changes nothing; --push is what publishes.
+    p.add_argument("--dry-run", action="store_true", default=True,
+                   help="(default) report what would change and write nothing")
+    p.add_argument("--push", dest="dry_run", action="store_false",
+                   help="actually commit and push the showcase")
     return p
 
 
