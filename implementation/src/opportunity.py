@@ -28,7 +28,7 @@ when on-box; off-box the analytic ranking stands alone.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 # Op families where a hand/LLM-authored NKI kernel can beat the compiler (it is
@@ -271,4 +271,26 @@ def select_targets(specs: list, sol_fn: Callable[[Any], tuple] | None = None,
     op; returns [] if nothing is worth authoring (an honest 'compiler already
     wins everything here')."""
     ranked = [t for t in rank_targets(specs, sol_fn) if t.worth_authoring]
-    return ranked[:max_targets] if max_targets is not None else ranked
+    ranked = ranked[:max_targets] if max_targets is not None else ranked
+    # BORROW BEFORE INVENT: every op we're about to author gets a pointer to the
+    # harvest sources, so the framework checks for an existing kernel first
+    # instead of authoring blind. See harvest_sources / docs/kernel-sources.md.
+    return [replace(t, reason=t.reason + _BORROW_HINT) for t in ranked]
+
+
+# --- borrow-before-invent: surface the harvest sources at authoring time -----
+_BORROW_HINT = ("  — borrow-check first: harvest_sources / docs/kernel-sources.md "
+                "(jburtoft, nki-library, nki-samples) before authoring")
+
+
+def harvest_hint(spec: Any = None) -> list[dict]:
+    """The harvest sources to check for an EXISTING kernel before authoring one
+    (borrow before invent). Returns the flat source list from ``kernel_sources.yaml``
+    via ``harvest_sources`` (all sources; the caller/agent picks by op). Empty list
+    if the source list is unavailable — never raises, so target selection never
+    breaks on a missing/loadable sources file."""
+    try:
+        import harvest_sources  # noqa: PLC0415 — optional, self-contained
+        return harvest_sources.all_sources()
+    except Exception:  # noqa: BLE001
+        return []
