@@ -188,3 +188,93 @@ def test_dense_layers_are_left_alone():
     m.model.layers[0].mlp.gate_proj = nn.Linear(4, 4)
     n, _ = shard_moe_experts(m, rank=0, world=4)
     assert n == 0
+
+
+# ---------------------------------------------------------------------------
+# EP decoupled from TP: experts shard across ep_degree < world ranks, replicated
+# across world/ep_degree groups, and the mixture is summed WITHIN each EP group.
+# Same simulation contract as _sharded_sum above: summing a group's partials is
+# exactly what dist.all_reduce(group=ep_group) computes. If the group partition ever
+# dropped or double-counted an expert, the sum would diverge from the unsharded
+# reference -- so this fails instead of a decoupled run reporting a wrong number.
+# ---------------------------------------------------------------------------
+
+def _ep_group_sum(ref, world, ep_degree, hs, idx, w, group_id=0):
+    """Sum the partials of one EP group's ranks -- the scoped all_reduce's result."""
+    out = None
+    for ep_rank in range(ep_degree):
+        r = group_id * ep_degree + ep_rank
+        shard = ExpertParallelExperts(ref, r, world, ep_size=ep_degree,
+                                      ep_rank=r % ep_degree, ep_group=None)
+        o = shard(hs, idx, w)
+        out = o if out is None else out + o
+    return out
+
+
+def test_ep_group_partition_covers_every_expert_exactly_once():
+    """Each EP group, on its own, must own every expert exactly once."""
+    from backends.moe_ep import expert_shard_plan
+    num_experts = 16
+    for world in (8, 16):
+        for ep_degree in (1, 2, 4, 8):
+            if world % ep_degree:
+                continue
+            for group_id in range(world // ep_degree):
+                seen = []
+                for ep_rank in range(ep_degree):
+                    lo, hi = expert_shard_plan(num_experts, ep_rank, ep_degree)
+                    seen += list(range(lo, hi))
+                assert sorted(seen) == list(range(num_experts)), (world, ep_degree)
+
+
+def test_ep_decoupled_group_sum_equals_unsharded_fp32():
+    torch.manual_seed(0)
+    ref = RefExperts(16, 32, 24).eval()
+    hs = torch.randn(12, 32)
+    idx, w = _routing(12, 16, top_k=4)
+    expected = ref(hs, idx, w)
+    # world=8 cores; try every EP split that divides it.
+    for ep_degree in (1, 2, 4, 8):
+        got = _ep_group_sum(ref, 8, ep_degree, hs, idx, w)
+        assert torch.allclose(got, expected, atol=1e-6), \
+            f"ep_degree={ep_degree} diverged from unsharded"
+
+
+def test_ep_decoupled_uneven_experts_still_exact():
+    """Experts not divisible by ep_degree must still partition exactly."""
+    torch.manual_seed(1)
+    ref = RefExperts(13, 32, 24).eval()
+    hs = torch.randn(10, 32)
+    idx, w = _routing(10, 13, top_k=3)
+    expected = ref(hs, idx, w)
+    for ep_degree in (2, 4):          # 13 % 2, 13 % 4 both nonzero
+        got = _ep_group_sum(ref, 8, ep_degree, hs, idx, w)
+        assert torch.allclose(got, expected, atol=1e-6), ep_degree
+
+
+def test_every_ep_group_computes_the_same_mixture():
+    """Replicas across groups are redundant, not divergent -- each group's sum is
+    the full mixture, so different groups agree."""
+    torch.manual_seed(2)
+    ref = RefExperts(16, 32, 24).eval()
+    hs = torch.randn(8, 32)
+    idx, w = _routing(8, 16, top_k=4)
+    g0 = _ep_group_sum(ref, 8, 4, hs, idx, w, group_id=0)
+    g1 = _ep_group_sum(ref, 8, 4, hs, idx, w, group_id=1)
+    assert torch.allclose(g0, g1, atol=1e-6)
+
+
+def test_ep_degree_none_or_world_is_the_coupled_default():
+    """ep_degree None / ==world must reproduce the original coupled shards exactly,
+    so turning the knob off is byte-identical to before."""
+    torch.manual_seed(3)
+    ref = RefExperts(16, 32, 24).eval()
+    for world in (2, 4, 8):
+        for r in range(world):
+            base = ExpertParallelExperts(ref, r, world)
+            for ep in (None, world):
+                dec = ExpertParallelExperts(ref, r, world, ep_size=(ep or world),
+                                            ep_rank=r, ep_group=None)
+                assert torch.equal(base.gate_up_proj, dec.gate_up_proj), (world, r, ep)
+                assert (base.lo, base.hi) == (dec.lo, dec.hi)
+                assert dec.ep_group is None
