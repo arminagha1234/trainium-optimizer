@@ -179,6 +179,53 @@ def prewarm_hf_cache(model_id: str, log=None) -> bool:
         return False
 
 
+def tp_cap_for(archs: str, heads: int | None, linear_value_heads: int | None,
+               core_count: int) -> int:
+    """Largest TENSOR-PARALLEL degree this architecture can express.
+
+    Single definition, called by both the baseline chooser and the search axis.
+    They disagreed before: #121 raised the Qwen3.5 cap from 4 to the head count in
+    `_fit_baseline_tp` and missed `config_axes`, so the baseline could run at tp=8
+    or tp=32 while the search would never propose above 4 for the very models that
+    needed it.
+
+    Bounds, in order of how hard they are:
+
+    * **Gemma4: a hard 4.** Its Global layers use head_dim 512 with only 4 KV
+      heads, so tp>4 shards a KV head below one head_dim and crashes.
+    * **Query heads.** TP splits attention by head, so nothing above the head count
+      is expressible at all.
+    * **GatedDeltaNet value heads.** These cannot be replicated the way KV heads
+      can (#135): out_proj is row-sharded with an all-reduce, so two ranks holding
+      the same value head would have its contribution summed twice. Bounding here
+      means such a candidate is never proposed, rather than proposed and then
+      raising inside the shard.
+    * **Physical cores.**
+    """
+    cap = 4 if "Gemma4" in archs else (heads or 64)
+    if linear_value_heads:
+        cap = min(cap, linear_value_heads)
+    return max(1, min(int(cap), int(core_count)))
+
+
+def tp_candidates(heads: int | None, cap: int) -> list[int]:
+    """Every TP degree that divides the head count, up to ``cap``.
+
+    Deliberately NOT restricted to powers of two, which is what the axis used to
+    offer. A 24-head model then capped at tp=8 and left 40 of a 64-core box idle,
+    when tp=12 and tp=24 are both perfectly valid shardings:
+
+        Qwen3.8-27B (24 heads)   powers of two: 1,2,4,8
+                                 divisors:      1,2,3,4,6,8,12,24
+
+    Falls back to the power-of-two ladder only when the head count is unknown,
+    since without it there is nothing to divide.
+    """
+    if not heads:
+        return [t for t in (1, 2, 4, 8, 16, 32, 64) if t <= cap]
+    return [t for t in range(1, cap + 1) if heads % t == 0]
+
+
 def _is_noise(line: str) -> bool:
     """Separator banners, rule lines and runtime env dumps carry no diagnosis.
 
@@ -344,8 +391,10 @@ class NativePyTorchBackend:
         # both inside the 24 GB/core budget, where a cap of 4 left them at 17 and
         # 60 GB/rank respectively. Nothing above the head count is expressible
         # anyway, so this is the widest correct value rather than a new guess.
-        max_tp = 4 if "Gemma4" in archs else (heads if "Qwen3_5" in archs else 64)
-        max_tp = min(max_tp, self.core_count)   # never exceed physical cores
+        # Same cap the search axis uses, from one definition -- these two drifted
+        # apart once already (#121 fixed this site and missed config_axes).
+        _lvh = _int("linear_num_value_heads", 0) or None
+        max_tp = tp_cap_for(archs, heads, _lvh, self.core_count)
         best = None
         # 24GB per NeuronCore -> keep weights under ~10GB/rank so there is room
         # for activations + compiler scratch. tp only needs to divide the query
@@ -468,7 +517,7 @@ class NativePyTorchBackend:
         # #2 Model-aware TP: only offer tp that divides the query-head count (and
         # respects the gemma4 cap), so the search never wastes a candidate
         # loading a 30-60GB model just to reject an impossible shard.
-        tps = [1, 2, 4, 8, 16, 32, 64]
+        tps = [t for t in (1, 2, 4, 8, 16, 32, 64) if t <= self.core_count]
         mid = getattr(self, "_model_id", None)
         if mid:
             try:
@@ -479,15 +528,21 @@ class NativePyTorchBackend:
                 except Exception:  # noqa: BLE001
                     pass
                 heads = getattr(cfg, "num_attention_heads", None)
+                lvh = getattr(cfg, "linear_num_value_heads", None)
                 archs = " ".join(getattr(self._hf_config(mid), "architectures", []) or [])
-                cap = 4 if ("Gemma4" in archs or "Qwen3_5" in archs) else 64
-                cap = min(cap, self.core_count)   # never propose tp > physical cores
-                if isinstance(heads, int):
-                    tps = [t for t in tps if heads % t == 0 and t <= cap]
-                else:
-                    tps = [t for t in tps if t <= cap]
-            except Exception:  # noqa: BLE001
-                pass
+                cap = tp_cap_for(archs, heads if isinstance(heads, int) else None,
+                                 lvh if isinstance(lvh, int) else None,
+                                 self.core_count)
+                tps = tp_candidates(heads if isinstance(heads, int) else None, cap)
+            except Exception as e:  # noqa: BLE001
+                # Without the config there is no head count to divide, so the full
+                # ladder is proposed and the worker's invalid_tp check rejects the
+                # impossible ones. That check runs BEFORE any weights load, so the
+                # cost is a few process launches -- but say so, because silently
+                # sweeping tp the model cannot express looks like a search bug.
+                print(f"[axes] could not read {mid} config ({e!r}); proposing the "
+                      f"full tp ladder and letting the worker reject invalid ones",
+                      file=sys.stderr)
         axes = {
             "tp_degree": tps or [1],
             "weights_dtype": ["bf16", "fp32"],
