@@ -300,3 +300,55 @@ form, 460 GB is 29 GB/rank against a 14 GB/rank budget, so the honest verdict is
 `TOO_LARGE`. It needs expert parallelism or a second node — and an over-predicting gate
 is worse than a rejecting one, because it sends a band off to spend hours rediscovering
 the limit.
+
+## The host-DRAM model under-predicts, measured on a 470 GB load
+
+Band `huge2` was killed loading Qwen3-235B-A22B-Instruct-2507. Nothing appears in its
+`run.log` past `establishing baseline` because the process was killed by the kernel, not
+by Python — the evidence is in the memory monitor:
+
+```
+[mem 10:35:01] 29 GB avail
+[mem 10:36:01] 18 GB avail
+[mem 10:36:31] 12 GB avail
+[mem 10:37:01]  6 GB avail      <- of 2147 GB total
+```
+
+The capability gate had cleared this configuration:
+
+```
+Qwen/Qwen3-235B-A22B-Instruct-2507   470.2 GB, 64 heads, tp=64
+  conc=1: ok=True RUNNABLE   470 GB at tp=64 = 7.3 GB/rank, within the 14 GB/rank budget
+  conc=2: ok=True RUNNABLE
+  conc=3: ok=True RUNNABLE   <- what was launched
+```
+
+HBM was never the problem: 7.3 GB/rank against a 14.4 GB budget is comfortable. The
+host is what ran out. The gate's host model reckons `concurrency` full copies plus a
+shard on every other rank, which for this model at conc=3 is
+
+    3 x 470 GB  +  61 x 7.3 GB  ~=  1858 GB     against 2147 GB available
+
+so it passed with ~289 GB of headroom, and the real peak still exceeded 2141 GB. The
+model is therefore **low by at least ~15%** on a load of this size. Candidate causes,
+none yet isolated: page cache from streaming 470 GB of safetensors, a materialized copy
+alongside the mmap, or ranks holding a full state dict past the point the stagger model
+assumes they have dropped to shard size.
+
+One data point does not justify fitting a correction factor, so the model is unchanged
+and the number is recorded here instead. What follows from it operationally:
+
+**Treat `RUNNABLE` at high concurrency as unproven for anything over ~400 GB.** The
+relaunch uses `TRN_OPT_LOAD_CONCURRENCY=1`, where the same model is predicted at
+470 + 448 = ~918 GB — less than half of host DRAM, so the ~15% error cannot reach the
+ceiling.
+
+**The failure mode is silent.** A kernel OOM kill leaves no Python traceback and the
+workload simply reports FAILED, three hours after the last log line. The `mem.log`
+sidecar the band template writes is the only reason this was diagnosable at all, which
+is a good argument for keeping it.
+
+MiniMax-Text-01 is the case where the model already says no: 915 GB is `HOST_LIMITED`
+at conc=2 (2715 GB needed) and only `TIGHT` at conc=1 (14.3 GB/rank against a 14.4
+ceiling). Given the under-prediction above, its conc=1 verdict deserves the same
+scepticism.
