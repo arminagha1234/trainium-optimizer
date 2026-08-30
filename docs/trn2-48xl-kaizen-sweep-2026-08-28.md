@@ -482,3 +482,47 @@ Worth stating plainly: shard-on-read did its job. 235B is the first time the ful
 ever loaded on a single 48xl. The compile wall is a different problem, and it is the one
 to solve next for the very largest models -- while the mid-size MoEs are gated on wall 3
 instead.
+
+## External MoE hand-off: what to adopt, what's stale, and a regression it surfaced
+
+An external hand-off reviewed the EP/TP work and pointed at six reference EP×TP
+implementations (Pumice native-Neuron, Megatron, NeuronxDistributed, torchtitan,
+fairscale). Reconciling it honestly:
+
+**Adopt — the static-shape lesson (the real one).** Our `ExpertParallelExperts.forward`
+routes tokens with `F.one_hot(...).nonzero()`, `torch.where(...)` and a per-expert Python
+loop -- **data-dependent, dynamic shapes**. On Neuron that is exactly wrong: the compiler
+mandates `dynamic=False` and rejects dynamic shapes, so this recompiles/stalls. The
+correct pattern is the **dense all-local-experts** forward (run every token through all
+`num_experts/ep` local experts, affinity-mask, sum -- no data-dependent gather, fully
+static), which NeuronxDistributed ships as `expert_mlps_v2.forward_all_experts_EP`. Our EP
+is numerically correct (proven bit-for-bit in test_moe_ep.py) but shape-dynamic; the dense
+static form is the likely fix for the MoE compile/HBM behaviour. **This is the highest-value
+item.**
+
+**Adopt — the orphaned-rank hypothesis.** The hand-off attributes 30B-A3B's
+`NRT_RESOURCE` and 122B's collective re-init failure to orphaned/stale ranks from a prior
+candidate, fixable by reaping between candidates (cheaper than the "undiagnosed device
+exhaustion" this doc recorded earlier). Worth testing directly before any re-architecture.
+
+**Stale framing.** The hand-off says "EP isn't wired -- experts are replicated -> OOM" and
+"TP-up/EP-down isn't selectable". That described the tree at PRs #115-#126; it predates
+the EP work since merged -- expert parallelism (shard_moe_experts), shard-on-read
+(#161/#162), and the EP/TP decouple knob `TRN_OPT_EP_DEGREE` (#166, proven with 5 tests).
+TP-up/EP-down IS selectable now. The correction over-generalised "not wired in our path"
+into "impossible", but its *references and the static-shape point stand regardless*.
+
+**Stack conflation to watch.** Its concrete APIs (`xm.all_to_all`, `xla_pg_options` mesh,
+NxD `initialize_model_parallel`) are **XLA-Neuron**; our beta3 backend is **native-PyTorch
+Neuron (no XLA)**. So copy the *algorithm* (dense static forward, router replicated, local
+expert slice) but not the XLA collectives. The static-shape lesson still applies because
+native `torch.compile(backend="neuron")` also mandates `dynamic=False`.
+
+**Regression this surfaced (mine).** Installing `fla` in the band template (added to
+unblock Kimi-Linear's imports) makes transformers route the Qwen3.5-family GatedDeltaNet
+through fla's **CUDA** kernels -> `torch._C._cuda_init()` crash on Neuron. Proof: gdn27
+(generated before the fla change) verified Qwen3.6-27B at 342 tok/s; the three EP-degree
+bands (generated after) all crashed `FAIL_NO_BASELINE: worker tried a CUDA path`. So the
+EP-down experiment produced NO data -- confounded by this. Lesson: **template deps have
+global blast radius**; `fla` must be scoped to models that need it (or the GDN path forced
+to the native kernel), and the EP-degree experiment re-run once it is.
