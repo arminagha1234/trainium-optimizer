@@ -228,3 +228,75 @@ stdout, which CloudWatch captures regardless.
 
 Exit codes are distinct (`42` unmounted, `43` cold cache in the wrong region) so a
 voided placement is distinguishable from a real failure without reading logs at all.
+
+## Tensor parallelism only works at power-of-two world sizes
+
+`#140` widened the TP search from powers of two to **every divisor** of the query-head
+count. The reasoning was sound on paper: a 24-head model capped at tp=8 leaves 40 of a
+64-core box idle, and tp=12 and tp=24 shard 24 heads perfectly evenly. The hardware
+disagrees.
+
+Measured directly, one `init_process_group` + one `all_reduce` per world size, no model
+loaded at all:
+
+| world size | result |
+|-----------:|:-------|
+| 2 | collective forms, `all_reduce` correct |
+| 3 | `RuntimeError: Failed to execute the device barrier 2` |
+| 4 | forms, correct |
+| 5 | barrier failure |
+| 6 | barrier failure |
+| 12 | barrier failure |
+| 16 | forms, correct |
+| 24 | barrier failure |
+| 32 | forms, correct |
+| 64 | forms, correct |
+
+Every non-power-of-two fails. (world=8 also failed in that sequence, immediately after
+the world=6 failure — a crashed run leaves the runtime unable to initialise the next
+one, so the container needs restarting between TP attempts. tp=8 is the working baseline
+for Qwen3.8-27B, so 8 is fine on a clean runtime.)
+
+### What it cost to learn this the other way
+
+The Qwen3.8-27B sweep proposed the full divisor set and paid a **55 GB checkpoint load
+per candidate** to discover the same thing:
+
+```
+tp_degree=3   -> collective/TP initialisation failed (init_process_group)
+tp_degree=6   -> collective/TP initialisation failed
+tp_degree=12  -> collective/TP initialisation failed
+tp_degree=24  -> collective/TP initialisation failed
+```
+
+Four config slots, no information gained about the model.
+
+### The corrected rule
+
+TP candidates are the **intersection**: powers of two that divide the head count. Both
+filters are load-bearing — drop the divisor check and tp=16 comes back for a 24-head
+model (rejected by the worker as `invalid_tp`); drop the ladder and tp=12 comes back
+(rejected by the runtime).
+
+| model | heads | reachable TP | note |
+|:--|--:|:--|:--|
+| Qwen3.8-27B | 24 | 1, 2, 4, 8 | **tp=24 unreachable** |
+| Qwen3.5-35B-A3B | 16 | 1, 2, 4, 8, 16 | |
+| Qwen3.5-122B-A10B | 32 | 1, 2, 4, 8, 16, 32 | |
+| DeepSeek-V4-Flash | 64 | 1 … 64 | |
+| MiniMax-M2 | 48 | 1, 2, 4, 8, 16 | **tp=48 unreachable** |
+
+### Two consequences worth stating plainly
+
+**Idle cores on a low-head-count model are not a config bug.** Qwen3.5-0.8B has 8 query
+heads and won at tp=4; 60 of 64 cores are capacity that model cannot address by
+sharding. The way to use them is more concurrent **replicas**, which is what the
+box-throughput figure measures — 9,104 tok/s from 12 replicas at tp=4, against 1,143
+tok/s for one.
+
+**MiniMax-M2 does not fit by tensor parallelism.** The capability gate previously
+admitted it on the strength of tp=48 giving 9.6 GB/rank. At the tp=16 it can actually
+form, 460 GB is 29 GB/rank against a 14 GB/rank budget, so the honest verdict is
+`TOO_LARGE`. It needs expert parallelism or a second node — and an over-predicting gate
+is worse than a rejecting one, because it sends a band off to spend hours rediscovering
+the limit.

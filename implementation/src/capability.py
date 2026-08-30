@@ -342,19 +342,29 @@ def max_clean_tp(config: dict[str, Any], hw: HardwareProfile) -> int:
     Bounded by the adapter caps, the head count (TP must divide the query heads),
     the GatedDeltaNet value-head count where present, and the physical core count.
 
-    Considers EVERY divisor of the head count, not just powers of two, in lockstep
-    with `native_pytorch.tp_candidates` (#140). While this still tried only powers of
-    two it UNDER-predicted what the runner would do, and the gate then rejected models
-    that fit:
+    Must stay in lockstep with `native_pytorch.tp_candidates`. The constraint is the
+    intersection of two things: tp divides the query-head count, AND tp is a power of
+    two, because the Neuron runtime cannot form a collective at any other world size.
+    Measured directly -- one `init_process_group` + `all_reduce`, no model loaded:
 
-        MiniMax-M2   48 heads, 460 GB   powers of two -> tp=16 -> 28.8 GB/rank REJECTED
-                                        divisors      -> tp=48 ->  9.6 GB/rank fits
-        Qwen3.8-27B  24 heads           powers of two -> tp=8
-                                        divisors      -> tp=24
+        world  2  4  16  32  64  -> forms, all_reduce correct
+        world  3  5  6  12  24   -> RuntimeError: Failed to execute the device barrier 2
 
-    A gate that models a smaller tp than the runner picks turns into a gate that
-    blocks runnable models, which is the failure this module exists to avoid -- just
-    in the opposite direction from the original bug.
+    This function has now been wrong in BOTH directions, so the reasoning is written
+    down rather than left to the code. #140 changed it to consider every divisor so
+    the gate would stop rejecting models it believed the runner could shard further.
+    Concretely it claimed:
+
+        MiniMax-M2   48 heads, 460 GB   divisors -> tp=48 -> 9.6 GB/rank "fits"
+
+    tp=48 is not a power of two, so that configuration cannot be launched at all. The
+    honest figure is tp=16 -> 29 GB/rank, and if that does not fit then the model does
+    not fit by tensor parallelism alone -- expert parallelism or a second node is the
+    answer, not a world size the runtime will refuse.
+
+    Over-predicting is the more expensive mistake: the gate admits the model, the band
+    spends a full checkpoint load per candidate, and every one dies in
+    `init_process_group`. Qwen3.8-27B burned four config slots exactly that way.
     """
     tc = _text_config(config)
     archs = " ".join(architectures(config))
@@ -374,8 +384,8 @@ def max_clean_tp(config: dict[str, Any], hw: HardwareProfile) -> int:
     if not heads:
         return 1
     best = 1
-    for tp in range(1, min(cap, heads) + 1):
-        if heads % tp == 0:
+    for tp in (1, 2, 4, 8, 16, 32, 64):
+        if tp <= min(cap, heads) and heads % tp == 0:
             best = tp
     return best
 
