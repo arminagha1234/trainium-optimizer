@@ -77,9 +77,10 @@ Full standings: [LEADERBOARD.md](./LEADERBOARD.md) · per-model recipes: [`optim
 | 35 | phi-2 | phi | — | 4,176 | **9,841** | **2.357×** | (config-only) | trn2.3xlarge | ✅ Verified |
 | 36 | stablelm-3b-4e1t | stablelm | 3B | 3,393 | **7,721** | **2.275×** | (config-only) | trn2.3xlarge | ✅ Verified |
 | 37 | pythia-2.8b | pythia | 2.8B | 3,108 | **6,450** | **2.076×** | (config-only) | trn2.3xlarge | ✅ Verified |
-| 38 | SmolLM2-1.7B | smollm2 | 1.7B | 10,573 | **14,460** | **1.368×** | (config-only) | trn2.3xlarge | ✅ Verified |
-| 39 | Qwen3.5-2B | qwen3.5 | 2B | 1,071 | **1,129** | **1.054×** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ Verified |
-| 40 | Qwen3.5-0.8B | qwen3.5 | 0.8B | 1,093 | **1,143** | **1.045×** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ Verified |
+| 38 | Qwen3.5-4B | qwen3.5 | 4B | 593 | **812** | **1.37×** | TP=8, bf16, batch=1 | trn2.48xlarge | ✅ Verified |
+| 39 | SmolLM2-1.7B | smollm2 | 1.7B | 10,573 | **14,460** | **1.368×** | (config-only) | trn2.3xlarge | ✅ Verified |
+| 40 | Qwen3.5-2B | qwen3.5 | 2B | 1,071 | **1,129** | **1.054×** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ Verified |
+| 41 | Qwen3.5-0.8B | qwen3.5 | 0.8B | 1,093 | **1,143** | **1.045×** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ Verified |
 <!-- LEADERBOARD:END -->
 
 *Speedup is vs the eager baseline on the same instance + probe shape. ✅ Verified
