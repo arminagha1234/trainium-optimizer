@@ -166,3 +166,65 @@ python -u run_overnight.py --backend native-pytorch-beta3 \
 Two operational notes: pipe nothing through `tail` (it buffers until exit and makes
 a healthy run look hung), and read progress with `kaizen workload exec` rather than
 `get-artifact`, which serves a badly stale S3 copy mid-run.
+
+## The scheduler chooses the region, and a wrong region silently voids the run
+
+`kaizen start-workload` has no `--region`: placement is scheduler-side. Band `large2`
+was scheduled in **eu-north-1** while every other band landed in **ap-southeast-4**,
+and the consequences were invisible:
+
+* a **different FSX filesystem** — so the shared HF cache was cold, and the run would
+  have re-downloaded every checkpoint before touching a device
+* a **`run.log` no other pod could read**, which is how progress is normally inspected
+  (`get-artifact` serves a stale S3 copy mid-run, so reading a sibling pod's log on the
+  shared mount is the reliable route)
+* the workload reported **SUCCEEDED** having produced nothing
+
+The reason it looked healthy is worth stating plainly, because it will happen again to
+anyone writing results to a mount path: **`mkdir -p` on an unmounted path succeeds.**
+It creates a perfectly ordinary local directory inside the container, `tee` writes to
+it happily, and every byte is deleted with the pod. Nothing anywhere reports an error.
+The same trap ate an earlier `gdn_repro` run on a trn2.3xlarge, which does not mount
+`FSX_TEAM_SHARED_RW` at all.
+
+So the check cannot be "does the directory exist" — it has to be **"is this path
+actually a shared mount"**, read from the mount table, before any work begins:
+
+```bash
+FSX=/ustore/fsx/team_shared_rw
+EXPECT_REGION=${TRN_OPT_EXPECT_REGION:-ap-southeast-4}
+IMDS_T=$(curl -s --max-time 2 -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+REGION=$(curl -s --max-time 2 -H "X-aws-ec2-metadata-token: ${IMDS_T}" \
+  http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || true)
+[ -z "${REGION}" ] && REGION=${AWS_DEFAULT_REGION:-${AWS_REGION:-unknown}}
+echo "PREFLIGHT band=$BAND region=${REGION} expect=${EXPECT_REGION} host=$(hostname)"
+
+# The mount table, not the directory: `mkdir -p` would have hidden this.
+if ! grep -q " /ustore/fsx" /proc/mounts 2>/dev/null; then
+  echo "PREFLIGHT_FAIL fsx_not_mounted -- results would be deleted with the pod."
+  exit 42
+fi
+
+CACHE_GB=$(du -s --block-size=1G "$FSX/hf_cache_shared" 2>/dev/null | awk '{print $1+0}')
+if [ "$REGION" != "unknown" ] && [ "$REGION" != "$EXPECT_REGION" ]; then
+  if [ "${CACHE_GB:-0}" -lt 50 ]; then
+    echo "PREFLIGHT_FAIL cold_cache_in_wrong_region cache=${CACHE_GB}GB"
+    exit 43
+  fi
+  echo "PREFLIGHT_WARN wrong region but cache is warm (${CACHE_GB}GB); continuing"
+fi
+```
+
+Two deliberate choices in there:
+
+**A wrong region is only fatal when the cache is also cold.** The region itself costs
+nothing; the cold cache is what burns the slot. Failing on region alone would throw
+away usable capacity, and capacity is the scarce thing.
+
+**Preflight prints before any redirect into a file.** If the shared mount is missing,
+a log written to that mount is exactly the log nobody can read — so the verdict goes to
+stdout, which CloudWatch captures regardless.
+
+Exit codes are distinct (`42` unmounted, `43` cold cache in the wrong region) so a
+voided placement is distinguishable from a real failure without reading logs at all.
