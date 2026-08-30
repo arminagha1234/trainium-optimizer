@@ -1,0 +1,26 @@
+commit	stage	origin	layer	source	metric	mfu	correctness	compile_s	status	description
+unknown	baseline				1093.4274127649267	2.417896890443647	100.0	0.0	keep	baseline
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	"compile_mode=compile-default (metric=0 -> backend produced no throughput: neuronx-cc INTERNAL ERROR (compiler bug -- escalate, do not tune around it): rc=1: [rank0]: error message=""COMPILATION FAILED: [INTERNAL_ERROR] [NCC_IINAR001] [unassigned.crzke] ISA validation failed: TensorScalarAffineSelect; inst failed assertion check: 's2d2_ts_as_valid_elem_count' - "")"
+unknown	config		config		1098.971812821542	2.430157226612069	93.75	0.0	discard	attn_implementation=sdpa
+unknown	config		config		1062.7880659497803	2.3501440789403802	93.75	0.0	discard	weights_dtype=fp32
+unknown	config		config		1066.1258209324415	1.1787624295680714	93.75	0.0	discard	tp_degree=2
+unknown	config		config		1142.9129896642758	0.63183109630685	87.5	0.0	keep	tp_degree=4
+unknown	config		config		1098.712749341103	0.30369804491697133	87.5	0.0	discard	tp_degree=8
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	tp_degree=16 (metric=0 -> backend produced no throughput: invalid_tp: num_attention_heads=8 not divisible by tp=16)
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	tp_degree=32 (metric=0 -> backend produced no throughput: invalid_tp: num_attention_heads=8 not divisible by tp=32)
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	tp_degree=64 (metric=0 -> backend produced no throughput: invalid_tp: num_attention_heads=8 not divisible by tp=64)
+unknown	config		config		1091.796521896184	2.4142905001939146	100.0	0.0	discard	cp_degree=2
+unknown	config		config		1108.0539614778688	2.450240589017581	100.0	0.0	discard	cp_degree=4
+unknown	config		config		1092.8419695223265	2.4166022993447878	100.0	0.0	discard	cp_degree=8
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	"batch=8 (metric=0 -> backend produced no throughput: rc=1: [rank0]: error message=""NRT EXECUTION FAILED: lazy::AllocBind: NRT_RESOURCE on retry after drain, Failed to allocate resource"")"
+unknown	config		config		0.0	-1.0	0.0	0.0	discard	"batch=32 (metric=0 -> backend produced no throughput: rc=1: [rank0]: error message=""NRT EXECUTION FAILED: lazy::AllocBind: NRT_RESOURCE on retry after drain, Failed to allocate resource"")"
+unknown	known_kernel	harvested	kernel	neuronx-cc	0.0	-1.0	0.0	0.0	discard	"cc:model-type-transformer (metric=0 -> backend produced no throughput: neuronx-cc INTERNAL ERROR (compiler bug -- escalate, do not tune around it): rc=1: [rank1]: error message=""COMPILATION FAILED: [INTERNAL_ERROR] [NCC_IINAR001] [unassigned.crzke] ISA validation failed: TensorScalarAffineSelect; inst failed assertion check: 's2d2_ts_as_valid_elem_count' - "")"
+unknown	borrow	borrowed	kernel	neuronx-cc	0.0	-1.0	0.0	0.0	discard	"cc:auto-cast-none (metric=0 -> backend produced no throughput: neuronx-cc INTERNAL ERROR (compiler bug -- escalate, do not tune around it): rc=1: [rank0]: error message=""COMPILATION FAILED: [INTERNAL_ERROR] [NCC_IINAR001] [unassigned.crzke] ISA validation failed: TensorScalarAffineSelect; inst failed assertion check: 's2d2_ts_as_valid_elem_count' - "")"
+unknown	graph_rewrite		graph	neuronx-cc	0.0	-1.0	0.0	0.0	discard	"cc:optlevel1 (metric=0 -> backend produced no throughput: neuronx-cc INTERNAL ERROR (compiler bug -- escalate, do not tune around it): rc=1: [rank2]: error message=""COMPILATION FAILED: [INTERNAL_ERROR] [NCC_IINAR001] [unassigned.crzke] ISA validation failed: TensorScalarAffineSelect; inst failed assertion check: 's2d2_ts_as_valid_elem_count' - "")"
+unknown	graph_rewrite		graph	neuronx-cc	0.0	-1.0	0.0	0.0	discard	"cc:optlevel2 (metric=0 -> backend produced no throughput: neuronx-cc INTERNAL ERROR (compiler bug -- escalate, do not tune around it): rc=1: [rank2]: error message=""COMPILATION FAILED: [INTERNAL_ERROR] [NCC_IINAR001] [unassigned.crzke] ISA validation failed: TensorScalarAffineSelect; inst failed assertion check: 's2d2_ts_as_valid_elem_count' - "")"
+unknown	graph_rewrite		graph	neuronx-cc	0.0	-1.0	0.0	2700.0	discard	cc:optlevel3 (compile too slow: 2700s)
+unknown	graph_rewrite		graph	neuronx-cc	0.0	-1.0	0.0	0.0	discard	"cc:optlevel2+nocast (metric=0 -> backend produced no throughput: neuronx-cc INTERNAL ERROR (compiler bug -- escalate, do not tune around it): rc=1: [rank0]: error message=""COMPILATION FAILED: [INTERNAL_ERROR] [NCC_IINAR001] [unassigned.crzke] ISA validation failed: TensorScalarAffineSelect; inst failed assertion check: 's2d2_ts_as_valid_elem_count' - "")"
+unknown	graph_rewrite		graph	neuronx-cc	0.0	-1.0	0.0	2700.0	discard	cc:optlevel3+transformer+nocast (compile too slow: 2700s)
+unknown	invent		kernel		0.0	-1.0	0.0	0.0	discard	Stage 4 not integrated: invent_engine not wired to pipeline (needs NKI-writer agent + validated on-device execution)
+unknown	profile_loop				1142.9129896642758	-1.0	100.0	0.0	discard	round 1: profile=compute_bound hot=attention_prefill(45%) -> re-entered deep stages -> +0.0% (no gain)
+unknown	profile_loop				1142.9129896642758	-1.0	100.0	0.0	discard	round 2: profile=compute_bound hot=attention_prefill(45%) -> re-entered deep stages -> +0.0% (no gain)
