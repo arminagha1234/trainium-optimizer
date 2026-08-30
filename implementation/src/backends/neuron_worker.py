@@ -374,6 +374,23 @@ def main() -> None:
     params = _param_count(cfg)
 
     t_load = time.time()
+
+    # HOST DRAM, not HBM, is what kills the biggest models here. from_pretrained
+    # materialises the WHOLE model in this process and sharding only happens below,
+    # so with one process per core the transient peak is `world x model_size`:
+    #     Qwen3.5-122B-A10B  250 GB x 32 =  8.0 TB  vs 2147 GB of DRAM -> OOMKilled
+    #     DeepSeek-V4-Flash  319 GB x 64 = 20.4 TB                     -> OOMKilled(137)
+    # Raising tp for HBM headroom makes this strictly worse. Setting
+    # TRN_OPT_LOAD_CONCURRENCY=N lets only N ranks be inside the
+    # load -> shard -> to(device) window at once; the rest already hold just their
+    # shard, so the peak becomes N*model + (world-N)*model/world. Off by default
+    # because it costs wall-clock on every model, including ones that never needed it.
+    try:
+        from backends.load_stagger import acquire_load_slot, release_load_slot
+    except Exception:  # noqa: BLE001
+        from load_stagger import acquire_load_slot, release_load_slot
+    _load_slot = acquire_load_slot(dist.get_rank(), world, log=_log)
+
     model = AutoModelForCausalLM.from_pretrained(
         a.model, dtype=dtype, attn_implementation=a.attn, trust_remote_code=True
     )
@@ -534,6 +551,10 @@ def main() -> None:
             _log(f"kernel-inject failed, running eager: {e!r}")
 
     model = model.to(dev)
+    # The host copy is gone now that the shard lives in HBM, so the next wave of
+    # ranks can load. Released here rather than after from_pretrained because the
+    # full copy survives until .to(dev) moves the shard off the host.
+    release_load_slot(_load_slot, log=_log)
     model.eval()
     load_s = time.time() - t_load
     _log(f"loaded+sharded tp={a.tp} dtype={a.dtype} attn={a.attn} in {load_s:.1f}s")
