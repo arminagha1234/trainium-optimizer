@@ -355,3 +355,85 @@ if __name__ == "__main__":
             traceback.print_exc()
     print(f"\n{passed} passed, {failed} failed")
     raise SystemExit(1 if failed else 0)
+
+
+# --- per-model README: "I have box X, what is the best way to run this?" -------
+#
+# The leaderboard answers "which model is fastest". It does not answer the question
+# a reader has when they land on one model and own a particular box. A model
+# optimized on both a trn2.3xlarge and a trn2.48xlarge is two independent results,
+# and collect_verified already keys on (model, hardware) to keep both.
+
+from publish_deliverables import group_by_model, render_model_readme  # noqa: E402
+
+
+def _hw_recipe(model_id, hardware, *, speedup, baseline, best):
+    r = _recipe(model_id, speedup=speedup, baseline=baseline, best=best)
+    r["toolchain"] = {"instance_type": hardware}
+    return r
+
+
+def _two_route_tree(root: Path):
+    """One model verified on two boxes, in the nested <slug>/<hardware>/ layout."""
+    _write_bundle(root, "qwen3-5-35b-a3b/trn2-3xlarge",
+                  _hw_recipe("Qwen/Qwen3.5-35B-A3B", "trn2.3xlarge",
+                             speedup=1.8, baseline=100.0, best=180.0))
+    _write_bundle(root, "qwen3-5-35b-a3b/trn2-48xlarge",
+                  _hw_recipe("Qwen/Qwen3.5-35B-A3B", "trn2.48xlarge",
+                             speedup=1.4, baseline=300.0, best=420.0))
+    return root
+
+
+def test_the_same_model_on_two_boxes_yields_two_routes():
+    with tempfile.TemporaryDirectory() as td:
+        root = _two_route_tree(Path(td))
+        ds = collect_verified(root)
+        groups = group_by_model(ds)
+        assert len(ds) == 2, [d.hardware for d in ds]
+        assert list(groups) == ["qwen3-5-35b-a3b"]
+        assert {d.hardware for d in groups["qwen3-5-35b-a3b"]} == {
+            "trn2.3xlarge", "trn2.48xlarge"}
+
+
+def test_model_readme_lists_every_route_with_its_own_numbers():
+    with tempfile.TemporaryDirectory() as td:
+        groups = group_by_model(collect_verified(_two_route_tree(Path(td))))
+        md = render_model_readme("qwen3-5-35b-a3b", groups["qwen3-5-35b-a3b"])
+    assert "# Qwen3.5-35B-A3B" in md
+    assert "2 verified route(s)" in md
+    for hw in ("trn2.3xlarge", "trn2.48xlarge"):
+        assert f"`{hw}`" in md
+    # Each row carries that box's own baseline and best, not a shared pair.
+    assert "180" in md and "420" in md
+    assert "100" in md and "300" in md
+
+
+def test_model_readme_warns_that_speedups_are_not_comparable_across_boxes():
+    """A 1.4x on a 48xl and a 1.8x on a 3xl are not the same achievement.
+
+    Without saying so, the table invites exactly the wrong comparison -- and the
+    48xl row is the LOWER speedup while being the HIGHER absolute throughput.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        groups = group_by_model(collect_verified(_two_route_tree(Path(td))))
+        md = render_model_readme("qwen3-5-35b-a3b", groups["qwen3-5-35b-a3b"])
+    assert "speedup is not" in md.lower()
+    rows = [ln for ln in md.splitlines() if ln.startswith("| `trn2")]
+    assert "48xlarge" in rows[-1], "the lower speedup must not be ranked first"
+    assert "3xlarge" in rows[0]
+
+
+def test_model_readme_is_written_for_single_route_models_too():
+    """So the file always exists and a second route later just adds a row."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _write_bundle(root, "gpt2", _recipe("openai-community/gpt2",
+                                            speedup=2.0, baseline=10.0, best=20.0))
+        groups = group_by_model(collect_verified(root))
+        md = render_model_readme("gpt2", groups["gpt2"])
+    assert "1 verified route(s)" in md
+    assert "trn2.3xlarge" in md
+
+
+def test_model_readme_is_empty_for_no_routes():
+    assert render_model_readme("nothing", []) == ""
