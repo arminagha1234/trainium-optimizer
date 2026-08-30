@@ -585,6 +585,17 @@ def _auto_publish(out_root: Path, a, log) -> dict:
         log(f"auto-publish unavailable ({e!r}) -- results are still in {out_root}")
         return {"error": repr(e)}
 
+    # The mock backend exists for laptop smoke-runs and produces plausible-looking
+    # recipes -- verified, speedup > 1, complete bundle -- with instance_type="mock"
+    # and absurd numbers. Because publication defaults to the repo this file lives
+    # in, a single `--backend mock` run regenerated LEADERBOARD.md down to one row
+    # reading "Qwen3-8B ... 286.93x ... mock" and rewrote that model's bundle with
+    # it. Refused here, and independently refused by publish_deliverables'
+    # real-hardware allowlist, because one guard on the public showcase is not enough.
+    if str(getattr(a, "backend", "")).strip().lower() == "mock":
+        log("auto-publish skipped: --backend mock produces synthetic numbers")
+        return {"noop": True, "reason": "mock backend"}
+
     repo_dir = Path(a.publish_repo_dir) if a.publish_repo_dir else _repo_root_from_here()
     src_dir = out_root / "optimized_models"
     if not src_dir.is_dir():

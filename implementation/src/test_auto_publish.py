@@ -21,9 +21,18 @@ from publish_deliverables import collect_verified
 
 
 class _Args:
-    def __init__(self, **kw):
+    """Stand-in for the parsed argv.
+
+    ``publish_repo_dir`` has no default here ON PURPOSE. In production it falls back
+    to the repo overnight.py lives in, which is what let a mock smoke-run rewrite the
+    real LEADERBOARD.md. A test must never be one forgotten kwarg away from doing the
+    same, so every case passes an explicit temp checkout.
+    """
+
+    def __init__(self, publish_repo_dir, **kw):
         self.publish = True
-        self.publish_repo_dir = None
+        self.backend = "native-pytorch-beta3"
+        self.publish_repo_dir = publish_repo_dir
         self.publish_push = False
         for k, v in kw.items():
             setattr(self, k, v)
@@ -59,7 +68,7 @@ def _run(tmp_path, bundles, **argkw):
     (repo / "README.md").write_text("# repo\n")
     logs: list[str] = []
     res = overnight._auto_publish(
-        out_root, _Args(publish_repo_dir=str(repo), **argkw), logs.append)
+        out_root, _Args(str(repo), **argkw), logs.append)
     return repo, logs, res
 
 
@@ -138,7 +147,7 @@ def test_a_missing_bundle_directory_is_a_clean_noop(tmp_path):
     out_root = tmp_path / "art"
     out_root.mkdir()
     logs: list[str] = []
-    res = overnight._auto_publish(out_root, _Args(), logs.append)
+    res = overnight._auto_publish(out_root, _Args(str(tmp_path / "repo")), logs.append)
     assert res.get("noop") is True
     assert any("nothing verified this cycle" in m for m in logs)
 
@@ -156,8 +165,7 @@ def test_publication_failure_never_loses_the_run(monkeypatch, tmp_path):
     _bundle(out_root / "optimized_models", "q",
             model_id="Qwen/Qwen3.5-35B-A3B", speedup=1.6)
     logs: list[str] = []
-    res = overnight._auto_publish(out_root, _Args(publish_repo_dir=str(tmp_path / "r")),
-                                 logs.append)
+    res = overnight._auto_publish(out_root, _Args(str(tmp_path / "r")), logs.append)
     assert "error" in res
     assert any("non-fatal" in m for m in logs)
 
@@ -172,3 +180,52 @@ def test_publish_can_be_turned_off(tmp_path):
     ap.add_argument("--no-publish", dest="publish", action="store_false")
     assert ap.parse_args([]).publish is True
     assert ap.parse_args(["--no-publish"]).publish is False
+
+
+# --- synthetic results must never reach the public showcase -------------------
+#
+# Not hypothetical. Automatic publication defaults to the repo overnight.py lives in,
+# so a laptop `--backend mock` smoke-run regenerated LEADERBOARD.md down to a single
+# row -- "Qwen3-8B | 604 | 173,162 | 286.93x | ... | mock | verified" -- and rewrote
+# optimized_models/qwen3-8b/ with it. Every gate that existed passed: verified,
+# speedup > 1, bundle present. Nothing asked whether the number came from hardware.
+
+def test_a_mock_backend_run_never_publishes(tmp_path):
+    out_root = tmp_path / "art"
+    om = out_root / "optimized_models"
+    om.mkdir(parents=True)
+    _bundle(om, "qwen3-8b", model_id="Qwen/Qwen3-8B", speedup=286.93,
+            hardware="mock")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    logs: list[str] = []
+    args = _Args(str(repo))
+    args.backend = "mock"
+    res = overnight._auto_publish(out_root, args, logs.append)
+    assert res.get("noop") is True
+    assert not (repo / "LEADERBOARD.md").exists()
+    assert any("mock" in m for m in logs)
+
+
+def test_a_synthetic_instance_type_is_refused_even_on_a_real_backend(tmp_path):
+    """Belt and braces: the backend name is not the only way a mock number leaks."""
+    repo, logs, res = _run(tmp_path, [dict(
+        slug="qwen3-8b", model_id="Qwen/Qwen3-8B", speedup=286.93,
+        hardware="mock")])
+    assert res.get("noop") is True
+    assert not (repo / "LEADERBOARD.md").exists()
+
+
+def test_real_neuron_instances_are_still_accepted():
+    from publish_deliverables import is_real_hardware
+
+    for hw in ("trn2.48xlarge", "trn2.3xlarge", "trn1.32xlarge", "inf2.48xlarge"):
+        assert is_real_hardware(hw), hw
+
+
+def test_anything_not_a_neuron_instance_is_refused():
+    """An allowlist, so a NEW synthetic backend is excluded by default."""
+    from publish_deliverables import is_real_hardware
+
+    for hw in ("mock", "", None, "cpu", "sim", "fake-trn2", "gpu.a100", "trn2"):
+        assert not is_real_hardware(hw), hw
