@@ -133,11 +133,13 @@ def test_tp_cap_matches_the_adapter_limits():
     # Qwen3_5 is bounded by the head count, matching native_pytorch after #121.
     # A stale cap of 4 here would make the gate reject models the runner runs.
     #
-    # 24 heads now yields 24, not 8: the search considers every divisor of the head
-    # count (#140), so a power-of-two answer here would UNDER-predict the runner and
-    # reject models that fit. 24 is the widest sharding this model can express.
+    # 24 heads yields 8, not 24. tp must divide the head count AND be a power of two,
+    # because the runtime cannot form a collective at any other world size (measured:
+    # world 3/5/6/12/24 all fail with "Failed to execute the device barrier 2"). So 8
+    # is the widest sharding this model can RUN, and predicting 24 would over-predict
+    # the runner -- admitting models that then die at init.
     assert max_clean_tp(_dense(heads=24, arch="Qwen3_5ForConditionalGeneration"),
-                        TRN2_48XLARGE) == 24
+                        TRN2_48XLARGE) == 8
     assert max_clean_tp(_dense(heads=32, arch="Gemma4ForCausalLM"),
                         TRN2_48XLARGE) == 4
     # uncapped arch may shard as wide as heads and cores allow
@@ -145,20 +147,28 @@ def test_tp_cap_matches_the_adapter_limits():
                         TRN2_48XLARGE) == 32
 
 
-def test_tp_must_divide_head_count():
-    """The invariant, asserted as a property rather than as one number.
+def test_tp_is_the_largest_power_of_two_dividing_the_head_count():
+    """Both invariants at once, across a range of awkward head counts.
 
-    This used to assert 2 for a 6-head model, which was really asserting "powers of
-    two only" -- 6 shards 6 heads perfectly well. What must never happen is a tp that
-    does NOT divide the head count, because the worker rejects it and the run is
-    wasted, so check that across a range of awkward head counts.
+    An earlier version asserted 2 for a 6-head model. #140 called that "really
+    asserting powers of two only -- 6 shards 6 heads perfectly well" and changed it
+    to assert `tp == heads`. The arithmetic in that argument is correct and the
+    conclusion was still wrong: 6 shards 6 heads perfectly well AND the runtime
+    cannot form a 6-way collective, so the original expectation of 2 was right.
+
+    So assert the property rather than a number, and assert BOTH halves of it: tp
+    divides the head count (or the worker rejects it) and tp is a power of two (or
+    `init_process_group` fails with "Failed to execute the device barrier 2").
+    Neither half alone is the contract.
     """
     for heads in (6, 10, 12, 14, 18, 20, 22, 24, 40, 48):
         tp = max_clean_tp(_dense(heads=heads, arch="LlamaForCausalLM"),
                           TRN2_48XLARGE)
         assert heads % tp == 0, (heads, tp)
         assert tp <= TRN2_48XLARGE.cores
-        assert tp == heads, (heads, tp)   # widest divisor within the core count
+        assert tp & (tp - 1) == 0, (heads, tp)          # power of two
+        nxt = tp * 2                                    # and the LARGEST such
+        assert heads % nxt != 0 or nxt > TRN2_48XLARGE.cores, (heads, tp)
 
 
 def test_tp_never_exceeds_physical_cores():
@@ -504,24 +514,47 @@ def test_the_rejection_reason_names_the_loader_that_was_modelled(monkeypatch):
 # still tried only powers of two it UNDER-predicted the runner and started rejecting
 # models that fit -- the same class of bug as the original over-prediction, inverted.
 
-def test_max_clean_tp_uses_every_divisor_not_just_powers_of_two():
+def test_max_clean_tp_never_predicts_a_world_size_that_cannot_be_formed():
+    """48 divides 48, and tp=48 still cannot be launched.
+
+    #140 made this return 48 so the gate would stop rejecting MiniMax-M2. That is the
+    wrong fix: the runtime only forms a collective at a power-of-two world size, so
+    tp=48 dies in `init_process_group` before a single token is measured. Predicting it
+    converts a clean rejection into a burned checkpoint load.
+    """
     cfg = _moe(h=3072, L=62, moe_inter=1536, experts=256, heads=48,
                arch="MiniMaxM2ForCausalLM")
-    assert max_clean_tp(cfg, TRN2_48XLARGE) == 48       # was 16
+    tp = max_clean_tp(cfg, TRN2_48XLARGE)
+    assert tp == 16                      # 1,2,4,8,16 divide 48; 32 does not
+    assert tp & (tp - 1) == 0, "must be a power of two"
 
 
-def test_a_24_head_model_reaches_24_not_8():
+def test_a_24_head_model_stops_at_8_not_24():
+    """The 56 idle cores on a 24-head model are reachable by REPLICAS, not by tp.
+
+    tp=12 and tp=24 divide 24 evenly and neither can form a collective, so 8 is the
+    honest ceiling. Qwen3.8-27B demonstrated this the expensive way: tp=3, 6, 12 and 24
+    each loaded 55 GB of weights and then failed at `init_process_group`.
+    """
     cfg = _dense(h=3072, L=64, heads=24, arch="Qwen3_5ForConditionalGeneration")
-    assert max_clean_tp(cfg, TRN2_48XLARGE) == 24       # was 8
+    assert max_clean_tp(cfg, TRN2_48XLARGE) == 8
 
 
-def test_minimax_m2_is_runnable_once_tp_is_predicted_correctly():
-    """460 GB over 48 ranks is 9.6 GB/rank; over 16 it was 28.8 and rejected."""
+def test_minimax_m2_does_not_fit_by_tensor_parallelism_alone():
+    """460 GB over the 16 ranks it can actually form is 29 GB/rank -- over budget.
+
+    The previous version asserted it fit, on the strength of tp=48 giving 9.6 GB/rank.
+    That world size cannot be formed, so the number was never available. Recording the
+    real verdict matters more than recording a pass: MiniMax-M2 needs expert parallelism
+    or a second node, and a gate that says "fits" sends a band off to spend hours
+    proving otherwise.
+    """
     cfg = _moe(h=3072, L=62, moe_inter=1536, experts=256, heads=48,
                arch="MiniMaxM2ForCausalLM")
     v = assess(cfg, TRN2_48XLARGE, weight_gb=460.2, load_concurrency=1)
-    assert v.chosen_tp == 48
-    assert v.gb_per_rank < v.budget_gb_per_rank, v.reason
+    assert v.chosen_tp == 16
+    assert not v.ok and v.status == "TOO_LARGE", v.reason
+    assert v.gb_per_rank > v.budget_gb_per_rank
 
 
 def test_deltanet_value_heads_bound_the_predicted_tp():

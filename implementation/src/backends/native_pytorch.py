@@ -246,21 +246,47 @@ def tp_cap_for(archs: str, heads: int | None, linear_value_heads: int | None,
 
 
 def tp_candidates(heads: int | None, cap: int) -> list[int]:
-    """Every TP degree that divides the head count, up to ``cap``.
+    """TP degrees this stack can actually run: powers of two that divide the heads.
 
-    Deliberately NOT restricted to powers of two, which is what the axis used to
-    offer. A 24-head model then capped at tp=8 and left 40 of a 64-core box idle,
-    when tp=12 and tp=24 are both perfectly valid shardings:
+    Two independent constraints, and a candidate must satisfy BOTH.
 
-        Qwen3.8-27B (24 heads)   powers of two: 1,2,4,8
-                                 divisors:      1,2,3,4,6,8,12,24
+    **The head count** must be divisible by the TP degree, because TP splits attention
+    by head. Proposing tp=16 for a 24-head model spends a config slot on a guaranteed
+    ``invalid_tp`` rejection.
 
-    Falls back to the power-of-two ladder only when the head count is unknown,
-    since without it there is nothing to divide.
+    **The Neuron runtime only forms a collective at a power-of-two world size.**
+    Measured directly -- one ``init_process_group`` + ``all_reduce`` per world size,
+    no model loaded:
+
+        world  2   4   16  32  64   -> collective forms, all_reduce correct
+        world  3   5   6   12  24   -> RuntimeError: Failed to execute the
+                                        device barrier 2
+
+    #140 widened this axis from powers of two to every DIVISOR, reasoning that a
+    24-head model capped at tp=8 leaves 40 of 64 cores idle and that tp=12 and tp=24
+    are perfectly valid shardings. The arithmetic was right and the conclusion was
+    wrong: those world sizes cannot be formed, so the Qwen3.8-27B sweep spent four
+    config slots -- each a full 55 GB checkpoint load -- collecting
+    ``collective/TP initialisation failed`` for tp=3, 6, 12 and 24.
+
+    The divisor filter still earns its place; it was the power-of-two ladder that went
+    missing. Intersecting the two gives, for the models in the plan:
+
+        Qwen3.8-27B    24 heads -> 1, 2, 4, 8          (24 NOT reachable)
+        Qwen3.5-122B   32 heads -> 1, 2, 4, 8, 16, 32
+        DeepSeek-V4    64 heads -> 1, 2, 4, 8, 16, 32, 64
+        MiniMax-M2     48 heads -> 1, 2, 4, 8, 16      (48 is not a power of two)
+
+    Idle cores on a model with few heads are reachable by running more REPLICAS, which
+    is what the box-throughput figure measures -- not by a wider shard.
+
+    Falls back to the bare ladder when the head count is unknown, since without it
+    there is nothing to divide.
     """
+    ladder = (1, 2, 4, 8, 16, 32, 64)
     if not heads:
-        return [t for t in (1, 2, 4, 8, 16, 32, 64) if t <= cap]
-    return [t for t in range(1, cap + 1) if heads % t == 0]
+        return [t for t in ladder if t <= cap]
+    return [t for t in ladder if t <= cap and heads % t == 0]
 
 
 def _is_noise(line: str) -> bool:

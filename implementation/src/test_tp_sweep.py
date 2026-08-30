@@ -29,15 +29,45 @@ GEOMETRY = {
 }
 
 
-def test_a_24_head_model_can_now_use_24_cores_not_8():
-    """The concrete win: 3x more of the box becomes reachable."""
+
+def test_a_24_head_model_stops_at_8_because_12_and_24_cannot_form_a_collective():
+    """tp=24 is arithmetically valid and physically unrunnable.
+
+    24 divides evenly by 3, 6, 12 and 24, and every one of those world sizes fails
+    `init_process_group` with "Failed to execute the device barrier 2". So the
+    reachable set is the powers of two dividing 24: tp=8 really is the ceiling for
+    this model, and the other 56 cores are reachable by running more REPLICAS, not by
+    a wider shard.
+    """
     heads, _, lvh = GEOMETRY["Qwen3.8-27B"]
     cap = tp_cap_for("Qwen3_5ForConditionalGeneration", heads, lvh, CORES_48XL)
     tps = tp_candidates(heads, cap)
-    assert tps == [1, 2, 3, 4, 6, 8, 12, 24]
-    assert max(tps) == 24
-    powers_of_two_only = [t for t in (1, 2, 4, 8, 16, 32, 64) if heads % t == 0]
-    assert max(powers_of_two_only) == 8      # what it used to stop at
+    assert tps == [1, 2, 4, 8]
+    for unformable in (3, 6, 12, 24):
+        assert unformable not in tps, f"tp={unformable} cannot form a collective"
+
+
+def test_no_axis_ever_proposes_a_non_power_of_two():
+    """The rule that cost four 55 GB checkpoint loads to learn."""
+    for name, (heads, _, lvh) in GEOMETRY.items():
+        cap = tp_cap_for("X", heads, lvh, CORES_48XL)
+        for tp in tp_candidates(heads, cap):
+            assert tp & (tp - 1) == 0, f"{name}: tp={tp} is not a power of two"
+
+
+def test_minimax_m2_is_capped_at_16_not_48():
+    """48 heads divide by 48, and 48 is not a power of two -- so the tp=48 the launch
+    plan called for was never runnable."""
+    tps = tp_candidates(48, tp_cap_for("MiniMaxM2ForCausalLM", 48, None, CORES_48XL))
+    assert 48 not in tps
+    assert max(tps) == 16          # 1,2,4,8,16 divide 48; 32 does not
+
+
+def test_both_filters_are_load_bearing():
+    """Neither constraint alone gives the right answer for a 24-head model."""
+    both = tp_candidates(24, tp_cap_for("X", 24, None, CORES_48XL))
+    assert 24 % 12 == 0 and 12 not in both        # the ladder removes it
+    assert 24 % 16 != 0 and 16 not in both        # the divisor check removes it
 
 
 def test_qwen3_5_is_no_longer_capped_at_four():
@@ -49,6 +79,7 @@ def test_qwen3_5_is_no_longer_capped_at_four():
         assert max(tp_candidates(heads, cap)) == heads, name
 
 
+
 def test_tp_64_is_reachable_exactly_when_the_head_count_allows_it():
     """TP=64 is not a setting, it is an arithmetic property of the model."""
     reach = {}
@@ -58,7 +89,7 @@ def test_tp_64_is_reachable_exactly_when_the_head_count_allows_it():
     assert reach["DeepSeek-V4-Flash"] == 64      # 64 heads
     assert reach["Qwen3.5-122B-A10B"] == 32      # 32 heads: 64 is not expressible
     assert reach["Qwen3.5-35B-A3B"] == 16
-    assert reach["Qwen3.8-27B"] == 24
+    assert reach["Qwen3.8-27B"] == 8             # 24 heads, but 12/24 cannot form
 
 
 def test_gemma4_stays_hard_capped_at_four():
