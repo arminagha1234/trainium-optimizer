@@ -698,6 +698,21 @@ class NativePyTorchBackend:
         # /dev/neuron*, which wedges every later candidate in the run -- and
         # killpg would hit our own group. See backends/device_reap.py.
         _budget = self._config_timeout_s(cfg)
+        # Clear any orphaned ranks BEFORE launching. A crashed prior candidate leaves
+        # reparented ranks that fail the next device acquisition (NRT_RESOURCE), and a
+        # successful one whose teardown SIGSEGV'd leaves a stale process group so the
+        # next init_process_group fails (the 122B re-measure). Reaping only AFTER a
+        # failure missed both; clearing before every launch -- baseline, each candidate,
+        # and the grader re-measure -- starts each from a clean device. No-op on a clean
+        # box (e.g. the first baseline on a fresh pod).
+        try:
+            from backends.device_reap import clear_survivors as _clear
+        except Exception:  # noqa: BLE001
+            from device_reap import clear_survivors as _clear
+        _pre = _clear(log=None, timeout_s=_REAP_TIMEOUT_S)
+        if not _pre.startswith("clear: no survivors"):
+            print(f"[measure] pre-launch device clear: {_pre}", file=sys.stderr,
+                  flush=True)
         _proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.PIPE, start_new_session=True)
         try:

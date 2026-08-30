@@ -29,6 +29,7 @@ from backends.device_reap import (
     kill_process_group,
     reap,
     surviving_workers,
+    clear_survivors,
     wait_until_clear,
 )
 from backends.native_pytorch import _is_noise, _worker_failure_reason
@@ -289,3 +290,47 @@ def test_an_unsupported_op_is_still_reported_as_unsupported():
     reason = _worker_failure_reason(1, tail)
     assert "unsupported" in reason.lower()
     assert "INTERNAL ERROR" not in reason
+
+
+# --- clear_survivors: kill orphaned ranks by marker when we hold no handle --------
+
+def test_clear_survivors_is_a_noop_on_a_clean_box(tmp_path):
+    """The common case -- first baseline on a fresh pod. Nothing to kill, cheap."""
+    root = _fake_proc(tmp_path, {})
+    calls = []
+    note = clear_survivors(proc_root=root, _kill=lambda *a: calls.append(a))
+    assert note == "clear: no survivors"
+    assert calls == []
+
+
+def test_clear_survivors_signals_only_orphaned_ranks_not_us(tmp_path):
+    """Kill the neuron_worker/torchrun orphans; never signal the optimizer itself."""
+    import os as _os
+    root = _fake_proc(tmp_path, {
+        11: "python -m torch.distributed.run neuron_worker.py",
+        12: "python neuron_worker.py --tp 8",
+        99: "python run_overnight.py",              # the driver -- must NOT be killed
+        _os.getpid(): "python neuron_worker.py",    # us -- must NOT be killed
+    })
+    killed = []
+    # once SIGTERM'd, drop them so the SIGKILL pass and wait see a clear box
+    seen = {"first": True}
+    def fake_kill(pid, sig):
+        killed.append((pid, sig))
+    # surviving_workers reads the fake proc_root; after signalling we can't mutate it,
+    # so assert on the signal calls rather than on clearance here.
+    clear_survivors(proc_root=root, _kill=fake_kill, grace_s=0.0, timeout_s=0.0)
+    signalled = {pid for pid, _ in killed}
+    assert 11 in signalled and 12 in signalled       # the ranks
+    assert 99 not in signalled                       # not the driver
+    assert _os.getpid() not in signalled             # never ourselves
+
+
+def test_clear_survivors_escalates_term_then_kill(tmp_path):
+    import os as _os
+    import signal as _sig
+    root = _fake_proc(tmp_path, {13: "torchrun neuron_worker.py"})
+    sigs = []
+    clear_survivors(proc_root=root, _kill=lambda pid, s: sigs.append(s),
+                    grace_s=0.0, timeout_s=0.0)
+    assert _sig.SIGTERM in sigs and _sig.SIGKILL in sigs
