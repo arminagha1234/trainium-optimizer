@@ -80,6 +80,29 @@ ALLOWED_PATHS = ("optimized_models", "LEADERBOARD.md", "README.md")
 # does not remove a genuine verified result.
 _RECOMMENDED_BUNDLE_FILES = ("reproduce.sh", "RECIPE.md", "results.tsv")
 
+# Instance families that mean "this was measured on real Neuron silicon". Anything
+# else -- most importantly the mock backend's "mock" -- is a synthetic number and
+# must never reach the public showcase.
+#
+# This is not hypothetical. Automatic publication (overnight._auto_publish) defaults
+# to the repo it lives in, so a laptop smoke-run on `--backend mock` regenerated
+# LEADERBOARD.md down to a single row reading
+#     Qwen3-8B | 604 | 173,162 | 286.93x | TP=4, ..., fp8, DP=16 | mock | verified
+# and rewrote optimized_models/qwen3-8b/ with it. Every existing gate passed:
+# verified=="verified", speedup>1, bundle present. The missing question was whether
+# the number came from hardware at all.
+_REAL_INSTANCE_PREFIXES = ("trn1.", "trn2.", "trn3.", "inf1.", "inf2.")
+
+
+def is_real_hardware(instance_type: str) -> bool:
+    """True only for a real Neuron instance type.
+
+    Deliberately a prefix allowlist rather than a "not mock" denylist: a new
+    synthetic backend should be excluded by DEFAULT, not once someone remembers to
+    add its name here.
+    """
+    return str(instance_type or "").strip().lower().startswith(_REAL_INSTANCE_PREFIXES)
+
 MARKER_START = "<!-- LEADERBOARD:START -->"
 MARKER_END = "<!-- LEADERBOARD:END -->"
 
@@ -219,6 +242,19 @@ def _deliverable_from_recipe(
               f"row still listed, numbers come from recipe.json", file=sys.stderr)
     config = recipe.get("config", {}) or {}
     toolchain = recipe.get("toolchain", {}) or {}
+    hardware = str(
+        recipe.get("instance_type")
+        or toolchain.get("instance_type")
+        or "trn2.3xlarge"
+    )
+    # A synthetic result is not a result. The mock backend produces plausible-looking
+    # recipes -- verified, speedup > 1, complete bundle -- that would otherwise
+    # publish exactly like a measured one.
+    if not is_real_hardware(hardware):
+        print(f"[publish] skipping {model_id}: instance_type={hardware!r} is not a "
+              f"real Neuron instance -- refusing to publish a synthetic result",
+              file=sys.stderr)
+        return None
     return Deliverable(
         slug=_slug(model_id),
         model_id=model_id,
@@ -231,11 +267,7 @@ def _deliverable_from_recipe(
         metric_label=recipe.get("metric_label", "tok/s"),
         config=config,
         config_summary=_config_summary(config),
-        hardware=str(
-            recipe.get("instance_type")
-            or toolchain.get("instance_type")
-            or "trn2.3xlarge"
-        ),
+        hardware=hardware,
         verified="verified",
         rel_dir=str(source_dir.relative_to(optimized_models_dir)),
         source_dir=source_dir,
@@ -291,6 +323,11 @@ def _skipped_report(optimized_models_dir: Path | str) -> list[tuple[str, str]]:
             skipped.append((str(recipe_path.parent), "unreadable recipe.json"))
             continue
         rel = str(recipe_path.parent.relative_to(root))
+        tc = recipe.get("toolchain", {}) or {}
+        hw = str(recipe.get("instance_type") or tc.get("instance_type") or "trn2.3xlarge")
+        if not is_real_hardware(hw):
+            skipped.append((rel, f"not real hardware (instance_type={hw!r})"))
+            continue
         v = str(recipe.get("verified", "")).strip().lower()
         if v != "verified":
             skipped.append((rel, f"not verified (verified={recipe.get('verified')!r})"))
