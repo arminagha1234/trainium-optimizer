@@ -283,3 +283,65 @@ def test_zero_metric_recorded_as_failure_not_benign(tmp_path: Path):
     # And no 0-metric row was ever kept.
     assert not any(r.status is Status.KEEP and r.metric <= 0.0
                    and r.stage is Stage.CONFIG for r in rows)
+
+
+# --- ordering: feasibility is asked BEFORE architecture support ---------------
+#
+# The capability gate used to sit after the architecture routing, which returns
+# early. `if rewrites_wired and _is_qwen3_next_arch(cfg): return True, None` fires
+# first, so EVERY hybrid linear-attention model bypassed the gate. On a real run
+# Qwen3.5-122B-A10B walked straight past it into a baseline it could not load and
+# crashed 32 ranks, while the gate had the answer ready (8006 GB of host DRAM
+# needed against 2147). DeepSeek-V4-Flash, not a linear-attention arch, fell
+# through to the gate on the SAME run and was correctly skipped in 10 seconds --
+# which is what makes this an ordering bug rather than a gate bug.
+
+_HUGE_QWEN3_NEXT_CFG = dict(QWEN3_NEXT_CFG, **{
+    "hidden_size": 3072, "num_hidden_layers": 48, "num_attention_heads": 32,
+    "num_key_value_heads": 2, "head_dim": 256, "moe_intermediate_size": 1024,
+    "intermediate_size": 1024, "num_experts": 256, "vocab_size": 151936,
+})
+
+
+def test_an_unfittable_model_is_skipped_even_when_rewrites_are_wired():
+    """Being SUPPORTED is not being FEASIBLE. 122B's real shape, 250 GB measured."""
+    from capability import TRN2_48XLARGE
+
+    loader = _loader({QWEN3_NEXT_SPEC.model_id: _HUGE_QWEN3_NEXT_CFG})
+    ok, reason = preflight_check(QWEN3_NEXT_SPEC, config_loader=loader,
+                                 rewrites_wired=True,
+                                 hardware=TRN2_48XLARGE, weight_gb=250.2)
+    assert ok is False, "a model that cannot be loaded must not reach a baseline"
+    assert reason and reason.startswith("capability:")
+    assert "host DRAM" in reason
+
+
+def test_the_same_model_proceeds_once_the_loader_makes_it_fit(monkeypatch):
+    """And the gate must not become a blanket ban on large hybrids."""
+    from capability import TRN2_48XLARGE
+
+    monkeypatch.setenv("TRN_OPT_LOAD_CONCURRENCY", "4")
+    loader = _loader({QWEN3_NEXT_SPEC.model_id: _HUGE_QWEN3_NEXT_CFG})
+    ok, reason = preflight_check(QWEN3_NEXT_SPEC, config_loader=loader,
+                                 rewrites_wired=True,
+                                 hardware=TRN2_48XLARGE, weight_gb=250.2)
+    assert ok is True, reason
+
+
+def test_a_fitting_hybrid_still_proceeds_with_hardware_supplied():
+    """The ordering change must not disturb the small-model path."""
+    from capability import TRN2_48XLARGE
+
+    loader = _loader({QWEN3_NEXT_SPEC.model_id: QWEN3_NEXT_CFG})
+    ok, reason = preflight_check(QWEN3_NEXT_SPEC, config_loader=loader,
+                                 rewrites_wired=True,
+                                 hardware=TRN2_48XLARGE, weight_gb=1.6)
+    assert ok is True, reason
+
+
+def test_without_hardware_the_gate_is_skipped_and_routing_is_unchanged():
+    """No hardware profile means no feasibility opinion -- fail open, as before."""
+    loader = _loader({QWEN3_NEXT_SPEC.model_id: _HUGE_QWEN3_NEXT_CFG})
+    ok, reason = preflight_check(QWEN3_NEXT_SPEC, config_loader=loader,
+                                 rewrites_wired=True)
+    assert ok is True, reason
