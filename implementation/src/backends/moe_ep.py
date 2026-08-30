@@ -189,7 +189,7 @@ def _ep_layout(rank, world, ep_degree):
 
 
 def shard_moe_experts(model: nn.Module, rank: int, world: int,
-                      ep_degree=None) -> tuple[int, float]:
+                      ep_degree=None, ep_plan=None) -> tuple[int, float]:
     """Replace every fused-expert module in ``model`` with a rank-local shard.
 
     Returns ``(layers_sharded, gb_freed_per_rank)``. A no-op at ``world <= 1``.
@@ -201,7 +201,12 @@ def shard_moe_experts(model: nn.Module, rank: int, world: int,
     """
     if world <= 1:
         return 0, 0.0
-    ep_size, ep_rank, ep_group = _ep_layout(rank, world, ep_degree)
+    if ep_plan is not None:
+        # explicit layout from the orthogonal 2-D mesh (moe_mesh): strided EP column
+        # + that column's process group. Overrides the contiguous Design-B layout.
+        ep_size, ep_rank, ep_group = ep_plan
+    else:
+        ep_size, ep_rank, ep_group = _ep_layout(rank, world, ep_degree)
     root = getattr(model, "model", model)
     layers = getattr(root, "layers", None)
     if layers is None:  # multimodal wrapper

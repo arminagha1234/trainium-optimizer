@@ -5,13 +5,23 @@ import os, torch, torch.nn as nn, torch.distributed as dist
 import torch.nn.functional as F
 
 class AllReduceLinear(nn.Module):
-    """Rowwise-sharded Linear: local partial matmul, then sum across TP ranks."""
-    def __init__(self, lin):
-        super().__init__(); self.lin = lin
+    """Rowwise-sharded Linear: local partial matmul, then sum across the TP ranks.
+
+    ``group`` is the TP process subgroup to sum over. None means the whole world --
+    correct when TP=world (the coupled/Design-B path). In the orthogonal 2-D mesh the
+    TP group is one row (size tp<world), so the sum must be scoped to it or o_proj
+    would incorrectly reduce across EP columns too.
+    """
+    def __init__(self, lin, group=None):
+        super().__init__(); self.lin = lin; self.group = group
     def forward(self, x):
         o = self.lin(x)
         if dist.is_initialized() and dist.get_world_size() > 1:
-            dist.all_reduce(o)
+            grp = self.group
+            # world_size within the group; 1-rank group needs no reduce
+            n = dist.get_world_size(grp) if grp is not None else dist.get_world_size()
+            if n > 1:
+                dist.all_reduce(o, group=grp)
         return o
 
 def _slice_linear(lin, rows=None, cols=None):
@@ -38,7 +48,7 @@ def _slice_linear(lin, rows=None, cols=None):
         n.bias.data = b.contiguous()
     return n
 
-def shard_attention(a, r, tp):
+def shard_attention(a, r, tp, group=None):
     """Head-parallel attention. Handles tp > num_key_value_heads by REPLICATING
     KV heads rather than slicing them to nothing.
 
@@ -67,13 +77,13 @@ def shard_attention(a, r, tp):
     # o_proj input = nh*hd; slice cols by q-heads, all-reduce
     o = _slice_linear(a.o_proj, cols=(r*qpr*hd, (r*qpr+qpr)*hd))
     if o.bias is not None and r != 0: o.bias.data.zero_()  # add bias once
-    a.o_proj = AllReduceLinear(o)
+    a.o_proj = AllReduceLinear(o, group=group)
     # repeat_kv reads num_key_value_groups at runtime, so it must describe the
     # LOCAL shapes: qpr query heads over kpr KV heads. Set on the module, never on
     # a.config -- the config object is shared by every layer.
     a.num_key_value_groups = max(1, qpr // kpr)
 
-def shard_deltanet(a, r, tp):
+def shard_deltanet(a, r, tp, group=None):
     """Head-parallel GatedDeltaNet. K-heads REPLICATE when tp exceeds their count;
     V-heads must not.
 
@@ -141,33 +151,36 @@ def shard_deltanet(a, r, tp):
     a.dt_bias = nn.Parameter(a.dt_bias.data[r*vpr:(r*vpr+vpr)].contiguous())
     a.A_log = nn.Parameter(a.A_log.data[r*vpr:(r*vpr+vpr)].contiguous())
     # out_proj input = value_dim; slice cols by v-head, all-reduce
-    a.out_proj = AllReduceLinear(_slice_linear(a.out_proj, cols=(r*vpr*hvd, (r*vpr+vpr)*hvd)))
+    a.out_proj = AllReduceLinear(_slice_linear(a.out_proj, cols=(r*vpr*hvd, (r*vpr+vpr)*hvd)), group=group)
     # update dims used by forward split/reshape
     a.num_k_heads = kpr; a.num_v_heads = vpr
     a.key_dim = kpr*hkd; a.value_dim = vpr*hvd; a.conv_dim = cd
     # norm is over head_v_dim (128) -> replicate unchanged
 
-def shard_mlp(m, r, tp):
+def shard_mlp(m, r, tp, group=None):
     inter = m.gate_proj.out_features; ipr = inter // tp
     m.gate_proj = _slice_linear(m.gate_proj, rows=(r*ipr, (r*ipr+ipr)))
     m.up_proj = _slice_linear(m.up_proj, rows=(r*ipr, (r*ipr+ipr)))
     d = _slice_linear(m.down_proj, cols=(r*ipr, (r*ipr+ipr)))
     if d.bias is not None and r != 0: d.bias.data.zero_()
-    m.down_proj = AllReduceLinear(d)
+    m.down_proj = AllReduceLinear(d, group=group)
 
-def shard_model(model, r, tp):
+def shard_model(model, r, tp, group=None):
+    """Head-parallel TP over `tp` ranks. `r` is the rank WITHIN the TP group and
+    `group` is that group's process handle (None = world, the coupled default). In
+    the 2-D mesh, pass tp=row width, r=tp_rank, group=the TP row's subgroup."""
     layers = model.model.layers
     n_attn = n_dn = n_mlp = 0
     for L in layers:
         if hasattr(L, "self_attn"):
-            shard_attention(L.self_attn, r, tp); n_attn += 1
+            shard_attention(L.self_attn, r, tp, group=group); n_attn += 1
         if hasattr(L, "linear_attn"):
-            shard_deltanet(L.linear_attn, r, tp); n_dn += 1
+            shard_deltanet(L.linear_attn, r, tp, group=group); n_dn += 1
         # NOTE: a sparse MoE block has L.mlp.experts + L.mlp.gate and NO top-level
         # gate_proj, so this dense branch SKIPS it — leaving every expert whole on
         # every rank (the Qwen3.5-30B OOM). To shard MoE experts add a shard_moe
         # (expert-TP) branch gated on hasattr(L.mlp, "experts"). Full method +
         # ready snippet: docs/large-model-playbook.md ("MoE placement fix").
         if hasattr(L, "mlp") and hasattr(L.mlp, "gate_proj"):
-            shard_mlp(L.mlp, r, tp); n_mlp += 1
+            shard_mlp(L.mlp, r, tp, group=group); n_mlp += 1
     return n_attn, n_dn, n_mlp
