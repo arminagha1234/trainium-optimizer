@@ -296,10 +296,15 @@ def test_zero_metric_recorded_as_failure_not_benign(tmp_path: Path):
 # through to the gate on the SAME run and was correctly skipped in 10 seconds --
 # which is what makes this an ordering bug rather than a gate bug.
 
+# Qwen3.5-122B-A10B's real shape. linear_num_value_heads matters: value heads cannot
+# be replicated (out_proj all-reduces), so they bound tp -- the small fixture this
+# derives from carries 16, which would cap a 32-head model at tp=16 and is not what
+# the real model does.
 _HUGE_QWEN3_NEXT_CFG = dict(QWEN3_NEXT_CFG, **{
     "hidden_size": 3072, "num_hidden_layers": 48, "num_attention_heads": 32,
     "num_key_value_heads": 2, "head_dim": 256, "moe_intermediate_size": 1024,
     "intermediate_size": 1024, "num_experts": 256, "vocab_size": 151936,
+    "linear_num_key_heads": 16, "linear_num_value_heads": 64,
 })
 
 
