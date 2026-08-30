@@ -345,3 +345,79 @@ def test_without_hardware_the_gate_is_skipped_and_routing_is_unchanged():
     ok, reason = preflight_check(QWEN3_NEXT_SPEC, config_loader=loader,
                                  rewrites_wired=True)
     assert ok is True, reason
+
+
+# --- a fixed limitation must not stay banked forever --------------------------
+#
+# DeepSeek-V4-Flash was correctly skipped as HOST_LIMITED, which banked an
+# anti-pattern. Staggered loading then made it loadable and the fresh gate said
+# RUNNABLE -- but the run was skipped anyway, replaying the stale reason verbatim
+# ("64 full copies, one per rank...") long after that stopped being what the loader
+# does. The compounding bank had compounded a false memory.
+
+class _FakeLesson:
+    def __init__(self, reason, matcher=None, lesson_id="preflight-x"):
+        self.reason = reason
+        self.matcher = matcher if matcher is not None else {}
+        self.lesson_id = lesson_id
+        self.evidence = []
+
+
+class _FakeBank:
+    def __init__(self, lessons):
+        self._lessons = lessons
+
+    def preflight_antipatterns(self, family, sdk_version):
+        return self._lessons
+
+
+def _cap_lesson(spec, reason="capability: loading 319 GB on 64 ranks needs 20431 GB"):
+    from preflight import arch_signature
+    sig = arch_signature(spec, DENSE_CFG)
+    return _FakeLesson(reason, {"arch_signature": sig, "model_id": spec.model_id})
+
+
+def test_a_banked_capability_verdict_is_not_replayed():
+    """It is re-derived for free at step 0, so a stored copy can only be stale."""
+    loader = _loader({DENSE_SPEC.model_id: DENSE_CFG})
+    bank = _FakeBank([_cap_lesson(DENSE_SPEC)])
+    ok, reason = preflight_check(DENSE_SPEC, bank=bank, config_loader=loader)
+    assert ok is True, reason
+
+
+def test_a_banked_expensive_failure_is_still_replayed():
+    """The bank's actual purpose: do not rediscover a compile abort at full price."""
+    loader = _loader({DENSE_SPEC.model_id: DENSE_CFG})
+    bank = _FakeBank([_FakeLesson(
+        "neuronx-cc aborted after 3h on this architecture",
+        {"arch_signature": __import__("preflight").arch_signature(DENSE_SPEC, DENSE_CFG),
+         "model_id": DENSE_SPEC.model_id})])
+    ok, reason = preflight_check(DENSE_SPEC, bank=bank, config_loader=loader)
+    assert ok is False
+    assert "aborted" in reason
+
+
+def test_a_tagged_capability_lesson_is_recognised_without_the_prefix():
+    """Newly banked entries carry matcher['source'], so the tag is authoritative."""
+    from preflight import arch_signature
+
+    loader = _loader({DENSE_SPEC.model_id: DENSE_CFG})
+    sig = arch_signature(DENSE_SPEC, DENSE_CFG)
+    tagged = _FakeLesson("some reworded capability message",
+                         {"arch_signature": sig, "model_id": DENSE_SPEC.model_id,
+                          "source": "capability"})
+    ok, _ = preflight_check(DENSE_SPEC, bank=_FakeBank([tagged]),
+                            config_loader=loader)
+    assert ok is True
+
+
+def test_capability_skips_are_tagged_when_banked():
+    """So a future run can tell a cheap verdict from an expensive failure."""
+    from preflight import arch_signature, make_anti_pattern_lesson
+
+    sig = arch_signature(DENSE_SPEC, DENSE_CFG)
+    cap = make_anti_pattern_lesson(DENSE_SPEC, sig, "capability: 8006 GB of host DRAM")
+    assert cap.matcher.get("source") == "capability"
+
+    expensive = make_anti_pattern_lesson(DENSE_SPEC, sig, "neuronx-cc ISA failure")
+    assert "source" not in expensive.matcher
