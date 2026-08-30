@@ -77,6 +77,35 @@ class ExpertParallelExperts(nn.Module):
         self.down_proj = nn.Parameter(
             orig.down_proj.data[lo:hi].clone(), requires_grad=False)
 
+    @classmethod
+    def from_sliced(cls, *, num_experts, rank, world, act_fn, gate_up_proj, down_proj):
+        """Build directly from THIS RANK'S already-sliced expert weights.
+
+        The ``__init__`` above slices ``orig.gate_up_proj[lo:hi]`` from a full,
+        materialised expert tensor -- which is exactly the host-DRAM peak that
+        shard-on-read exists to avoid. This path takes the weights already narrowed
+        to ``[lo:hi]`` by ``shard_stream.stream_shard`` (read straight off disk), so
+        the full expert set never exists in this process.
+
+        ``lo``/``hi`` are recomputed from ``expert_shard_plan`` rather than inferred
+        from the tensor, and asserted against its length, so a mismatch between the
+        streamed slice and the expected range is caught here instead of producing a
+        model that routes tokens to the wrong expert.
+        """
+        self = cls.__new__(cls)
+        nn.Module.__init__(self)
+        lo, hi = expert_shard_plan(num_experts, rank, world)
+        if gate_up_proj.shape[0] != hi - lo or down_proj.shape[0] != hi - lo:
+            raise ValueError(
+                f"sliced expert count {gate_up_proj.shape[0]}/{down_proj.shape[0]} "
+                f"!= expected {hi - lo} for rank {rank}/{world} of {num_experts}")
+        self.num_experts = num_experts          # global, for the one-hot dispatch
+        self.lo, self.hi = lo, hi
+        self.act_fn = act_fn
+        self.gate_up_proj = nn.Parameter(gate_up_proj, requires_grad=False)
+        self.down_proj = nn.Parameter(down_proj, requires_grad=False)
+        return self
+
     def forward(
         self,
         hidden_states: torch.Tensor,

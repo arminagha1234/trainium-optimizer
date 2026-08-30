@@ -247,3 +247,92 @@ def test_kv_heads_replicate_at_the_real_122b_geometry():
         assert sl is not None and sl.hi - sl.lo == hd, r
         seen.add(sl.lo // hd)
     assert seen == {0, 1}                            # both KV heads used, none dropped
+
+
+# ---------------------------------------------------------------------------
+# Assembling a model from streamed slices must equal loading it whole and sharding.
+#
+# test above proves the SLICES match. This proves the ASSEMBLY: meta-instantiate,
+# swap expert modules to rank-local, stream weights in -> the live model's parameters
+# are bit-for-bit identical to full-load + shard_moe_experts. If they diverge, a run
+# using shard-on-read would route tokens through the wrong expert weights and report a
+# number for a model that is quietly wrong -- so this fails instead.
+# ---------------------------------------------------------------------------
+import safetensors.torch  # noqa: E402
+
+from backends.shard_stream import load_ep_sharded  # noqa: E402
+
+
+def _save_checkpoint(model, d):
+    """Write the model as a single safetensors file, like a real checkpoint."""
+    sd = {k: v.contiguous() for k, v in model.state_dict().items()
+          if not v.is_meta}
+    safetensors.torch.save_file(sd, str(d / "model.safetensors"))
+    return [d / "model.safetensors"]
+
+
+def _imperative_ep_only(base, rank, world):
+    """Reference: full-load, shard ONLY the experts (attention replicated).
+
+    shard-on-read replicates attention for this model, so the matching imperative
+    configuration is expert-parallel with attention left whole -- not shard_model,
+    which also TP-shards attention. Both are correct; this isolates what the assembly
+    actually does.
+    """
+    m = copy.deepcopy(base)
+    shard_moe_experts(m, rank, world)
+    return dict(m.named_parameters())
+
+
+@pytest.mark.parametrize("world", [2, 4, 8])
+def test_assembled_model_matches_full_load_plus_expert_shard(tmp_path, world):
+    base = _model()
+    # A monkeypatch so load_ep_sharded builds the SAME tiny config, not a Hub fetch.
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+        Qwen3_5MoeTextConfig,
+    )
+    import transformers
+    orig_from_pretrained = transformers.AutoConfig.from_pretrained
+    cfg_obj = Qwen3_5MoeTextConfig(**CFG)
+    cfg_obj._attn_implementation = "eager"
+    transformers.AutoConfig.from_pretrained = staticmethod(
+        lambda *a, **k: cfg_obj)
+    try:
+        files = _save_checkpoint(base, tmp_path)
+        for rank in range(world):
+            ref = _imperative_ep_only(base, rank, world)
+            got_model = load_ep_sharded("tiny", files, CFG, rank, world)
+            got = dict(got_model.named_parameters())
+            # every reference parameter must be present and identical
+            for name, expected in ref.items():
+                assert name in got, (world, rank, "missing", name)
+                a = got[name]
+                assert a.shape == expected.shape, (world, rank, name,
+                                                   a.shape, expected.shape)
+                assert torch.equal(a, expected), (world, rank, name)
+            assert set(got) == set(ref), (world, rank,
+                                          set(got) ^ set(ref))
+    finally:
+        transformers.AutoConfig.from_pretrained = orig_from_pretrained
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_assembled_expert_weights_are_rank_local_not_full(tmp_path, world):
+    """The whole point: a rank must hold only its experts, not all of them."""
+    base = _model()
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+        Qwen3_5MoeTextConfig,
+    )
+    import transformers
+    orig = transformers.AutoConfig.from_pretrained
+    cfg_obj = Qwen3_5MoeTextConfig(**CFG); cfg_obj._attn_implementation = "eager"
+    transformers.AutoConfig.from_pretrained = staticmethod(lambda *a, **k: cfg_obj)
+    try:
+        files = _save_checkpoint(base, tmp_path)
+        m = load_ep_sharded("tiny", files, CFG, 0, world)
+        per_rank = CFG["num_experts"] // world
+        for name, prm in m.named_parameters():
+            if name.endswith("mlp.experts.gate_up_proj"):
+                assert prm.shape[0] == per_rank, (name, prm.shape, per_rank)
+    finally:
+        transformers.AutoConfig.from_pretrained = orig

@@ -79,7 +79,8 @@ def kv_range(heads: int, kv_heads: int, rank: int, world: int) -> tuple[int, int
 
 
 def slice_for(name: str, cfg: dict, rank: int, world: int,
-              shape: tuple[int, ...] | None = None) -> Slice | None:
+              shape: tuple[int, ...] | None = None,
+              *, experts_only: bool = False) -> Slice | None:
     """How to slice checkpoint tensor ``name`` for ``rank``, or None to replicate.
 
     ``cfg`` is the plain text-config dict. ``shape`` is the tensor's GLOBAL shape,
@@ -94,6 +95,15 @@ def slice_for(name: str, cfg: dict, rank: int, world: int,
     [32, 256].
     """
     if world <= 1:
+        return None
+    # experts_only: shard ONLY the fused-expert tensors, replicate everything else.
+    # This is the loader mode -- sharding an attention WEIGHT without installing the
+    # matching sharded-attention MODULE (head-count reshape + o_proj all-reduce) would
+    # be silently wrong, so shard-on-read replicates attention and lets expert
+    # parallelism carry the memory win (experts are 96.9% of the bytes that OOM). Not
+    # the default, because the search's TP path DOES install sharded attention modules
+    # and wants the attention slices too.
+    if experts_only and ".mlp.experts." not in name:
         return None
 
     def _i(key, default=0):
@@ -153,7 +163,7 @@ def unrecognised(shapes: dict, cfg: dict, rank: int, world: int) -> list[str]:
             if slice_for(n, cfg, rank, world, tuple(sh)) is None]
 
 
-def stream_shard(files, cfg: dict, rank: int, world: int, *, log=None):
+def stream_shard(files, cfg: dict, rank: int, world: int, *, experts_only: bool = False, log=None):
     """Yield ``(name, tensor)`` holding only THIS rank's slice of each weight.
 
     ``files`` are the checkpoint's ``.safetensors`` paths. Reads one file at a time
@@ -174,7 +184,9 @@ def stream_shard(files, cfg: dict, rank: int, world: int, *, log=None):
     for path in files:
         with safe_open(str(path), framework="pt") as f:
             for name in f.keys():
-                sl = slice_for(name, cfg, rank, world, tuple(f.get_slice(name).get_shape()))
+                sl = slice_for(name, cfg, rank, world,
+                               tuple(f.get_slice(name).get_shape()),
+                               experts_only=experts_only)
                 if sl is None:
                     yield name, f.get_tensor(name)
                     n_repl += 1
@@ -189,3 +201,90 @@ def stream_shard(files, cfg: dict, rank: int, world: int, *, log=None):
     if log:
         log(f"shard-on-read: {n_shard} tensor(s) sliced, {n_repl} replicated "
             f"(rank {rank}/{world})")
+
+
+def load_ep_sharded(model_id, files, cfg, rank, world, *, dtype=None, log=None):
+    """Assemble an expert-parallel model WITHOUT materialising the full model.
+
+    This is the wiring that turns the proven slice_for / stream_shard plan into a live
+    model. The steps, and why each is safe:
+
+    1. Instantiate on the ``meta`` device from config. ``from_config`` builds the
+       module tree with zero real memory. This is what makes the host-DRAM peak
+       ``resident shard + one file in flight`` instead of ``world x model``.
+
+    2. Replace each fused-expert module with a rank-local one. Experts are 96.9% of the
+       bytes for the models that OOM (122B, 235B, MiniMax) and are the ONLY thing
+       slice_for shards for them -- attention and the rest are replicated. So only the
+       expert modules change shape; everything else keeps its full (meta) shape and
+       receives a full replicated tensor that matches.
+
+    3. Stream the checkpoint and fill parameters in place with
+       ``load_state_dict(assign=True)``: experts get their [lo:hi] slice (built off
+       disk), the rest get replicated full copies. ``assign=True`` swaps the meta
+       placeholders for real tensors rather than copying into them, so no full-width
+       buffer is ever allocated for a sharded parameter.
+
+    Correctness is not asserted by inspection: test_shard_stream.py proves the assembled
+    per-rank parameters are bit-for-bit identical to the imperative shard_moe_experts
+    path, itself numerically validated in test_moe_ep.py. Any parameter left on meta
+    after loading is a missing rule and is raised, not silently shipped.
+    """
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+    try:
+        from .moe_ep import ExpertParallelExperts
+    except ImportError:
+        from moe_ep import ExpertParallelExperts
+
+    hf_cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(hf_cfg, trust_remote_code=True)
+    if dtype is not None:
+        model = model.to(dtype)
+
+    n_exp = 0
+    for key in ("num_experts", "n_routed_experts"):
+        if isinstance(cfg.get(key), int):
+            n_exp = cfg[key]
+            break
+
+    streamed = dict(stream_shard(files, cfg, rank, world,
+                                 experts_only=True, log=log))
+    root = getattr(model, "model", model)
+    layers = getattr(root, "layers", None)
+    if layers is None:
+        lm = getattr(root, "language_model", None)
+        layers = getattr(lm, "layers", []) if lm is not None else []
+    swapped = 0
+    for li, layer in enumerate(layers):
+        mlp = getattr(layer, "mlp", None)
+        experts = getattr(mlp, "experts", None) if mlp is not None else None
+        if experts is None or not hasattr(experts, "gate_up_proj") or not n_exp:
+            continue
+        prefix = None
+        for nm in streamed:
+            if nm.endswith("mlp.experts.gate_up_proj") and f".layers.{li}." in nm:
+                prefix = nm[: -len("gate_up_proj")]
+                break
+        if prefix is None:
+            continue
+        mlp.experts = ExpertParallelExperts.from_sliced(
+            num_experts=n_exp, rank=rank, world=world, act_fn=experts.act_fn,
+            gate_up_proj=streamed[prefix + "gate_up_proj"],
+            down_proj=streamed[prefix + "down_proj"])
+        swapped += 1
+
+    expert_names = {n for n in streamed if ".mlp.experts." in n}
+    load_sd = {n: t for n, t in streamed.items() if n not in expert_names}
+    _missing, unexpected = model.load_state_dict(load_sd, strict=False, assign=True)
+
+    still_meta = [n for n, pr in model.named_parameters() if pr.is_meta]
+    if still_meta:
+        raise RuntimeError(
+            f"shard-on-read left {len(still_meta)} parameter(s) on meta, e.g. "
+            f"{still_meta[:5]} -- a shard rule is missing for them")
+    if log:
+        log(f"shard-on-read assembled: {swapped} expert layer(s) rank-local, "
+            f"{len(load_sd)} tensor(s) loaded, {len(unexpected)} unexpected")
+    return model
