@@ -352,3 +352,47 @@ MiniMax-Text-01 is the case where the model already says no: 915 GB is `HOST_LIM
 at conc=2 (2715 GB needed) and only `TIGHT` at conc=1 (14.3 GB/rank against a 14.4
 ceiling). Given the under-prediction above, its conc=1 verdict deserves the same
 scepticism.
+
+## Two cheap causes that cost whole models
+
+Band `large2` ran three P0/P1 targets and published none. Neither failure was about
+optimization:
+
+**Kimi-Linear-48B-A3B-Instruct — a missing 40 KB package.** 34 seconds from start to
+crash:
+
+```
+[kimi-linear-48b-a3b-instruct] CRASHED: FAIL_NO_BASELINE: ... baseline produced no
+throughput (metric=0.0) ... WORKER: rc=1: [rank7]: ImportError: This modeling file
+requires the following packages that were not found in your environment: einops.
+```
+
+`einops` is a hard requirement of several remote modeling files. The orchestrator handled
+it correctly — no baseline means no incumbent to optimize, so it refused to continue —
+but the whole model was lost to a `pip install`. `einops`, `sentencepiece` and `tiktoken`
+are now installed by the band template.
+
+**DeepSeek-V4-Flash — runtime contamination from the previous model.** 35 seconds, and
+the reason it failed is *when* it ran:
+
+```
+09:26 -> 11:34  Qwen3.5-122B-A10B   grader: unverified (claimed=6 remeasured=0
+                                    drift=100.0% equivalence=FAIL)
+                                    re-measure failed: collective/TP initialisation failed
+11:34 -> 11:35  DeepSeek-V4-Flash   FAIL_NO_BASELINE: collective/TP initialisation failed
+```
+
+DeepSeek-V4-Flash has 64 query heads, and world=64 initialises cleanly on a fresh
+container (measured). What it inherited was a runtime left broken by the 122B's failed
+collective in the same container — the same effect that makes a TP ladder unreliable
+after its first failure.
+
+So **one model per workload for anything that shards wide.** Sequencing large models in a
+single container means the first collective failure silently poisons every model after it,
+and the symptom is indistinguishable from the later model being broken. `large2` looked
+like three unrelated failures and was really one missing package plus one carried-over
+runtime.
+
+Worth noting what worked correctly here: the 122B claimed 6 tok/s, the trusted grader
+re-measured it, the re-measure failed, and the result was marked `unverified` and **not
+published**. A claimed number that cannot be reproduced never reaches the board.
