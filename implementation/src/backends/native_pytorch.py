@@ -105,6 +105,12 @@ _ERR_SIGNATURES: tuple[tuple[str, str], ...] = (
     ("KeyError: 'architectures'", "model config has no architectures field"),
     ("Dynamic shape is not supported", "dynamic shape reached the compiler "
                                        "(set dynamic=False / pin the batch)"),
+    # neuronx-cc crashed inside itself. Not a model or config problem -- the same
+    # graph on a fixed compiler would compile. Distinguishing this from
+    # "unsupported op" matters: one is escalate, the other is rewrite.
+    ("INTERNAL_ERROR", "neuronx-cc INTERNAL ERROR (compiler bug -- escalate, "
+                       "do not tune around it)"),
+    ("BIRCodeGenLoop", "neuronx-cc INTERNAL ERROR in BIR codegen (compiler bug)"),
     ("not supported", "unsupported architecture/op for this backend"),
     ("CUDA", "worker tried a CUDA path on a Neuron device"),
     # NOT a bare "torch.distributed" match: torchrun's own ChildFailedError
