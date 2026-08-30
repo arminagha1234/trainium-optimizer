@@ -258,6 +258,7 @@ def host_load_peak_gb(
     *,
     lean_loader: bool = False,
     stream_gb: float = _LEAN_STREAM_GB,
+    concurrency: int | None = None,
 ) -> float:
     """Peak HOST DRAM, summed over every rank on the node, during model load.
 
@@ -278,14 +279,25 @@ def host_load_peak_gb(
     more ranks, host DRAM wants fewer -- which is why "try a bigger tp" could
     never resolve these models.
 
+    ``concurrency=N`` models ``TRN_OPT_LOAD_CONCURRENCY`` (backends/load_stagger.py):
+    only N ranks sit in the load window at once, so the peak drops to
+    ``N*W + (ranks-N)*W/ranks``. This is what makes 122B and DeepSeek loadable today,
+    at the cost of ``ceil(ranks/N)`` sequential load waves.
+
     ``lean_loader=True`` models a shard-on-read loader: build on ``meta``, stream
     one file at a time, slice this rank's portion, release the rest. Peak becomes
     the resident sharded weights plus one file in flight per rank, so the rank
-    count stops multiplying the model size.
+    count stops multiplying the model size. Faster than staggering, more work to
+    build.
     """
     ranks = max(1, ranks)
     if lean_loader:
         return weight_gb + ranks * stream_gb
+    if concurrency is not None and concurrency < ranks:
+        # Staggered: only `concurrency` ranks hold a full copy; the rest already
+        # hold just their shard. See backends/load_stagger.py.
+        c = max(1, concurrency)
+        return c * weight_gb + (ranks - c) * (weight_gb / ranks)
     return ranks * weight_gb
 
 
@@ -445,9 +457,14 @@ def assess(
 
     host_peak = host_load_peak_gb(weight_gb, ranks)
     host_lean = host_load_peak_gb(weight_gb, ranks, lean_loader=True)
+    host_stag = host_load_peak_gb(weight_gb, ranks, concurrency=2)
+    host_stag1 = host_load_peak_gb(weight_gb, ranks, concurrency=1)
+    host_cap = hw.host_ram_gb * max(1, node_count)
+    fits_stagger = host_stag <= host_cap
     breakdown["host_ram_gb"] = hw.host_ram_gb
     breakdown["host_peak_gb"] = round(host_peak, 1)
     breakdown["host_peak_lean_gb"] = round(host_lean, 1)
+    breakdown["host_peak_stagger2_gb"] = round(host_stag, 1)
 
     if weight_gb > hw.total_hbm_gb * max(1, node_count):
         return Verdict(
@@ -469,8 +486,12 @@ def assess(
                     f"{hw.host_ram_gb:.0f} GB -- this OOM-kills the pod during "
                     f"load, before any core is touched. A bigger tp makes it "
                     f"WORSE, not better"
-                    + (f"; a shard-on-read loader would need only "
-                       f"{host_lean:.0f} GB and would fit" if fits_lean
+                    + (f"; TRN_OPT_LOAD_CONCURRENCY=2 brings the peak to "
+                       f"{host_stag:.0f} GB and fits" if fits_stagger
+                       else f"; even TRN_OPT_LOAD_CONCURRENCY=1 peaks at "
+                            f"{host_stag1:.0f} GB")
+                    + (f"; a shard-on-read loader would need "
+                       f"{host_lean:.0f} GB" if fits_lean
                        else f"; even a shard-on-read loader needs "
                             f"{host_lean:.0f} GB")
                     + dq_note),

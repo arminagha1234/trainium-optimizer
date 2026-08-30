@@ -389,3 +389,36 @@ def test_a_1t_model_does_not_fit_one_node_even_with_a_perfect_loader():
     assert lean["weight_gb"] < 2000.0
     assert ceiling(TRN2_48XLARGE, lean_loader=True, node_count=2)["params_b"] \
         > lean["params_b"]
+
+
+# --- staggered loading: the setting that makes the big two loadable today ------
+
+def test_host_limited_verdict_hands_over_the_setting_that_fixes_it():
+    """A diagnosis the next person can act on beats one they have to re-derive."""
+    v = assess(_moe(h=2048, L=40, moe_inter=512, experts=256, heads=32),
+               TRN2_48XLARGE, weight_gb=250.2)
+    assert v.status == "HOST_LIMITED"
+    assert "TRN_OPT_LOAD_CONCURRENCY=2" in v.reason
+    assert v.details["host_peak_stagger2_gb"] < TRN2_48XLARGE.host_ram_gb
+
+
+def test_staggering_is_modelled_and_beats_the_eager_peak():
+    from capability import host_load_peak_gb
+
+    eager = host_load_peak_gb(250.2, 32)
+    stag = host_load_peak_gb(250.2, 32, concurrency=2)
+    assert eager > TRN2_48XLARGE.host_ram_gb
+    assert stag < TRN2_48XLARGE.host_ram_gb
+    # Concurrency at or above the rank count is just the eager peak.
+    assert host_load_peak_gb(250.2, 32, concurrency=32) == eager
+    assert host_load_peak_gb(250.2, 32, concurrency=99) == eager
+
+
+def test_staggering_and_shard_on_read_agree_on_direction_not_magnitude():
+    """Both fit; shard-on-read is far cheaper, which is why it is the real fix."""
+    from capability import host_load_peak_gb
+
+    stag = host_load_peak_gb(319.2, 64, concurrency=2)
+    lean = host_load_peak_gb(319.2, 64, lean_loader=True)
+    assert stag < TRN2_48XLARGE.host_ram_gb
+    assert lean < stag
