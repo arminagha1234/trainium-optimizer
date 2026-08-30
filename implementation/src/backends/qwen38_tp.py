@@ -74,21 +74,52 @@ def shard_attention(a, r, tp):
     a.num_key_value_groups = max(1, qpr // kpr)
 
 def shard_deltanet(a, r, tp):
-    nkv, nvh = a.num_k_heads, a.num_v_heads          # 16, 48
+    """Head-parallel GatedDeltaNet. K-heads REPLICATE when tp exceeds their count;
+    V-heads must not.
+
+    Same class of bug as shard_attention had, found the same way. Qwen3.5-122B-A10B
+    has linear_num_key_heads=16, and its 32 query heads force tp=32, so
+    `nkv // tp` was 0: the q and k blocks were sliced to zero width and 32 ranks
+    died with `ZeroDivisionError: integer division or modulo by zero` once the
+    forward divided by a now-zero head count.
+
+    The two axes are NOT symmetric, which is the part worth being careful about:
+
+    * K-heads feed keys that are consumed locally, so several ranks may hold the
+      same one. Replicating costs one slice of in_proj_qkv/conv1d per rank.
+    * V-heads determine the columns of out_proj, and out_proj is row-sharded with
+      an all-reduce. If two ranks held the same v-head its contribution would be
+      summed twice and the output would be silently wrong. So v-heads must stay
+      disjoint, which genuinely bounds tp at num_v_heads -- and that is raised as
+      an error rather than papered over, because a wrong answer is worse than a
+      failed run.
+    """
+    nkv, nvh = a.num_k_heads, a.num_v_heads          # e.g. 16, 64
     hkd, hvd = a.head_k_dim, a.head_v_dim            # 128, 128
-    kd, vd = a.key_dim, a.value_dim                  # 2048, 6144
-    kpr, vpr = nkv // tp, nvh // tp                  # 4, 12
+    kd, vd = a.key_dim, a.value_dim                  # 2048, 8192
+    if nvh < tp:
+        raise ValueError(
+            f"GatedDeltaNet has {nvh} value heads but tp={tp}: value heads cannot "
+            f"be replicated because out_proj all-reduces, so a shared head would "
+            f"be double-counted. Cap tp at {nvh} for this model.")
+    vpr = nvh // tp
+    # K-heads that serve THIS rank's value heads. Reduces to nkv//tp and r*kpr
+    # whenever tp divides nkv, and floors at one head instead of zero when it does
+    # not (122B: 16 k-heads over 32 ranks -> two ranks share each k-head).
+    kpr = max(1, (vpr * nkv) // nvh)
+    k_start = (r * vpr * nkv) // nvh
     # in_proj_qkv rows = [q:0..kd][k:kd..2kd][v:2kd..2kd+vd]; slice each block by head
     W = a.in_proj_qkv.weight.data
-    q = W[r*kpr*hkd:(r*kpr+kpr)*hkd]
-    k = W[kd + r*kpr*hkd: kd + (r*kpr+kpr)*hkd]
+    q = W[k_start*hkd:(k_start+kpr)*hkd]
+    k = W[kd + k_start*hkd: kd + (k_start+kpr)*hkd]
     v = W[2*kd + r*vpr*hvd: 2*kd + (r*vpr+vpr)*hvd]
     newW = torch.cat([q, k, v], 0).contiguous()
     nin = nn.Linear(W.shape[1], newW.shape[0], bias=False, dtype=W.dtype); nin.weight.data = newW
     a.in_proj_qkv = nin
     # conv1d depthwise: same channel slices
     C = a.conv1d.weight.data  # (conv_dim,1,K)
-    cq = C[r*kpr*hkd:(r*kpr+kpr)*hkd]; ck = C[kd + r*kpr*hkd: kd + (r*kpr+kpr)*hkd]
+    cq = C[k_start*hkd:(k_start+kpr)*hkd]
+    ck = C[kd + k_start*hkd: kd + (k_start+kpr)*hkd]
     cv = C[2*kd + r*vpr*hvd: 2*kd + (r*vpr+vpr)*hvd]
     newC = torch.cat([cq, ck, cv], 0).contiguous()
     cd = newC.shape[0]
@@ -97,7 +128,8 @@ def shard_deltanet(a, r, tp):
     nc.weight.data = newC
     if a.conv1d.bias is not None:
         cb = a.conv1d.bias.data
-        nc.bias.data = torch.cat([cb[r*kpr*hkd:(r*kpr+kpr)*hkd], cb[kd+r*kpr*hkd:kd+(r*kpr+kpr)*hkd],
+        nc.bias.data = torch.cat([cb[k_start*hkd:(k_start+kpr)*hkd],
+                                  cb[kd+k_start*hkd:kd+(k_start+kpr)*hkd],
                                   cb[2*kd+r*vpr*hvd:2*kd+(r*vpr+vpr)*hvd]]).contiguous()
     a.conv1d = nc
     # in_proj_z (value_dim) by v-head

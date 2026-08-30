@@ -335,6 +335,33 @@ def preflight_check(
     """
     cfg = config if config is not None else load_hf_config(spec.model_id, config_loader)
 
+    # 0. CAPABILITY -- can this model physically run on this box at all?
+    #
+    # FIRST, deliberately. This used to sit after the architecture routing
+    # below, which returns early: `if rewrites_wired and
+    # _is_qwen3_next_arch(cfg): return True, None` fires before the gate is
+    # ever consulted, so EVERY hybrid linear-attention model bypassed it.
+    # Qwen3.5-122B-A10B went straight to a baseline it could not physically
+    # load and crashed 32 ranks, while the gate had the right answer ready
+    # (HOST_LIMITED: 8006 GB of host DRAM needed against 2147) and was never
+    # asked. DeepSeek-V4-Flash, not a linear-attention arch, fell through to
+    # the gate on the same run and was correctly skipped in 10 seconds.
+    #
+    # The two questions are independent: a rewrite bundle or a kernel makes a
+    # model SUPPORTED, it does not make a 250 GB model FIT. Feasibility is
+    # also the cheaper question, so it belongs first.
+    #
+    # Fails OPEN by construction: capability.assess returns UNKNOWN/ok for a
+    # config it cannot size, so an unfamiliar arch is never blocked here.
+    if hardware is not None and cfg:
+        try:
+            from capability import assess as _assess  # local: keeps preflight import-light
+            verdict = _assess(cfg, hardware, weight_gb=weight_gb)
+            if not verdict.ok:
+                return False, f"capability: {verdict.reason}"
+        except Exception:  # noqa: BLE001 - a broken gate must never block a run
+            pass
+
     # 1. Static detection — fires on the FIRST encounter, from config alone.
     if is_linear_attention_arch(cfg):
         # Graph-rewrite path: qwen3-next is handled by the wired rewrite bundle
@@ -354,25 +381,9 @@ def preflight_check(
             return True, None
         return False, (need.reason if need else LINEAR_ATTN_REASON)
 
-    # 1b. Capability gate — can this model physically run on this box?
-    #
-    # Runs on the config only (no weights, no compile), so a model that cannot
-    # fit is rejected in milliseconds instead of after a multi-GB download and a
-    # device OOM. This is the check that would have caught Qwen3.5-35B-A3B: the
-    # backend's dense parameter formula sized that 256-expert MoE at 7.4 GB when
-    # it is ~72 GB, chose tp=1, and OOM'd. Pass `weight_gb` (summed from the HF
-    # repo's file metadata) when available — it beats any config estimate.
-    #
-    # Fails OPEN by construction: capability.assess returns UNKNOWN/ok for a
-    # config it cannot size, so an unfamiliar architecture is never blocked here.
-    if hardware is not None and cfg:
-        try:
-            from capability import assess as _assess  # local: keeps preflight import-light
-            verdict = _assess(cfg, hardware, weight_gb=weight_gb)
-            if not verdict.ok:
-                return False, f"capability: {verdict.reason}"
-        except Exception:  # noqa: BLE001 — a broken gate must never block a run
-            pass
+    # (The capability gate ran at step 0, above the architecture routing.
+    # It used to live here, where those early returns made it unreachable
+    # for every hybrid linear-attention model.)
 
     # 2. Bank consultation — a class that already failed the expensive way.
     if bank is not None and hasattr(bank, "preflight_antipatterns"):
