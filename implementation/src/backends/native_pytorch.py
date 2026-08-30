@@ -179,6 +179,43 @@ def prewarm_hf_cache(model_id: str, log=None) -> bool:
         return False
 
 
+def collective_env(tp: int) -> dict[str, str]:
+    """Runtime settings a multi-rank TP launch needs on Neuron.
+
+    None of this was being set, and it is the difference between a collective that
+    works and one that fails at execution. tp<=8 happened to survive without it;
+    tp=32 did not:
+
+        Qwen3-30B-A3B  tp=32  NRT EXECUTION FAILED: lazy::AllocBind: NRT_RESOURCE;
+                              no pending ops on stream to wait for (cannot defer),
+                              Failed to allocate resource
+        Qwen3.5-122B   tp=32  NRT EXECUTION FAILED: NRT model scheduling failed,
+                              Invalid NEFF, instruction, or input
+
+    Both models are tiny per rank (1.9 and 7.8 GB against a 14.4 GB budget), so this
+    was never about memory.
+
+    * ``TORCH_NEURONX_ENABLE_HOST_CC=1`` routes collectives through the HOST. Without
+      it the all-reduce tries the intra-node OFI/EFA device path, which cannot
+      initialise inside this container. The `aws-ofi-nccl initialization failed / is
+      EFA enabled?` warning that accompanies it is BENIGN and appears in working runs
+      too, which is exactly why the real cause is easy to miss.
+    * ``NEURON_RT_NUM_CORES`` tells the runtime how many cores this launch owns, so
+      rank placement matches ``--nproc_per_node`` instead of being inferred.
+    * ``TORCH_NEURONX_ENABLE_ASYNC_NRT=1`` is part of the same validated combination.
+
+    Single-rank runs get none of it: there is no collective to route, and narrowing
+    the visible core count would only constrain a run that does not need it.
+    """
+    if tp <= 1:
+        return {}
+    return {
+        "NEURON_RT_NUM_CORES": str(tp),
+        "TORCH_NEURONX_ENABLE_HOST_CC": "1",
+        "TORCH_NEURONX_ENABLE_ASYNC_NRT": "1",
+    }
+
+
 def tp_cap_for(archs: str, heads: int | None, linear_value_heads: int | None,
                core_count: int) -> int:
     """Largest TENSOR-PARALLEL degree this architecture can express.
@@ -614,7 +651,11 @@ class NativePyTorchBackend:
         ]
         env = {**os.environ,
                "HF_HUB_DISABLE_PROGRESS_BARS": "1",
-               "TOKENIZERS_PARALLELISM": "false"}
+               "TOKENIZERS_PARALLELISM": "false",
+               # Multi-rank collectives need host CC on this stack; see
+               # collective_env. An operator override in os.environ still wins.
+               **{k: v for k, v in collective_env(tp).items()
+                  if k not in os.environ}}
         # One Hub resolution here beats `tp` concurrent ones in the workers. Only
         # flip the workers offline once the cache is provably complete, so a cold
         # cache still downloads normally.
