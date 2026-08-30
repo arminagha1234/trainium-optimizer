@@ -40,12 +40,23 @@ from backends.base import (
 )
 from transformers import AutoConfig
 
+from backends.device_reap import reap as _reap
+
 _WORKER = Path(__file__).resolve().parent / "neuron_worker.py"
 # 30-min guardrail, enforced on the subprocess itself. Overridable because a
 # very large or dequantized checkpoint can spend longer than this just
 # loading: DeepSeek-V4-Flash (159.6 GB fp8 -> ~319 GB bf16) hit exactly this
 # wall with no compile error, which reads as a failure but is only a budget.
 _COMPILE_TIMEOUT_S = int(os.environ.get("TRN_OPT_COMPILE_TIMEOUT_S", "1800"))
+# Per-CANDIDATE wall. The baseline is allowed the full _COMPILE_TIMEOUT_S because
+# there is nothing to fall back to if it fails, but a single search candidate must
+# not be able to spend the whole run: one config burned 10800s and then, via
+# stranded ranks, took the ~20 candidates after it down with it. Defaults to a
+# quarter of the baseline budget, floored so a slow-but-real compile still fits.
+_CONFIG_TIMEOUT_S = int(os.environ.get(
+    "TRN_OPT_CONFIG_TIMEOUT_S", str(max(900, _COMPILE_TIMEOUT_S // 4))))
+# How long to wait for a killed worker's ranks to release the devices.
+_REAP_TIMEOUT_S = int(os.environ.get("TRN_OPT_REAP_TIMEOUT_S", "180"))
 
 
 def _shape_input_len(shape: str) -> int:
@@ -74,8 +85,21 @@ _RANK_PREFIX = re.compile(r"^\s*\[rank\d+\]:")
 # metric=0.0 into an actionable line without needing the full log.
 _ERR_SIGNATURES: tuple[tuple[str, str], ...] = (
     ("out of memory", "OOM: device ran out of HBM"),
-    ("HBM", "OOM / HBM pressure"),
+    # Device ACQUISITION failures, before the generic HBM match. A core held by an
+    # orphaned rank from a previous candidate is not memory pressure, and calling
+    # it OOM sends the next person to shrink the model instead of reaping the box.
+    ("NERR_RESOURCE", "device busy: cores held by another process "
+                      "(orphaned ranks from an earlier candidate?)"),
     ("nrt_tensor_allocate", "runtime allocation failed (cores held by another process?)"),
+    ("EXEC_BAD_INPUT", "runtime rejected the executable"),
+    ("Unable to acquire", "device busy: could not acquire a NeuronCore"),
+    ("failed to open device", "device busy: could not open a NeuronCore"),
+    ("REAP INCOMPLETE", "device busy: a previous candidate's ranks were never "
+                        "reaped, so this result is unreliable"),
+    ("out of range for device memory", "OOM: device ran out of HBM"),
+    # Generic, LAST among the memory patterns: matches any remaining mention of
+    # HBM once the env dump and the specific causes above are excluded.
+    ("HBM", "OOM / HBM pressure"),
     ("nrt_init", "Neuron runtime failed to initialise"),
     ("No module named", "missing Python dependency in the worker env"),
     ("KeyError: 'architectures'", "model config has no architectures field"),
@@ -150,9 +174,18 @@ def prewarm_hf_cache(model_id: str, log=None) -> bool:
 
 
 def _is_noise(line: str) -> bool:
-    """Separator banners and rule lines carry no diagnostic information."""
+    """Separator banners, rule lines and runtime env dumps carry no diagnosis.
+
+    ``nrt_infodump`` is the big one: on ANY runtime error the Neuron runtime dumps
+    its configuration, including lines like ``NEURON_RT_MAP_HBM=1``. A bare "HBM"
+    signature matches that, so a whole run's worth of device-acquisition failures
+    got labelled "OOM / HBM pressure" and pointed at memory, which was fine. The
+    dump is never the diagnosis, so it must never be eligible to be picked as one.
+    """
     t = line.strip()
     if not t:
+        return True
+    if "nrt_infodump" in t:
         return True
     # A line made only of separator punctuation ('====', '----', '****', ...).
     return len(set(t)) <= 2 and t[0] in "=-*_#~+ "
@@ -340,7 +373,29 @@ class NativePyTorchBackend:
         # such components, so this adds nothing for the LLM seeds.
         for comp in self._placeable_components():
             config[f"place:{comp}"] = self._DEFAULT_PLACEMENT.get(comp, "cpu")
+        # Remembered so measure() can tell the baseline from a search candidate and
+        # give them different compile budgets. Compared by value, not identity, so
+        # a copied/round-tripped config still matches.
+        self._baseline_config = dict(config)
         return Artifact(model_id=model_id, backend=self.name, config=config)
+
+    def _config_timeout_s(self, cfg: dict[str, Any]) -> int:
+        """Compile/run wall for THIS candidate.
+
+        The baseline gets the full budget because there is no fallback if it fails
+        -- losing it means the model is skipped entirely (FAIL_NO_BASELINE). A
+        search candidate gets a quarter of it: one candidate spending the whole run
+        is how ~20 later candidates were lost.
+
+        When the baseline config is unknown (no build_baseline in this process, e.g.
+        a resumed run) the generous budget is used. Mistakenly short-changing the
+        baseline costs the whole model; mistakenly being generous to one candidate
+        now only costs that candidate, because it gets reaped either way.
+        """
+        base = getattr(self, "_baseline_config", None)
+        if base is None or dict(cfg) == base:
+            return _COMPILE_TIMEOUT_S
+        return min(_CONFIG_TIMEOUT_S, _COMPILE_TIMEOUT_S)
 
     # Known-safe default placement per separable component (see base.placement_axes
     # and the Wan 2.2 evidence): the scheduler's bf16 solver drifts on device
@@ -510,22 +565,40 @@ class NativePyTorchBackend:
         # identical -- which made bringing up a new/large model a guessing game.
         # Bounded tail only, so a chatty compiler cannot balloon memory.
         _err_tail = ""
+        # start_new_session so the worker gets its OWN process group. Without it,
+        # a timeout kills torchrun and leaves its rank children holding
+        # /dev/neuron*, which wedges every later candidate in the run -- and
+        # killpg would hit our own group. See backends/device_reap.py.
+        _budget = self._config_timeout_s(cfg)
+        _proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.PIPE, start_new_session=True)
         try:
-            _proc = subprocess.run(cmd, env=env, timeout=_COMPILE_TIMEOUT_S,
-                                   stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.PIPE, check=False)
-            _err_tail = (_proc.stderr or b"").decode("utf-8", "replace")[-_ERR_TAIL_CHARS:]
+            _, _err = _proc.communicate(timeout=_budget)
+            _err_tail = (_err or b"").decode("utf-8", "replace")[-_ERR_TAIL_CHARS:]
             _rc = _proc.returncode
         except subprocess.TimeoutExpired:
-            # Compile/run blew past the 30-min wall. Record it as a compile that
-            # hit the ceiling (compile_seconds = the timeout) rather than a
-            # silent 0.0, so the ledger shows WHY this candidate was discarded.
+            # Compile/run blew past the wall. Record it as a compile that hit the
+            # ceiling (compile_seconds = the budget) rather than a silent 0.0, so
+            # the ledger shows WHY this candidate was discarded -- and reap the
+            # rank processes, because a timed-out candidate that keeps the cores
+            # turns one dead end into a dead run.
+            _note = _reap(_proc, log=None, timeout_s=_REAP_TIMEOUT_S)
             return Measurements(metric=0.0, shape=shape, batch=batch,
                                 hbm_peak_gb=999, hbm_available_gb=48,
-                                compile_seconds=float(_COMPILE_TIMEOUT_S),
+                                compile_seconds=float(_budget),
                                 failure_reason=(
-                                    f"timeout: exceeded the {_COMPILE_TIMEOUT_S}s "
-                                    f"compile/run wall"))
+                                    f"timeout: exceeded the {_budget}s "
+                                    f"compile/run wall; {_note}"))
+
+        # A crashed or signalled torchrun can strand ranks too, not only a timed-out
+        # one. Reap before the next candidate is launched, and record it when the box
+        # was NOT left clean -- every later candidate is then suspect, which has to be
+        # visible in the ledger rather than inferred afterwards.
+        _reap_note = ""
+        if _rc != 0:
+            _n = _reap(None, log=None, timeout_s=_REAP_TIMEOUT_S)
+            if _n.startswith("REAP INCOMPLETE"):
+                _reap_note = f" [{_n}]"
 
         if not out_f.exists():
             # Worker never wrote its JSON: it died before reporting. This is the
@@ -536,6 +609,7 @@ class NativePyTorchBackend:
             _child = _child_traceback(_rank_log_dir)
             if _child:
                 reason = _worker_failure_reason(_rc, _child)
+            reason += _reap_note
             print(f"[measure] worker produced no result (rc={_rc}): {reason}",
                   file=sys.stderr, flush=True)
             return Measurements(metric=0.0, shape=shape, batch=batch,
@@ -544,6 +618,7 @@ class NativePyTorchBackend:
         out_f.unlink(missing_ok=True)
         if not data.get("ok"):
             reason = str(data.get("error") or "").strip() or _worker_failure_reason(_rc, _err_tail)
+            reason += _reap_note
             print(f"[measure] worker reported not-ok: {reason}", file=sys.stderr, flush=True)
             return Measurements(metric=0.0, shape=shape, batch=batch,
                                 failure_reason=reason)
