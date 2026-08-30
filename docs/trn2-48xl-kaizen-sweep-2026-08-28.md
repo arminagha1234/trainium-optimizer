@@ -396,3 +396,44 @@ runtime.
 Worth noting what worked correctly here: the 122B claimed 6 tok/s, the trusted grader
 re-measured it, the re-measure failed, and the result was marked `unverified` and **not
 published**. A claimed number that cannot be reproduced never reaches the board.
+
+## Qwen3-30B-A3B fails at baseline with NRT_RESOURCE, on both load paths
+
+Qwen3-30B-A3B has now failed to establish a baseline five times -- `mid3`, `sorval`,
+`sorval2`, `moe30` -- with the same error, and the last two ran with shard-on-read ON:
+
+```
+[measure] worker produced no result (rc=1): [rank0]: NRT EXECUTION FAILED:
+lazy::AllocBind: NRT_RESOURCE; no pending ops on stream to wait for (cannot defer),
+Failed to allocate resource
+-> CRASHED: FAIL_NO_BASELINE (metric=0.0)
+```
+
+What this rules out, and why it matters for where to spend effort:
+
+* **Not a loading problem.** shard-on-read streams each rank's expert slice off disk
+  and never materialises the full model, so if the failure were host-DRAM at load, it
+  would have changed. It did not -- byte-identical error with the flag on and off. The
+  crash is `AllocBind` during graph *execution*, after the weights are in place.
+
+* **Not the host-DRAM ceiling.** `AllocBind ... Failed to allocate resource` with
+  "no pending ops on stream to wait for (cannot defer)" is the Neuron runtime unable to
+  allocate a *device* resource during execution setup, having found nothing to evict.
+  This is HBM or a runtime object (DMA rings, etc.), not the 2 TB host wall the 235B
+  hit.
+
+* **The weight arithmetic says it should fit.** `_fit_baseline_tp` picks the smallest
+  tp with `weight_gb/tp < 10`; for 30B-A3B (~60 GB bf16) that is tp=8 -> 7.5 GB/rank,
+  and at tp=8 the worker shards both experts (EP) and attention (TP). 7.5 GB of weights
+  on a 24 GB core should leave ample room, so the resource being exhausted is not
+  simply the weights -- it points at activation/scratch for the 128-expert routing at
+  the baseline sequence length, or a per-rank runtime-object limit that the MoE graph
+  trips.
+
+So this is a distinct, undiagnosed blocker sitting *in front of* every large-MoE win on
+this box: the model cannot be scored because its baseline will not run, before any
+optimisation is attempted. It is separate from both the host-DRAM loading problem
+(which shard-on-read addresses) and the `NCC_IINAR001` compiler bug (#134, the
+GatedDeltaNet family). Worth its own investigation -- candidate next steps: capture
+`neuron-ls`/runtime resource state at the failure, try the baseline at tp=16 (halve
+per-rank pressure), and shorten the baseline sequence to isolate activation memory.
