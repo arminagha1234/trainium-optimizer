@@ -42,6 +42,7 @@ import time
 __all__ = [
     "WORKER_MARKERS",
     "kill_process_group",
+    "clear_survivors",
     "surviving_workers",
     "wait_until_clear",
     "reap",
@@ -174,3 +175,48 @@ def reap(
         if log:
             log(f"reap: unexpected error {e!r}")
         return f"reap error {e!r}"
+
+
+def clear_survivors(log=None, grace_s: float = _TERM_GRACE_S,
+                    timeout_s: float = _CLEAR_TIMEOUT_S,
+                    markers: tuple[str, ...] = WORKER_MARKERS,
+                    proc_root: str = "/proc", _kill=os.kill) -> str:
+    """Kill orphaned worker processes BY MARKER, when we hold no Popen handle.
+
+    ``reap(proc)`` can only signal a process group it has a handle to. But a rank
+    orphaned by a crashed torchrun is reparented to init, and a rank left alive by a
+    SUCCESSFUL run whose teardown SIGSEGV'd (see the native-pytorch notes) is not tied
+    to any handle either. Both wedge the NEXT launch -- the crashed case fails to
+    acquire a core (NRT_RESOURCE), and the successful case leaves a stale process group
+    so the next ``init_process_group`` fails ("collective/TP initialisation failed",
+    the Qwen3.5-122B re-measure). So find survivors by cmdline and SIGTERM->SIGKILL
+    them directly.
+
+    Safe by construction: ``surviving_workers`` matches only neuron_worker/torchrun
+    cmdlines and excludes this process, so this never signals the optimizer itself.
+    A no-op (and cheap) when the box is already clean -- which is the common case,
+    including the very first baseline on a fresh pod.
+    """
+    victims = surviving_workers(markers, proc_root)
+    if not victims:
+        return "clear: no survivors"
+    for pid in victims:
+        try:
+            _kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+    deadline = time.time() + grace_s
+    while time.time() < deadline and surviving_workers(markers, proc_root):
+        time.sleep(_POLL_S)
+    for pid in surviving_workers(markers, proc_root):
+        try:
+            _kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+    clear = wait_until_clear(timeout_s=timeout_s, log=log, markers=markers,
+                             proc_root=proc_root)
+    left = surviving_workers(markers, proc_root)
+    if clear or not left:
+        return f"clear: reaped {len(victims)} orphan(s), devices released"
+    return (f"CLEAR INCOMPLETE: {len(left)} orphan(s) still hold the devices; "
+            f"the next launch is unreliable")
