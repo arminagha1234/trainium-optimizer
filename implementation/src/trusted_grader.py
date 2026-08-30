@@ -57,6 +57,19 @@ def verify_winner(backend, spec, winner, baseline_tokens, log,
         remeasured = float(m.metric)
         drift = abs(remeasured - claimed) / claimed if claimed > 0 else 1.0
         reproduced = (remeasured > 0.0) and (drift <= REPRO_TOL)
+        # WHY the re-measurement produced nothing. `measure` already knows -- it puts
+        # the classified cause in `failure_reason` -- and this function used to throw
+        # it away, logging a bare "remeasured=0" that is indistinguishable between a
+        # genuinely slow model, a wedged box, a missing cache file and a compiler
+        # crash. Two full trn2.48xlarge runs ended in guesswork because of it: the
+        # 35B completed every stage, reported 368 tok/s of box throughput, and then
+        # failed grading with `remeasured=0` seventeen seconds after Stage 6 -- far
+        # too fast to have measured a 72 GB model at all, which the reason would have
+        # said outright.
+        why = str(getattr(m, "failure_reason", "") or "").strip()
+        if remeasured <= 0.0 and not why:
+            why = ("re-measurement returned 0 with no failure_reason -- the backend "
+                   "reported neither a metric nor a cause")
 
         eq_ok = True
         toks = list(getattr(m, "top1_tokens", []) or [])
@@ -88,19 +101,24 @@ def verify_winner(backend, spec, winner, baseline_tokens, log,
             + (f"({task_metric}={task_score:.4f})" if task_metric else ""))
         log(f"[{name}] trusted grader: {verdict} "
             f"(claimed={claimed:,.0f} remeasured={remeasured:,.0f} "
-            f"drift={drift:.1%} equivalence={'ok' if eq_ok else 'FAIL'}{task_note})")
+            f"drift={drift:.1%} equivalence={'ok' if eq_ok else 'FAIL'}{task_note})"
+            + (f" -- re-measure failed: {why}" if remeasured <= 0.0 and why else ""))
         return {
             "verdict": verdict,
             "reproduced": reproduced,
             "remeasured_tok_s": remeasured,
             "drift_pct": drift * 100.0,
             "equivalence_ok": eq_ok,
+            # Carried so an `unverified` row explains ITSELF. A verdict without a
+            # cause is a dead end for whoever reads it next.
+            "remeasure_failure": why if remeasured <= 0.0 else "",
             "task_ok": task_ok,
             "task_score": task_score,
             "task_metric": task_metric,
         }
     except Exception as e:  # noqa: BLE001 — verification must never end a run
-        log(f"trusted grader failed (non-fatal): {e}")
+        log(f"trusted grader failed (non-fatal): {e!r}")
         return {"verdict": "ungraded", "reproduced": False,
                 "remeasured_tok_s": 0.0, "drift_pct": 0.0, "equivalence_ok": False,
-                "task_ok": False, "task_score": 0.0, "task_metric": ""}
+                "task_ok": False, "task_score": 0.0, "task_metric": "",
+                "remeasure_failure": f"grader raised: {e!r}"}
