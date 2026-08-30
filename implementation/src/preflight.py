@@ -385,14 +385,55 @@ def preflight_check(
     # It used to live here, where those early returns made it unreachable
     # for every hybrid linear-attention model.)
 
-    # 2. Bank consultation — a class that already failed the expensive way.
+    # 2. Bank consultation — a class that already failed the EXPENSIVE way.
+    #
+    # "Expensive" is load-bearing. The bank exists so a compile abort or a device
+    # OOM is not rediscovered at full price. A capability verdict is the opposite:
+    # it is a config-only computation that costs milliseconds and depends on
+    # MUTABLE inputs -- the hardware profile, the measured size, the tp the runner
+    # picks, the loader concurrency, and what the framework can shard today. Caching
+    # it is all downside.
+    #
+    # It also actively misleads. DeepSeek-V4-Flash was correctly skipped as
+    # HOST_LIMITED, which banked an anti-pattern. Staggered loading then made it
+    # loadable, the fresh gate said RUNNABLE -- and the run was skipped anyway,
+    # replaying the stale reason verbatim ("64 full copies, one per rank...") long
+    # after that stopped being what the loader does. The compounding bank had
+    # compounded a false memory, and it would have kept doing so for every model
+    # whose limitation we subsequently fixed.
+    #
+    # So capability-derived anti-patterns are ignored here and re-derived at step 0
+    # instead. Matched on the reason prefix as well as the tag, because entries
+    # already banked by earlier runs carry no tag and are shared with other agents,
+    # so they cannot be rewritten or purged from here.
     if bank is not None and hasattr(bank, "preflight_antipatterns"):
         sig = arch_signature(spec, cfg)
         for ap in bank.preflight_antipatterns(spec.family, sdk_version):
-            if _lesson_matches(ap, sig, spec.model_id):
-                return False, ap.reason or f"previously failed the expensive way ({ap.lesson_id})"
+            if not _lesson_matches(ap, sig, spec.model_id):
+                continue
+            if _is_capability_lesson(ap):
+                continue          # step 0 already answered this, with fresh inputs
+            return False, ap.reason or f"previously failed the expensive way ({ap.lesson_id})"
 
     return True, None
+
+
+# Prefix that capability-gate skips carry in their reason (see step 0).
+_CAPABILITY_PREFIX = "capability:"
+
+
+def _is_capability_lesson(lesson: Any) -> bool:
+    """True for an anti-pattern that merely records a capability verdict.
+
+    Those are re-derived for free at step 0 against current inputs, so replaying a
+    stored one can only be stale. Tagged entries are authoritative; the reason
+    prefix covers everything banked before the tag existed.
+    """
+    m = getattr(lesson, "matcher", {}) or {}
+    if isinstance(m, dict) and m.get("source") == "capability":
+        return True
+    return str(getattr(lesson, "reason", "") or "").lstrip().startswith(
+        _CAPABILITY_PREFIX)
 
 
 def make_anti_pattern_lesson(
@@ -422,7 +463,13 @@ def make_anti_pattern_lesson(
         migration_risk="high",
         origin=Origin.NONE,
         tier=Tier.PROVISIONAL,
-        matcher={"arch_signature": sig, "model_id": spec.model_id},
+        # `source` lets a later run tell a cheap, re-derivable capability verdict
+        # apart from a genuine expensive failure. Not a config axis, so it cannot
+        # affect bank.prune's matching.
+        matcher={"arch_signature": sig, "model_id": spec.model_id,
+                 **({"source": "capability"}
+                    if str(reason or "").lstrip().startswith(_CAPABILITY_PREFIX)
+                    else {})},
         reason=reason,
         confidence=Confidence(n_models_validated=1, human_verified=False),
         last_reverified_sdk=sdk_version,
