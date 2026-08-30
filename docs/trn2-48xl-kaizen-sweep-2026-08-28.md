@@ -437,3 +437,48 @@ optimisation is attempted. It is separate from both the host-DRAM loading proble
 GatedDeltaNet family). Worth its own investigation -- candidate next steps: capture
 `neuron-ls`/runtime resource state at the failure, try the baseline at tp=16 (halve
 per-rank pressure), and shorten the baseline sequence to isolate activation memory.
+
+## 235B: shard-on-read solved the LOAD, and exposed a second host-DRAM wall at COMPILE
+
+Ran Qwen3-235B-A22B with `TRN_OPT_SHARD_ON_READ=1` (band `huge4`). The result is the
+clearest evidence yet for shard-on-read, and it uncovered the next distinct blocker.
+
+**Shard-on-read works, measured.** After the 470 GB checkpoint finished loading, host
+DRAM sat at **1,586 GB free of 2,147**. The full-load path (`huge2`, `huge3`) fell to
+**6-14 GB free** at the same phase and was OOM-killed. So the model loaded on one node
+without ever materialising the full weights per rank -- exactly the design, on the
+biggest model in the plan, on real hardware.
+
+**Then it OOM-killed during the baseline COMPILE.** Watched live, host DRAM fell
+steadily once the first forward began:
+
+```
+15:54  1586 GB free   (load complete -- shard-on-read holding)
+17:36   393 GB free
+17:40   222 GB free
+17:41   190 GB free    (exec on the pod starts hanging -- memory pressure)
+18:01   FAILED
+```
+
+The cause is not loading and not HBM: it is **64 parallel `neuronx-cc` processes** --
+one per rank at tp=64 -- each compiling a slice of a 235B / 128-expert graph, each
+consuming multiple GB of HOST RAM at once. `load_stagger` bounds the load window but
+not the compile, and the compile cannot be staggered the same way: the first forward is
+a tensor-parallel collective, so holding ranks back to serialise their compiles would
+deadlock the all-reduce.
+
+So there are now three separable walls in front of the large models, and this session
+moved the first:
+
+1. **Load host-DRAM** -- SOLVED by shard-on-read (proven above).
+2. **Compile host-DRAM** -- NEW. 64 concurrent `neuronx-cc` on a huge graph. Candidate
+   fixes: cap per-process compiler host-RAM via `NEURON_CC_FLAGS`; a shared on-FSX
+   compile cache so re-compiles are free (does not help the first simultaneous 64,
+   though); or a smaller baseline (fewer layers compiled at once) to get a first
+   verified number, then scale.
+3. **Baseline-forward HBM / NRT_RESOURCE** -- the mid-size MoE wall (30B, Kimi-Linear).
+
+Worth stating plainly: shard-on-read did its job. 235B is the first time the full model
+ever loaded on a single 48xl. The compile wall is a different problem, and it is the one
+to solve next for the very largest models -- while the mid-size MoEs are gated on wall 3
+instead.
