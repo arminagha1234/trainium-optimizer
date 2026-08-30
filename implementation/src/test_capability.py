@@ -132,8 +132,12 @@ def test_measured_size_overrides_a_wrong_estimate():
 def test_tp_cap_matches_the_adapter_limits():
     # Qwen3_5 is bounded by the head count, matching native_pytorch after #121.
     # A stale cap of 4 here would make the gate reject models the runner runs.
+    #
+    # 24 heads now yields 24, not 8: the search considers every divisor of the head
+    # count (#140), so a power-of-two answer here would UNDER-predict the runner and
+    # reject models that fit. 24 is the widest sharding this model can express.
     assert max_clean_tp(_dense(heads=24, arch="Qwen3_5ForConditionalGeneration"),
-                        TRN2_48XLARGE) == 8      # 24 heads: 8 divides, 16 does not
+                        TRN2_48XLARGE) == 24
     assert max_clean_tp(_dense(heads=32, arch="Gemma4ForCausalLM"),
                         TRN2_48XLARGE) == 4
     # uncapped arch may shard as wide as heads and cores allow
@@ -142,8 +146,19 @@ def test_tp_cap_matches_the_adapter_limits():
 
 
 def test_tp_must_divide_head_count():
-    assert max_clean_tp(_dense(heads=6, arch="LlamaForCausalLM"),
-                        TRN2_48XLARGE) == 2
+    """The invariant, asserted as a property rather than as one number.
+
+    This used to assert 2 for a 6-head model, which was really asserting "powers of
+    two only" -- 6 shards 6 heads perfectly well. What must never happen is a tp that
+    does NOT divide the head count, because the worker rejects it and the run is
+    wasted, so check that across a range of awkward head counts.
+    """
+    for heads in (6, 10, 12, 14, 18, 20, 22, 24, 40, 48):
+        tp = max_clean_tp(_dense(heads=heads, arch="LlamaForCausalLM"),
+                          TRN2_48XLARGE)
+        assert heads % tp == 0, (heads, tp)
+        assert tp <= TRN2_48XLARGE.cores
+        assert tp == heads, (heads, tp)   # widest divisor within the core count
 
 
 def test_tp_never_exceeds_physical_cores():
@@ -481,3 +496,48 @@ def test_the_rejection_reason_names_the_loader_that_was_modelled(monkeypatch):
     assert v.status == "HOST_LIMITED"
     assert "TRN_OPT_LOAD_CONCURRENCY=1" in v.reason
     assert v.details["load_concurrency"] == 1
+
+
+# --- the gate must predict the tp the runner will actually use -----------------
+#
+# #140 made the search consider every divisor of the head count. While max_clean_tp
+# still tried only powers of two it UNDER-predicted the runner and started rejecting
+# models that fit -- the same class of bug as the original over-prediction, inverted.
+
+def test_max_clean_tp_uses_every_divisor_not_just_powers_of_two():
+    cfg = _moe(h=3072, L=62, moe_inter=1536, experts=256, heads=48,
+               arch="MiniMaxM2ForCausalLM")
+    assert max_clean_tp(cfg, TRN2_48XLARGE) == 48       # was 16
+
+
+def test_a_24_head_model_reaches_24_not_8():
+    cfg = _dense(h=3072, L=64, heads=24, arch="Qwen3_5ForConditionalGeneration")
+    assert max_clean_tp(cfg, TRN2_48XLARGE) == 24       # was 8
+
+
+def test_minimax_m2_is_runnable_once_tp_is_predicted_correctly():
+    """460 GB over 48 ranks is 9.6 GB/rank; over 16 it was 28.8 and rejected."""
+    cfg = _moe(h=3072, L=62, moe_inter=1536, experts=256, heads=48,
+               arch="MiniMaxM2ForCausalLM")
+    v = assess(cfg, TRN2_48XLARGE, weight_gb=460.2, load_concurrency=1)
+    assert v.chosen_tp == 48
+    assert v.gb_per_rank < v.budget_gb_per_rank, v.reason
+
+
+def test_deltanet_value_heads_bound_the_predicted_tp():
+    """Value heads cannot be replicated, so they are a hard ceiling on tp."""
+    cfg = _moe(h=2048, L=40, moe_inter=512, experts=256, heads=64)
+    cfg["text_config"]["linear_num_value_heads"] = 8
+    assert max_clean_tp(cfg, TRN2_48XLARGE) == 8
+
+
+def test_powers_of_two_models_are_unchanged():
+    """The common case must not move."""
+    for heads, expect in ((16, 16), (32, 32), (64, 64), (8, 8)):
+        cfg = _dense(h=4096, L=32, heads=heads)
+        assert max_clean_tp(cfg, TRN2_48XLARGE) == expect, heads
+
+
+def test_the_gemma4_hard_cap_still_binds():
+    cfg = _dense(h=4096, L=48, heads=32, arch="Gemma4ForConditionalGeneration")
+    assert max_clean_tp(cfg, TRN2_48XLARGE) == 4

@@ -339,8 +339,22 @@ def ceiling(
 def max_clean_tp(config: dict[str, Any], hw: HardwareProfile) -> int:
     """Largest TP this backend will actually use for the model.
 
-    Bounded by the adapter caps, the head count (TP must divide the query heads)
-    and the physical core count.
+    Bounded by the adapter caps, the head count (TP must divide the query heads),
+    the GatedDeltaNet value-head count where present, and the physical core count.
+
+    Considers EVERY divisor of the head count, not just powers of two, in lockstep
+    with `native_pytorch.tp_candidates` (#140). While this still tried only powers of
+    two it UNDER-predicted what the runner would do, and the gate then rejected models
+    that fit:
+
+        MiniMax-M2   48 heads, 460 GB   powers of two -> tp=16 -> 28.8 GB/rank REJECTED
+                                        divisors      -> tp=48 ->  9.6 GB/rank fits
+        Qwen3.8-27B  24 heads           powers of two -> tp=8
+                                        divisors      -> tp=24
+
+    A gate that models a smaller tp than the runner picks turns into a gate that
+    blocks runnable models, which is the failure this module exists to avoid -- just
+    in the opposite direction from the original bug.
     """
     tc = _text_config(config)
     archs = " ".join(architectures(config))
@@ -351,9 +365,17 @@ def max_clean_tp(config: dict[str, Any], hw: HardwareProfile) -> int:
             # None -> bounded only by the head count (and cores).
             cap = min(cap, capped if capped is not None else heads)
             break
+    # GatedDeltaNet value heads cannot be replicated the way KV heads can: out_proj
+    # is row-sharded with an all-reduce, so a shared value head would be counted
+    # twice (see qwen38_tp.shard_deltanet). This is a hard arithmetic bound.
+    lvh = _int(tc, "linear_num_value_heads", 0)
+    if lvh:
+        cap = min(cap, lvh)
+    if not heads:
+        return 1
     best = 1
-    for tp in (1, 2, 4, 8, 16, 32, 64):
-        if tp <= cap and heads and heads % tp == 0:
+    for tp in range(1, min(cap, heads) + 1):
+        if heads % tp == 0:
             best = tp
     return best
 
