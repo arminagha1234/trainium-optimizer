@@ -263,3 +263,29 @@ def test_the_candidate_budget_never_exceeds_the_baseline_budget():
     candidate = dict(art.config)
     candidate["batch"] = 32
     assert b._config_timeout_s(candidate) <= npt._COMPILE_TIMEOUT_S
+
+
+# --- compiler bugs are not model bugs ----------------------------------------
+
+def test_a_compiler_internal_error_is_labelled_as_one():
+    """Verbatim from the Qwen3.5-35B-A3B run (compile_mode=compile-default).
+
+    "unsupported op" means rewrite the graph; INTERNAL_ERROR means the compiler
+    crashed on a graph it should accept. Conflating them sends the search off
+    probing configs around a bug that no config can avoid.
+    """
+    tail = ("[rank2]: error message=\"COMPILATION FAILED: Command failed "
+            "(neuronx-cc compilation) with exit code 70: "
+            "Qwen3_5MoeGatedDeltaNet[linear_attn][0]_select.326 [INTERNAL_ERROR] "
+            "[NCC_IBCG901] BIRCodeGenLoop assertion err")
+    reason = _worker_failure_reason(1, tail)
+    assert "INTERNAL ERROR" in reason
+    assert "escalate" in reason
+
+
+def test_an_unsupported_op_is_still_reported_as_unsupported():
+    """The distinction has to cut both ways."""
+    tail = "[rank0]: NCC_EVRF029: Operation sort is not supported on trn2"
+    reason = _worker_failure_reason(1, tail)
+    assert "unsupported" in reason.lower()
+    assert "INTERNAL ERROR" not in reason
