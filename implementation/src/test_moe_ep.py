@@ -278,3 +278,40 @@ def test_ep_degree_none_or_world_is_the_coupled_default():
                 assert torch.equal(base.gate_up_proj, dec.gate_up_proj), (world, r, ep)
                 assert (base.lo, base.hi) == (dec.lo, dec.hi)
                 assert dec.ep_group is None
+
+
+def test_expert_forward_has_no_data_dependent_shapes():
+    """The Neuron invariant: the expert forward must not gather by nonzero()/where().
+
+    Those produce data-dependent shapes, which the Neuron compiler (dynamic=False)
+    rejects -- so a regression to the gather-routed-tokens form would recompile/stall
+    per token distribution on device even though it passes the numeric tests on CPU.
+    Pin the static-shape form here so that regression is caught in CI, not on a box.
+    """
+    import inspect
+    from backends.moe_ep import ExpertParallelExperts
+    src = inspect.getsource(ExpertParallelExperts.forward)
+    assert ".nonzero(" not in src, "expert forward regressed to a nonzero() gather"
+    assert "torch.where(" not in src, "expert forward regressed to a where() gather"
+    assert "index_add_" not in src, "expert forward regressed to a scatter-add gather"
+
+
+def test_dense_forward_matches_a_hand_computed_case():
+    """A tiny explicit case, so equivalence is anchored to arithmetic, not only to
+    the reference module (which could share a bug)."""
+    torch.manual_seed(0)
+    ref = RefExperts(4, 8, 8).eval()
+    hs = torch.randn(3, 8)
+    # token 0 -> experts [0,1], token 1 -> [2,3], token 2 -> [1,2]
+    idx = torch.tensor([[0, 1], [2, 3], [1, 2]])
+    w = torch.tensor([[0.6, 0.4], [0.7, 0.3], [0.5, 0.5]])
+    got = ExpertParallelExperts(ref, 0, 1)(hs, idx, w)   # world=1: all experts local
+    # hand form: sum_j w[t,j] * expert_{idx[t,j]}(hs[t])
+    def expert(e, x):
+        g, u = F.linear(x, ref.gate_up_proj[e]).chunk(2, dim=-1)
+        return F.linear(ref.act_fn(g) * u, ref.down_proj[e])
+    want = torch.zeros_like(hs)
+    for t in range(3):
+        for j in range(2):
+            want[t] += w[t, j] * expert(int(idx[t, j]), hs[t:t+1])[0]
+    assert torch.allclose(got, want, atol=1e-6), (got - want).abs().max()

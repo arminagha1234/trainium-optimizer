@@ -126,32 +126,34 @@ class ExpertParallelExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
+        # STATIC-SHAPE dense expert forward. Every token runs through every LOCAL
+        # expert; each expert's output is weighted by that token's router affinity
+        # for it (0 when the token was not routed to it) and summed. A non-routed
+        # token contributes exactly 0, so this equals the top-k mixture -- proven
+        # bit-for-bit vs the reference in test_moe_ep.py.
+        #
+        # Why not the obvious gather-routed-tokens form: that uses nonzero()/where()
+        # to select each expert's tokens, which are DATA-DEPENDENT shapes. The Neuron
+        # compiler runs with dynamic=False and rejects dynamic shapes, so the gather
+        # form recompiles/stalls per token distribution. This trades a few extra FLOPs
+        # (all tokens through all local experts) for a fully static graph -- the
+        # standard MoE-on-Neuron shape, matching NxD forward_all_experts_EP.
         final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        for expert_idx in expert_hit:
-            e = int(expert_idx[0])
-            if e == self.num_experts:
-                continue
-            if e < self.lo or e >= self.hi:
-                continue                        # owned by another rank
-            local = e - self.lo
-            top_k_pos, token_idx = torch.where(expert_mask[e])
-            current_state = hidden_states[token_idx]
-            gate, up = F.linear(current_state, self.gate_up_proj[local]).chunk(2, dim=-1)
+        num_local = self.hi - self.lo
+        for local in range(num_local):                 # STATIC: fixed local count
+            e = self.lo + local
+            gate, up = F.linear(hidden_states, self.gate_up_proj[local]).chunk(2, dim=-1)
             h = self.act_fn(gate) * up
             h = F.linear(h, self.down_proj[local])
-            h = h * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, h.to(final_hidden_states.dtype))
-        # Sum the per-rank partial sums. Every expert contributed on exactly one
-        # rank, so this reconstructs the full mixture.
+            # This token's weight for global expert e: sum of the router weights on
+            # whichever top-k slots selected e (0 if none did). No data-dependent
+            # indexing -- top_k_index/top_k_weights are [tokens, k], fixed shape.
+            aff = ((top_k_index == e) * top_k_weights).sum(dim=-1)
+            final_hidden_states = final_hidden_states + h * aff.unsqueeze(-1).to(h.dtype)
+        # Sum the per-rank partial sums over the EP subgroup. Every expert contributed
+        # on exactly one rank within the group, so this reconstructs the full mixture;
+        # group=None (EP=world) reduces over the whole world, the coupled default.
         if dist.is_initialized() and dist.get_world_size() > 1:
-            # Sum the mixture over the EP subgroup. group=None is the whole world,
-            # correct when EP=world; a smaller EP group sums only the ranks that
-            # together hold the full expert set, so replicas across other groups do
-            # not double-count.
             dist.all_reduce(final_hidden_states, group=getattr(self, "ep_group", None))
         return final_hidden_states
 
