@@ -203,32 +203,46 @@ def stream_shard(files, cfg: dict, rank: int, world: int, *, experts_only: bool 
             f"(rank {rank}/{world})")
 
 
-def load_ep_sharded(model_id, files, cfg, rank, world, *, dtype=None, log=None):
-    """Assemble an expert-parallel model WITHOUT materialising the full model.
+def load_ep_sharded(model_id, files, cfg, rank, world, *, dtype=None,
+                    attn_implementation=None, log=None):
+    """Assemble an expert-parallel model WITHOUT ever materialising it whole.
 
-    This is the wiring that turns the proven slice_for / stream_shard plan into a live
-    model. The steps, and why each is safe:
+    ``from_pretrained`` builds the full model in every rank before sharding, so the
+    host-DRAM peak is ``world x model_size`` -- the wall Qwen3-235B (470 GB) and the
+    MiniMax models hit at load. This builds the model on ``meta`` (zero memory), gives
+    each rank only its expert slice, and fills the rest replicated.
 
-    1. Instantiate on the ``meta`` device from config. ``from_config`` builds the
-       module tree with zero real memory. This is what makes the host-DRAM peak
-       ``resident shard + one file in flight`` instead of ``world x model``.
+    The sequence, and the trap each step avoids:
 
-    2. Replace each fused-expert module with a rank-local one. Experts are 96.9% of the
-       bytes for the models that OOM (122B, 235B, MiniMax) and are the ONLY thing
-       slice_for shards for them -- attention and the rest are replicated. So only the
-       expert modules change shape; everything else keeps its full (meta) shape and
-       receives a full replicated tensor that matches.
+    1. **Meta-instantiate from config.** CPU init would allocate the full model per rank
+       at construction -- OOM before a single weight is read -- so meta is mandatory,
+       not an optimisation.
 
-    3. Stream the checkpoint and fill parameters in place with
-       ``load_state_dict(assign=True)``: experts get their [lo:hi] slice (built off
-       disk), the rest get replicated full copies. ``assign=True`` swaps the meta
-       placeholders for real tensors rather than copying into them, so no full-width
-       buffer is ever allocated for a sharded parameter.
+    2. **(world>1) swap each fused-expert module for a rank-local one** sized to this
+       rank's ``[lo:hi]`` experts, holding weights read pre-sliced off disk. At world=1
+       nothing is sharded, so the experts load full into the original module and this
+       path is a pure meta-load -- which is what the forward-equivalence test checks.
 
-    Correctness is not asserted by inspection: test_shard_stream.py proves the assembled
-    per-rank parameters are bit-for-bit identical to the imperative shard_moe_experts
-    path, itself numerically validated in test_moe_ep.py. Any parameter left on meta
-    after loading is a missing rule and is raised, not silently shipped.
+    3. **``load_state_dict(assign=True)``** swaps meta placeholders for the streamed
+       tensors rather than copying into them, so no full-width buffer is allocated.
+
+    4. **``tie_weights()``.** ``assign=True`` replaces the embedding parameter object,
+       which breaks an lm_head that was tied to it; re-tying restores it (no-op when
+       the model does not tie).
+
+    5. **Re-materialise computed buffers left on meta** -- ``inv_freq`` and friends are
+       not in the checkpoint, so ``load_state_dict`` never fills them and they would
+       reach the forward as meta tensors and crash. They are recomputed by
+       re-instantiating the owning module on CPU, which reuses the module's OWN init
+       (version-agnostic -- the private rope API's key moved between versions).
+
+    6. **Refuse to return a model with ANY meta tensor left** -- parameter OR buffer.
+       A wrong loader does not crash, it benchmarks garbage, so an unfilled tensor is
+       raised here, loudly, rather than shipped.
+
+    Proven in test_shard_stream.py: per-rank parameters bit-for-bit vs the imperative
+    ``shard_moe_experts`` path (world 2/4/8), and world=1 forward logits equal to
+    ``from_pretrained``.
     """
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM
@@ -238,6 +252,12 @@ def load_ep_sharded(model_id, files, cfg, rank, world, *, dtype=None, log=None):
         from moe_ep import ExpertParallelExperts
 
     hf_cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    if attn_implementation is not None:
+        # match the full-load path's attention kernel choice
+        try:
+            hf_cfg._attn_implementation = attn_implementation
+        except Exception:  # noqa: BLE001
+            pass
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(hf_cfg, trust_remote_code=True)
     if dtype is not None:
@@ -251,39 +271,67 @@ def load_ep_sharded(model_id, files, cfg, rank, world, *, dtype=None, log=None):
 
     streamed = dict(stream_shard(files, cfg, rank, world,
                                  experts_only=True, log=log))
-    root = getattr(model, "model", model)
-    layers = getattr(root, "layers", None)
-    if layers is None:
-        lm = getattr(root, "language_model", None)
-        layers = getattr(lm, "layers", []) if lm is not None else []
+
     swapped = 0
-    for li, layer in enumerate(layers):
-        mlp = getattr(layer, "mlp", None)
-        experts = getattr(mlp, "experts", None) if mlp is not None else None
-        if experts is None or not hasattr(experts, "gate_up_proj") or not n_exp:
-            continue
-        prefix = None
-        for nm in streamed:
-            if nm.endswith("mlp.experts.gate_up_proj") and f".layers.{li}." in nm:
-                prefix = nm[: -len("gate_up_proj")]
-                break
-        if prefix is None:
-            continue
-        mlp.experts = ExpertParallelExperts.from_sliced(
-            num_experts=n_exp, rank=rank, world=world, act_fn=experts.act_fn,
-            gate_up_proj=streamed[prefix + "gate_up_proj"],
-            down_proj=streamed[prefix + "down_proj"])
-        swapped += 1
+    if world > 1 and n_exp:
+        root = getattr(model, "model", model)
+        layers = getattr(root, "layers", None)
+        if layers is None:
+            lm = getattr(root, "language_model", None)
+            layers = getattr(lm, "layers", []) if lm is not None else []
+        for li, layer in enumerate(layers):
+            mlp = getattr(layer, "mlp", None)
+            experts = getattr(mlp, "experts", None) if mlp is not None else None
+            if experts is None or not hasattr(experts, "gate_up_proj"):
+                continue
+            prefix = None
+            for nm in streamed:
+                if nm.endswith("mlp.experts.gate_up_proj") and f".layers.{li}." in nm:
+                    prefix = nm[: -len("gate_up_proj")]
+                    break
+            if prefix is None:
+                continue
+            mlp.experts = ExpertParallelExperts.from_sliced(
+                num_experts=n_exp, rank=rank, world=world, act_fn=experts.act_fn,
+                gate_up_proj=streamed[prefix + "gate_up_proj"],
+                down_proj=streamed[prefix + "down_proj"])
+            swapped += 1
+        # experts now live inside the swapped modules, not the load set
+        expert_names = {n for n in streamed if ".mlp.experts." in n}
+        load_sd = {n: t for n, t in streamed.items() if n not in expert_names}
+    else:
+        load_sd = streamed          # world==1: everything loads full, incl. experts
 
-    expert_names = {n for n in streamed if ".mlp.experts." in n}
-    load_sd = {n: t for n, t in streamed.items() if n not in expert_names}
     _missing, unexpected = model.load_state_dict(load_sd, strict=False, assign=True)
+    model.tie_weights()
 
-    still_meta = [n for n, pr in model.named_parameters() if pr.is_meta]
+    # 5. recompute non-checkpoint buffers still on meta (inv_freq, ...).
+    for _mn, mod in model.named_modules():
+        meta_bufs = [bn for bn, b in mod.named_buffers(recurse=False) if b.is_meta]
+        if not meta_bufs:
+            continue
+        rebuilt = None
+        if hasattr(mod, "config"):
+            try:
+                with torch.device("cpu"):
+                    rebuilt = type(mod)(mod.config)
+            except Exception:  # noqa: BLE001
+                rebuilt = None
+        for bn in meta_bufs:
+            src = getattr(rebuilt, bn, None) if rebuilt is not None else None
+            if src is None or src.is_meta:
+                raise RuntimeError(
+                    f"shard-on-read could not recompute buffer {_mn}.{bn}; "
+                    f"it would reach the forward as a meta tensor")
+            # assign into the buffer slot directly, preserving persistent-ness
+            mod._buffers[bn] = src.detach().clone()
+
+    still_meta = ([n for n, pr in model.named_parameters() if pr.is_meta]
+                  + [n for n, b in model.named_buffers() if b.is_meta])
     if still_meta:
         raise RuntimeError(
-            f"shard-on-read left {len(still_meta)} parameter(s) on meta, e.g. "
-            f"{still_meta[:5]} -- a shard rule is missing for them")
+            f"shard-on-read left {len(still_meta)} tensor(s) on meta, e.g. "
+            f"{still_meta[:5]} -- a shard rule or buffer recompute is missing")
     if log:
         log(f"shard-on-read assembled: {swapped} expert layer(s) rank-local, "
             f"{len(load_sd)} tensor(s) loaded, {len(unexpected)} unexpected")

@@ -336,3 +336,76 @@ def test_assembled_expert_weights_are_rank_local_not_full(tmp_path, world):
                 assert prm.shape[0] == per_rank, (name, prm.shape, per_rank)
     finally:
         transformers.AutoConfig.from_pretrained = orig
+
+
+def test_world_one_assembly_matches_from_pretrained_logits(tmp_path):
+    """The buffer/tying trap: assembling from meta must produce a RUNNABLE model.
+
+    The param-level tests never run a forward, so they cannot catch a meta ``inv_freq``
+    left unfilled (it is not in the checkpoint) or an lm_head un-tied by
+    ``assign=True``. At world=1 shard-on-read replicates everything, so its logits must
+    equal a plain ``from_pretrained`` load of the same checkpoint -- token for token.
+    If a computed buffer is wrong or missing, this fails with NaNs, a meta-tensor error,
+    or a logit mismatch, instead of a benchmark reporting a number for a broken model.
+    """
+    import transformers
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+        Qwen3_5MoeTextConfig,
+    )
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeForCausalLM,
+    )
+    from backends.shard_stream import load_ep_sharded
+
+    cfg = Qwen3_5MoeTextConfig(**CFG)
+    cfg._attn_implementation = "eager"
+    torch.manual_seed(0)
+    ref = Qwen3_5MoeForCausalLM(cfg).eval()
+
+    d = tmp_path / "ckpt"
+    d.mkdir()
+    files = _save_checkpoint(ref, d)
+    ids = torch.tensor([[3, 9, 27, 81, 243, 1, 5, 25]])
+    with torch.inference_mode():
+        want = ref(ids).logits
+
+    orig = transformers.AutoConfig.from_pretrained
+    transformers.AutoConfig.from_pretrained = staticmethod(lambda *a, **k: cfg)
+    try:
+        got_model = load_ep_sharded("tiny", files, CFG, 0, 1).eval()
+    finally:
+        transformers.AutoConfig.from_pretrained = orig
+
+    # no tensor may remain on meta -- load_ep_sharded raises otherwise, but assert the
+    # positive too so a future regression that silently leaves one is caught here.
+    assert not any(t.is_meta for _, t in got_model.named_parameters())
+    assert not any(t.is_meta for _, t in got_model.named_buffers())
+
+    with torch.inference_mode():
+        got = got_model(ids).logits
+    assert not torch.isnan(got).any(), "assembled model produced NaNs"
+    assert torch.allclose(got, want, atol=1e-4, rtol=1e-4), (
+        f"max abs diff {float((got - want).abs().max()):.2e}")
+
+
+def test_world_one_recomputes_inv_freq_not_leaves_it_meta(tmp_path):
+    """Pin the specific buffer that motivated the recompute step."""
+    import transformers
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+        Qwen3_5MoeTextConfig,
+    )
+    from backends.shard_stream import load_ep_sharded
+
+    cfg = Qwen3_5MoeTextConfig(**CFG)
+    cfg._attn_implementation = "eager"
+    base = _model()
+    files = _save_checkpoint(base, tmp_path)
+    orig = transformers.AutoConfig.from_pretrained
+    transformers.AutoConfig.from_pretrained = staticmethod(lambda *a, **k: cfg)
+    try:
+        m = load_ep_sharded("tiny", files, CFG, 0, 1)
+    finally:
+        transformers.AutoConfig.from_pretrained = orig
+    inv = dict(m.named_buffers())["model.rotary_emb.inv_freq"]
+    assert not inv.is_meta
+    assert torch.equal(inv, base.model.rotary_emb.inv_freq)

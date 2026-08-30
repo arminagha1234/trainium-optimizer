@@ -249,6 +249,23 @@ def _text_cfg(cfg):
     return c
 
 
+def _resolve_ckpt_files(model_id):
+    """Local .safetensors paths for shard-on-read, without a full download.
+
+    ``snapshot_download`` returns the cached snapshot dir when the files are present;
+    the sweep template verifies the cache and sets HF_HUB_OFFLINE=1 before the run, so
+    this is a cache lookup, not a fetch. Returns [] if nothing is found, which the
+    caller treats as "fall back to full load".
+    """
+    import glob
+    try:
+        from huggingface_hub import snapshot_download
+        d = snapshot_download(model_id, allow_patterns=["*.safetensors"])
+    except Exception:  # noqa: BLE001
+        return []
+    return sorted(glob.glob(os.path.join(d, "*.safetensors")))
+
+
 def _cfg_int(cfg, name, default=None):
     """getattr that tolerates heterogeneous-per-layer configs raising."""
     try:
@@ -391,9 +408,44 @@ def main() -> None:
         from load_stagger import acquire_load_slot, release_load_slot
     _load_slot = acquire_load_slot(dist.get_rank(), world, log=_log)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        a.model, dtype=dtype, attn_implementation=a.attn, trust_remote_code=True
-    )
+    # SHARD-ON-READ (opt-in, TRN_OPT_SHARD_ON_READ=1). from_pretrained materialises
+    # the whole model per rank before sharding, so the big MoE models OOM host DRAM at
+    # load. load_ep_sharded meta-instantiates and gives each rank only its expert slice
+    # (experts are 96.9% of the bytes that OOM). It is a PURE loading optimisation:
+    # experts come pre-sharded (so the expert-parallel step below is skipped), and
+    # attention/vocab are replicated exactly as from_pretrained leaves them, so the
+    # attention-TP and vocab-shard steps run unchanged. Any failure falls back to the
+    # proven full-load path -- shard-on-read must never be the reason a run dies.
+    _n_exp = _cfg_int(tcfg, "num_experts") or _cfg_int(tcfg, "n_routed_experts")
+    _shard_on_read = (os.environ.get("TRN_OPT_SHARD_ON_READ") == "1"
+                      and world > 1 and bool(_n_exp))
+    _ep_done_by_load = False
+    model = None
+    if _shard_on_read:
+        try:
+            try:
+                from backends.shard_stream import load_ep_sharded as _sor
+            except Exception:  # noqa: BLE001
+                from shard_stream import load_ep_sharded as _sor
+            files = _resolve_ckpt_files(a.model)
+            if not files:
+                raise RuntimeError("no local .safetensors found for shard-on-read")
+            tdict = {k: getattr(tcfg, k) for k in (
+                "num_experts", "n_routed_experts", "num_attention_heads",
+                "num_key_value_heads", "head_dim", "hidden_size")
+                if _cfg_int(tcfg, k)}
+            model = _sor(a.model, files, tdict, dist.get_rank(), world,
+                         dtype=dtype, attn_implementation=a.attn, log=_log)
+            _ep_done_by_load = True
+            _log(f"shard-on-read: loaded {a.model} without full materialisation "
+                 f"(rank {dist.get_rank()}/{world})")
+        except Exception as _se:  # noqa: BLE001
+            _log(f"shard-on-read failed ({_se!r}); falling back to full load")
+            model = None
+    if model is None:
+        model = AutoModelForCausalLM.from_pretrained(
+            a.model, dtype=dtype, attn_implementation=a.attn, trust_remote_code=True
+        )
     # Multimodal text-only: drop the vision tower so it doesn't eat HBM.
     mm = getattr(model, "model", model)
     for vattr in ("vision_tower", "embed_vision", "vision_model", "multi_modal_projector"):
@@ -417,7 +469,7 @@ def main() -> None:
     # these models. Exactness is established on CPU in test_moe_ep.py: each expert
     # contributes to exactly one additive term, so partitioning + all-reduce
     # reproduces the unsharded mixture.
-    if a.tp > 1:
+    if a.tp > 1 and not _ep_done_by_load:
         try:
             try:
                 from backends.moe_ep import shard_moe_experts as _ep_shard
