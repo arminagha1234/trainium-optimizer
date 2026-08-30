@@ -395,6 +395,25 @@ def dequant_factor(config: dict[str, Any], compute_dtype: str = "bf16") -> tuple
                     f"{factor:g}x the on-disk size)")
 
 
+def _env_load_concurrency(world: int) -> int | None:
+    """TRN_OPT_LOAD_CONCURRENCY as the runner will read it, or None if unset.
+
+    Imported from load_stagger so the gate and the loader can never disagree about
+    what the variable means -- a gate that models a different configuration than the
+    one that runs is worse than no gate. Falls back to None (no staggering) if that
+    module is unavailable, which keeps this module importable on its own.
+    """
+    try:
+        from backends.load_stagger import concurrency_from_env
+    except Exception:  # noqa: BLE001
+        try:
+            from load_stagger import concurrency_from_env  # type: ignore
+        except Exception:  # noqa: BLE001
+            return None
+    c = concurrency_from_env(world)
+    return None if c >= world else c
+
+
 def assess(
     config: dict[str, Any],
     hw: HardwareProfile = TRN2_48XLARGE,
@@ -402,6 +421,7 @@ def assess(
     dtype: str | None = None,
     node_count: int = 1,
     weight_gb: float | None = None,
+    load_concurrency: int | None = None,
 ) -> Verdict:
     """Decide whether ``config`` can run on ``hw`` before spending anything.
 
@@ -455,7 +475,12 @@ def assess(
                   budget_gb_per_rank=round(budget, 1),
                   min_tp_needed=min_tp, details=breakdown)
 
-    host_peak = host_load_peak_gb(weight_gb, ranks)
+    # Model the loader the run will ACTUALLY use. Without this the gate skips a
+    # model that staggering makes loadable -- the verdict has to track the
+    # configuration, not the default.
+    _conc = (load_concurrency if load_concurrency is not None
+             else _env_load_concurrency(ranks))
+    host_peak = host_load_peak_gb(weight_gb, ranks, concurrency=_conc)
     host_lean = host_load_peak_gb(weight_gb, ranks, lean_loader=True)
     host_stag = host_load_peak_gb(weight_gb, ranks, concurrency=2)
     host_stag1 = host_load_peak_gb(weight_gb, ranks, concurrency=1)
@@ -465,6 +490,7 @@ def assess(
     breakdown["host_peak_gb"] = round(host_peak, 1)
     breakdown["host_peak_lean_gb"] = round(host_lean, 1)
     breakdown["host_peak_stagger2_gb"] = round(host_stag, 1)
+    breakdown["load_concurrency"] = _conc
 
     if weight_gb > hw.total_hbm_gb * max(1, node_count):
         return Verdict(
@@ -480,9 +506,14 @@ def assess(
         return Verdict(
             False, "HOST_LIMITED",
             reason=(f"loading {weight_gb:.0f} GB on {ranks} ranks needs "
-                    f"{host_peak:.0f} GB of host DRAM ({ranks} full copies, one "
-                    f"per rank, because from_pretrained materialises the whole "
-                    f"model before sharding) but {hw.name} has "
+                    f"{host_peak:.0f} GB of host DRAM ("
+                    + (f"{ranks} full copies, one per rank, because "
+                       f"from_pretrained materialises the whole model before "
+                       f"sharding" if _conc is None else
+                       f"{_conc} full copies at a time under "
+                       f"TRN_OPT_LOAD_CONCURRENCY={_conc}, plus a shard on each "
+                       f"of the other {ranks - _conc} ranks")
+                    + f") but {hw.name} has "
                     f"{hw.host_ram_gb:.0f} GB -- this OOM-kills the pod during "
                     f"load, before any core is touched. A bigger tp makes it "
                     f"WORSE, not better"

@@ -422,3 +422,62 @@ def test_staggering_and_shard_on_read_agree_on_direction_not_magnitude():
     lean = host_load_peak_gb(319.2, 64, lean_loader=True)
     assert stag < TRN2_48XLARGE.host_ram_gb
     assert lean < stag
+
+
+# --- the gate must model the loader the run will actually use ------------------
+#
+# Without this the gate skips exactly the models staggering was built to rescue:
+# 122B and DeepSeek are HOST_LIMITED under the default loader, so preflight_check
+# would refuse them even with TRN_OPT_LOAD_CONCURRENCY=2 set on the run.
+
+def _big_moe():
+    return _moe(h=2048, L=40, moe_inter=512, experts=256, heads=32)
+
+
+def test_122b_is_rejected_under_the_default_loader():
+    v = assess(_big_moe(), TRN2_48XLARGE, weight_gb=250.2)
+    assert not v.ok and v.status == "HOST_LIMITED"
+    assert v.details["load_concurrency"] is None
+
+
+def test_122b_is_accepted_once_staggering_is_configured():
+    """734 GB of 2147 -- the run the gate must not block."""
+    v = assess(_big_moe(), TRN2_48XLARGE, weight_gb=250.2, load_concurrency=2)
+    assert v.ok, v.reason
+    assert v.details["host_peak_gb"] < TRN2_48XLARGE.host_ram_gb
+    assert v.details["load_concurrency"] == 2
+
+
+def test_deepseek_is_accepted_once_staggering_is_configured():
+    cfg = _moe(h=7168, L=61, moe_inter=2048, experts=256, heads=64)
+    cfg["quantization_config"] = {"quant_method": "fp8"}
+    v = assess(cfg, TRN2_48XLARGE, weight_gb=159.6, load_concurrency=2)
+    assert v.ok, v.reason
+
+
+def test_the_env_var_is_read_the_same_way_the_loader_reads_it(monkeypatch):
+    """Gate and loader must never disagree about what the variable means."""
+    monkeypatch.setenv("TRN_OPT_LOAD_CONCURRENCY", "2")
+    assert assess(_big_moe(), TRN2_48XLARGE, weight_gb=250.2).ok
+
+    # A typo means "no staggering" in load_stagger, so the gate must reject again
+    # rather than quietly assume a setting that will not be in effect.
+    monkeypatch.setenv("TRN_OPT_LOAD_CONCURRENCY", "two")
+    assert not assess(_big_moe(), TRN2_48XLARGE, weight_gb=250.2).ok
+
+
+def test_the_rejection_reason_names_the_loader_that_was_modelled(monkeypatch):
+    """1200 GB fits the box's HBM but cannot be loaded even one rank at a time.
+
+    At 64 ranks, concurrency=1 still peaks at 1200 + 63*(1200/64) = 2381 GB, because
+    the 63 ranks outside the load window are each holding their own shard. So the
+    verdict must say the model is unloadable HERE rather than suggest a setting that
+    is already in effect.
+    """
+    monkeypatch.setenv("TRN_OPT_LOAD_CONCURRENCY", "1")
+    v = assess(_moe(h=7168, L=92, moe_inter=2048, experts=256, heads=64),
+               TRN2_48XLARGE, weight_gb=1200.0)
+    assert not v.ok
+    assert v.status == "HOST_LIMITED"
+    assert "TRN_OPT_LOAD_CONCURRENCY=1" in v.reason
+    assert v.details["load_concurrency"] == 1
