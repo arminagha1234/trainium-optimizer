@@ -47,6 +47,7 @@ from preflight import (
     preflight_check,
 )
 from publish import publish
+from publish_deliverables import DEFAULT_DEPLOY_KEY
 from leaderboard_chart import build_leaderboard_chart
 from trajectory_chart import build_chart, build_highlights_chart
 
@@ -553,6 +554,76 @@ def _emit_lesson(bank, slug, spec, best, sdk_version, log,
         log(f"[{slug}] lesson emit failed (non-fatal): {e}")
 
 
+def _repo_root_from_here() -> Path:
+    """The repo this file lives in: .../implementation/src/overnight.py -> repo."""
+    return Path(__file__).resolve().parents[2]
+
+
+def _auto_publish(out_root: Path, a, log) -> dict:
+    """Refresh LEADERBOARD.md + optimized_models/ from this run's verified bundles.
+
+    Runs at the end of every cycle so the showcase cannot fall behind the runs. The
+    leaderboard stays derived, never hand-written: publish_deliverables reads the
+    recipe.json bundles and renders from them, so a row still cannot exist without
+    its folder.
+
+    Every quality gate is unchanged -- verified=="verified", speedup>1.0, and the
+    bundle present on disk. This changes WHEN publication happens, not WHAT
+    qualifies. A run that found nothing verified writes nothing and says so.
+
+    Two deliberate choices:
+
+    * Writing is automatic, PUSHING is not (``--publish-push``). Rewriting files in
+      a checkout is reviewable and reversible; pushing to the public showcase is
+      neither, and it needs a deploy key that only some hosts have.
+    * Failure here is logged but never fatal. The measurements are the expensive,
+      irreplaceable part of a run; a publication problem must not discard them.
+    """
+    try:
+        from publish_deliverables import check_consistency, publish as _pub
+    except Exception as e:  # noqa: BLE001
+        log(f"auto-publish unavailable ({e!r}) -- results are still in {out_root}")
+        return {"error": repr(e)}
+
+    repo_dir = Path(a.publish_repo_dir) if a.publish_repo_dir else _repo_root_from_here()
+    src_dir = out_root / "optimized_models"
+    if not src_dir.is_dir():
+        log(f"auto-publish: no bundles at {src_dir} -- nothing verified this cycle")
+        return {"noop": True}
+    try:
+        res = _pub(repo_dir=repo_dir, deploy_key=DEFAULT_DEPLOY_KEY,
+                   optimized_models_dir=src_dir, dry_run=not a.publish_push)
+    except Exception as e:  # noqa: BLE001 - never lose a run over publication
+        log(f"auto-publish FAILED (non-fatal, measurements are safe): {e!r}")
+        return {"error": repr(e)}
+
+    published = res.get("published") or []
+    if res.get("noop"):
+        log(f"auto-publish: nothing verified to publish ({res.get('reason', 'no wins')})")
+    else:
+        mode = "pushed" if res.get("pushed") else (
+            "committed" if res.get("committed") else "written (no push)")
+        log(f"auto-publish: {len(published)} verified result(s) {mode} -> "
+            f"{', '.join(published) or '(none)'}")
+    for rel, why in (res.get("skipped") or []):
+        log(f"auto-publish skipped {rel}: {why}")
+
+    # The anti-divergence guard, run automatically rather than left to a human or to
+    # CI that is not wired yet. A dead recipe link is worse than a missing row: it
+    # looks verified and cannot be audited.
+    try:
+        broken = check_consistency(repo_dir)
+        if broken:
+            log(f"auto-publish CONSISTENCY FAIL: {len(broken)} row(s) link to a "
+                f"missing bundle: {broken}")
+            res["consistency_broken"] = broken
+        else:
+            log("auto-publish consistency OK: every leaderboard row has a bundle")
+    except Exception as e:  # noqa: BLE001
+        log(f"auto-publish consistency check failed (non-fatal): {e!r}")
+    return res
+
+
 def write_leaderboard(results: list[ModelResult], out_root: Path, backend: str,
                       cycle: int | None = None) -> Path:
     """Per-cycle RUN SUMMARY — the morning artifact (ok / skipped / FAILED per
@@ -678,6 +749,16 @@ def main() -> None:
                          "without a DeltaNet kernel. Off by default.")
     ap.set_defaults(rewrites_wired=False)
     # --- bank hygiene: re-validate stale verified priors when the SDK changed ---
+    ap.add_argument("--no-publish", dest="publish", action="store_false",
+                    help="do not refresh LEADERBOARD.md / optimized_models after "
+                         "the cycle (publication is ON by default; the verified + "
+                         "speedup>1 gates apply either way)")
+    ap.add_argument("--publish-repo-dir", default=None,
+                    help="repo checkout to publish into. Default: the repo this "
+                         "file lives in, so a normal run updates the working tree.")
+    ap.add_argument("--publish-push", action="store_true",
+                    help="also commit and push. Off by default: writing the files "
+                         "is safe and reviewable, pushing is not.")
     ap.add_argument("--revalidate", action="store_true",
                     help="at STARTUP, re-validate verified config-priors whose "
                          "SDK stamp doesn't cover the live toolchain, before the "
@@ -798,6 +879,16 @@ def main() -> None:
                 log(f"leaderboard chart -> {board_img}")
             except Exception as e:  # noqa: BLE001
                 log(f"leaderboard chart failed (non-fatal): {e}")
+            # AUTOMATIC PUBLICATION. The showcase should reflect the newest
+            # verified results without anyone remembering to run a command --
+            # relying on that is how the leaderboard drifted behind the runs in the
+            # first place. Every gate stays where it was: publish_deliverables only
+            # accepts a recipe whose verified=="verified" AND speedup>1.0, and only
+            # if its bundle exists on disk, so "automatic" changes WHEN publication
+            # happens, never WHAT qualifies.
+            if a.publish:
+                _auto_publish(out_root, a, log)
+
             ok = sum(1 for r in results if r.ok)
             stats = bank.stats(current_sdk=a.sdk)
             log(f"=== cycle {cycle} done: {ok}/{len(results)} ok | "
