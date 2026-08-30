@@ -57,7 +57,9 @@ def gloo():
     assert r.returncode == 0, f"probe crashed unexpectedly:\n{r.stderr}"
 
 
-@pytest.mark.parametrize("tp,ep", [(4, 1), (2, 2), (1, 4)])
+# world=4: pure TP, pure EP, mixed. world=8: two genuinely mixed grids that
+# exercise a wider row/column and validate the sweep's valid_splits range.
+@pytest.mark.parametrize("tp,ep", [(4, 1), (2, 2), (1, 4), (4, 2), (2, 4)])
 def test_every_2d_split_matches_the_unsharded_model(tp, ep, gloo, tmp_path):
     out_path = str(tmp_path / f"logits_{tp}x{ep}.pt")
     r = subprocess.run(

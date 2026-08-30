@@ -375,14 +375,47 @@ def main() -> None:
     world = dist.get_world_size()
     dev = torch.device("neuron")
 
+    # ---- Orthogonal 2-D TP x EP mesh (opt-in via TRN_OPT_2D_MESH="tp,ep") -----
+    # Arrange the `world` ranks into an (ep, tp) grid with tp*ep==world: attention
+    # shards across the TP row (size tp), experts across the EP column (size ep),
+    # router replicated -- Design A, no rank does redundant work. Unset => the
+    # legacy coupled path (attention TP = world, Design-B EP). Proven equal to the
+    # unsharded model for every split on CPU in test_moe_2d_forward.py.
+    mesh_tp = mesh_ep = None
+    mesh_plan = mesh_tp_pg = mesh_ep_pg = None
+    _mesh2d = os.environ.get("TRN_OPT_2D_MESH", "").strip()
+    if _mesh2d:
+        try:
+            mesh_tp, mesh_ep = (int(x) for x in _mesh2d.split(","))
+        except Exception:  # noqa: BLE001
+            mesh_tp = mesh_ep = None
+        if not mesh_tp or not mesh_ep or mesh_tp * mesh_ep != world:
+            why = f"TRN_OPT_2D_MESH={_mesh2d!r} needs tp*ep==world={world}"
+            _log(f"INVALID_MESH: {why}")
+            dump({"ok": False, "error": f"invalid_mesh: {why}"})
+            sys.stdout.flush(); os._exit(0)
+        try:
+            from backends.moe_mesh import build_2d_groups as _b2d
+        except Exception:  # noqa: BLE001
+            from moe_mesh import build_2d_groups as _b2d
+        mesh_plan, mesh_tp_pg, mesh_ep_pg = _b2d(world, mesh_tp, mesh_ep,
+                                                 dist.get_rank())
+        result["mesh_tp"] = mesh_tp
+        result["mesh_ep"] = mesh_ep
+        _log(f"2D mesh: tp={mesh_tp} ep={mesh_ep} tp_rank={mesh_plan.tp_rank} "
+             f"ep_rank={mesh_plan.ep_rank} tp_row={mesh_plan.tp_group} "
+             f"ep_col={mesh_plan.ep_group}")
+    # attention shards over the TP-row width in mesh mode, else over the full tp.
+    attn_tp = mesh_tp or a.tp
+
     cfg = AutoConfig.from_pretrained(a.model, trust_remote_code=True)
     tcfg = _text_cfg(cfg)
     heads = _cfg_int(tcfg, "num_attention_heads")
     kv = _cfg_int(tcfg, "num_key_value_heads", heads)
     # Valid as long as tp divides the query-head count. If tp does not divide
     # the KV-head count, the GQA->MHA adapter expands K/V so it still shards.
-    if heads is not None and heads % a.tp != 0:
-        why = f"num_attention_heads={heads} not divisible by tp={a.tp}"
+    if heads is not None and heads % attn_tp != 0:
+        why = f"num_attention_heads={heads} not divisible by tp={attn_tp}"
         _log(f"INVALID_TP: {why}")
         dump({"ok": False, "error": f"invalid_tp: {why}"})
         sys.stdout.flush(); os._exit(0)
@@ -418,7 +451,11 @@ def main() -> None:
     # proven full-load path -- shard-on-read must never be the reason a run dies.
     _n_exp = _cfg_int(tcfg, "num_experts") or _cfg_int(tcfg, "n_routed_experts")
     _shard_on_read = (os.environ.get("TRN_OPT_SHARD_ON_READ") == "1"
-                      and world > 1 and bool(_n_exp))
+                      and world > 1 and bool(_n_exp) and mesh_tp is None)
+    if os.environ.get("TRN_OPT_SHARD_ON_READ") == "1" and mesh_tp is not None:
+        _log("shard-on-read disabled under TRN_OPT_2D_MESH: its contiguous "
+             "world-wide expert split is incompatible with the strided EP "
+             "column; using full-load + 2-D expert sharding instead")
     _ep_done_by_load = False
     model = None
     if _shard_on_read:
@@ -469,7 +506,35 @@ def main() -> None:
     # these models. Exactness is established on CPU in test_moe_ep.py: each expert
     # contributes to exactly one additive term, so partitioning + all-reduce
     # reproduces the unsharded mixture.
-    if a.tp > 1 and not _ep_done_by_load:
+    # ---- 2-D mesh sharding: experts over the EP column, attention over the TP
+    # row. Routes ALL MoE architectures through the scoped-group head-parallel
+    # shard (qwen38_tp.shard_model handles self_attn, linear_attn AND dense mlp);
+    # the DTensor dense plan shards over the whole world and cannot express the
+    # tp<world attention this mesh needs.
+    if mesh_tp is not None:
+        try:
+            try:
+                from backends.moe_ep import shard_moe_experts as _ep_shard
+            except Exception:  # noqa: BLE001
+                from moe_ep import shard_moe_experts as _ep_shard
+            n_ep, gb_freed = _ep_shard(model, dist.get_rank(), world,
+                                       ep_plan=(mesh_ep, mesh_plan.ep_rank,
+                                                mesh_ep_pg))
+            if n_ep:
+                _log(f"2D expert parallelism: sharded {n_ep} MoE layer(s) across "
+                     f"ep={mesh_ep} of world={world}, freeing ~{gb_freed:.1f} "
+                     f"GB/rank")
+        except Exception as _e:  # noqa: BLE001 - never fail a run over this
+            _log(f"2D expert parallelism skipped: {_e!r}")
+        try:
+            from backends.qwen38_tp import shard_model as _dn_shard
+        except Exception:  # noqa: BLE001
+            from qwen38_tp import shard_model as _dn_shard
+        na, nd, nm = _dn_shard(model, mesh_plan.tp_rank, mesh_tp,
+                               group=mesh_tp_pg)
+        _log(f"2D head-parallel TP over row: attn={na} deltanet={nd} mlp={nm}")
+
+    if a.tp > 1 and not _ep_done_by_load and mesh_tp is None:
         try:
             try:
                 from backends.moe_ep import shard_moe_experts as _ep_shard
@@ -491,7 +556,7 @@ def main() -> None:
         except Exception as _e:  # noqa: BLE001 - never fail a run over this
             _log(f"expert parallelism skipped: {_e!r}")
 
-    if a.tp > 1 and _has_deltanet(model):
+    if a.tp > 1 and _has_deltanet(model) and mesh_tp is None:
         # qwen3.8 hybrid (Gated DeltaNet + attention): manual head-parallel TP,
         # numerically validated exact (16/16 top-1 tokens vs CPU oracle at tp4).
         # No DTensor — the delta rule/attention are per-head so whole-head slices
@@ -502,7 +567,7 @@ def main() -> None:
             from qwen38_tp import shard_model as _dn_shard
         na, nd, nm = _dn_shard(model, dist.get_rank(), a.tp)
         _log(f"qwen3.8 head-parallel TP: attn={na} deltanet={nd} mlp={nm}")
-    elif a.tp > 1:
+    elif a.tp > 1 and mesh_tp is None:
         # Always attempt GQA->MHA expansion; it self-skips layers that already
         # shard cleanly, and expands only the ones that don't (handles gemma4's
         # per-layer heterogeneous kv-head counts and qwen3.8's GQA-4).

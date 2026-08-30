@@ -682,6 +682,11 @@ class NativePyTorchBackend:
                # collective_env. An operator override in os.environ still wins.
                **{k: v for k, v in collective_env(tp).items()
                   if k not in os.environ}}
+        # Orthogonal 2-D TP x EP mesh: a config carrying mesh_2d="tp,ep" launches
+        # the FULL box (nproc = tp_degree = world) and tells the worker how to split
+        # it. Only the worker interprets the grid; measure() just forwards it.
+        if cfg.get("mesh_2d"):
+            env["TRN_OPT_2D_MESH"] = str(cfg.get("mesh_2d"))
         # One Hub resolution here beats `tp` concurrent ones in the workers. Only
         # flip the workers offline once the cache is provably complete, so a cold
         # cache still downloads normally.
