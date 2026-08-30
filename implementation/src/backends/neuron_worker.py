@@ -475,10 +475,19 @@ def main() -> None:
                 from backends.moe_ep import shard_moe_experts as _ep_shard
             except Exception:  # noqa: BLE001
                 from moe_ep import shard_moe_experts as _ep_shard
-            n_ep, gb_freed = _ep_shard(model, dist.get_rank(), a.tp)
+            # TRN_OPT_EP_DEGREE decouples EP from TP: experts shard across this
+            # many ranks (replicated across tp/ep_degree, mixture summed per EP
+            # subgroup) while attention still shards across the full tp. Unset or
+            # ==tp is the coupled default. Lets us test the TP-up/EP-down split.
+            try:
+                _epd = int(os.environ.get("TRN_OPT_EP_DEGREE", "0")) or None
+            except ValueError:
+                _epd = None
+            n_ep, gb_freed = _ep_shard(model, dist.get_rank(), a.tp, ep_degree=_epd)
             if n_ep:
                 _log(f"expert parallelism: sharded {n_ep} MoE layer(s) across "
-                     f"tp={a.tp}, freeing ~{gb_freed:.1f} GB/rank")
+                     f"ep_degree={_epd or a.tp} of tp={a.tp}, freeing ~{gb_freed:.1f} "
+                     f"GB/rank")
         except Exception as _e:  # noqa: BLE001 - never fail a run over this
             _log(f"expert parallelism skipped: {_e!r}")
 

@@ -63,10 +63,20 @@ class ExpertParallelExperts(nn.Module):
     is identical on every rank. Only the *weights* are local.
     """
 
-    def __init__(self, orig: nn.Module, rank: int, world: int):
+    def __init__(self, orig: nn.Module, rank: int, world: int,
+                 ep_size: int | None = None, ep_rank: int | None = None,
+                 ep_group=None):
         super().__init__()
         num_experts = int(getattr(orig, "num_experts", orig.gate_up_proj.shape[0]))
-        lo, hi = expert_shard_plan(num_experts, rank, world)
+        # EP degree may be SMALLER than world: experts then shard across `ep_size`
+        # ranks and replicate across world/ep_size groups, with the mixture summed
+        # over the EP subgroup only (self.ep_group). Default ep_size=world,
+        # ep_rank=rank, ep_group=None -> reduce over the whole world, the original
+        # coupled EP=TP behaviour, byte-identical.
+        ep_size = world if ep_size is None else ep_size
+        ep_rank = rank if ep_rank is None else ep_rank
+        self.ep_group = ep_group
+        lo, hi = expert_shard_plan(num_experts, ep_rank, ep_size)
         self.num_experts = num_experts          # global, for the one-hot
         self.lo, self.hi = lo, hi
         self.act_fn = orig.act_fn
@@ -78,7 +88,8 @@ class ExpertParallelExperts(nn.Module):
             orig.down_proj.data[lo:hi].clone(), requires_grad=False)
 
     @classmethod
-    def from_sliced(cls, *, num_experts, rank, world, act_fn, gate_up_proj, down_proj):
+    def from_sliced(cls, *, num_experts, rank, world, act_fn, gate_up_proj, down_proj,
+                    ep_size=None, ep_rank=None, ep_group=None):
         """Build directly from THIS RANK'S already-sliced expert weights.
 
         The ``__init__`` above slices ``orig.gate_up_proj[lo:hi]`` from a full,
@@ -94,7 +105,10 @@ class ExpertParallelExperts(nn.Module):
         """
         self = cls.__new__(cls)
         nn.Module.__init__(self)
-        lo, hi = expert_shard_plan(num_experts, rank, world)
+        ep_size = world if ep_size is None else ep_size
+        ep_rank = rank if ep_rank is None else ep_rank
+        self.ep_group = ep_group
+        lo, hi = expert_shard_plan(num_experts, ep_rank, ep_size)
         if gate_up_proj.shape[0] != hi - lo or down_proj.shape[0] != hi - lo:
             raise ValueError(
                 f"sliced expert count {gate_up_proj.shape[0]}/{down_proj.shape[0]} "
@@ -134,17 +148,58 @@ class ExpertParallelExperts(nn.Module):
         # Sum the per-rank partial sums. Every expert contributed on exactly one
         # rank, so this reconstructs the full mixture.
         if dist.is_initialized() and dist.get_world_size() > 1:
-            dist.all_reduce(final_hidden_states)
+            # Sum the mixture over the EP subgroup. group=None is the whole world,
+            # correct when EP=world; a smaller EP group sums only the ranks that
+            # together hold the full expert set, so replicas across other groups do
+            # not double-count.
+            dist.all_reduce(final_hidden_states, group=getattr(self, "ep_group", None))
         return final_hidden_states
 
 
-def shard_moe_experts(model: nn.Module, rank: int, world: int) -> tuple[int, float]:
+def _ep_layout(rank, world, ep_degree):
+    """(ep_size, ep_rank, ep_group) for this rank given the requested EP degree.
+
+    ep_degree is the number of ranks the expert set is split across; the remaining
+    world/ep_degree ranks each hold a REPLICA of that split (they shard attention via
+    TP instead). Ranks are grouped in contiguous blocks of ep_degree, so EP group g is
+    [g*ep_degree : (g+1)*ep_degree] and the mixture is summed within it.
+
+    ep_degree None / >=world / non-divisor reproduces the coupled EP=TP=world exactly:
+    ep_group=None (the whole world), so the default path is byte-identical.
+    """
+    if not ep_degree or ep_degree >= world or ep_degree < 1 or world % ep_degree != 0:
+        return world, rank, None
+    ep_rank = rank % ep_degree
+    group = None
+    try:
+        import torch.distributed as _d
+        if _d.is_initialized():
+            # new_group is collective: EVERY rank must create EVERY group, even ones
+            # it does not join, or the group it does join will hang.
+            for g in range(world // ep_degree):
+                members = list(range(g * ep_degree, (g + 1) * ep_degree))
+                grp = _d.new_group(ranks=members)
+                if rank in members:
+                    group = grp
+    except Exception:  # noqa: BLE001 - fall back to world reduce if grouping fails
+        return world, rank, None
+    return ep_degree, ep_rank, group
+
+
+def shard_moe_experts(model: nn.Module, rank: int, world: int,
+                      ep_degree=None) -> tuple[int, float]:
     """Replace every fused-expert module in ``model`` with a rank-local shard.
 
     Returns ``(layers_sharded, gb_freed_per_rank)``. A no-op at ``world <= 1``.
+
+    ``ep_degree`` decouples expert parallelism from tensor parallelism: experts shard
+    across ``ep_degree`` ranks (replicated across world/ep_degree), while attention
+    still shards across the full ``world``. Default (None or ==world) is the original
+    coupled EP=TP behaviour.
     """
     if world <= 1:
         return 0, 0.0
+    ep_size, ep_rank, ep_group = _ep_layout(rank, world, ep_degree)
     root = getattr(model, "model", model)
     layers = getattr(root, "layers", None)
     if layers is None:  # multimodal wrapper
@@ -158,7 +213,9 @@ def shard_moe_experts(model: nn.Module, rank: int, world: int) -> tuple[int, flo
             continue
         before = (experts.gate_up_proj.numel() + experts.down_proj.numel()) \
             * experts.gate_up_proj.element_size()
-        mlp.experts = ExpertParallelExperts(experts, rank, world)
+        mlp.experts = ExpertParallelExperts(experts, rank, world,
+                                            ep_size=ep_size, ep_rank=ep_rank,
+                                            ep_group=ep_group)
         after = (mlp.experts.gate_up_proj.numel() + mlp.experts.down_proj.numel()) \
             * mlp.experts.gate_up_proj.element_size()
         freed += (before - after) / 1e9
