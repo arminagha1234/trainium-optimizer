@@ -130,7 +130,7 @@ class Deliverable:
     hardware: str
     verified: str
     rel_dir: str  # path of the recipe folder relative to optimized_models_dir
-    source_dir: Path  # absolute source folder (for rsync)
+    source_dir: Path  # absolute source folder to copy from
     chart_exists: bool
 
 
@@ -712,16 +712,25 @@ def publish(
             _git(["checkout", branch], repo_dir, env)
             _git(["pull", "--rebase", "origin", branch], repo_dir, env)
 
-        # 1. rsync each verified recipe folder into the checkout.
+        # 1. Copy each verified recipe folder into the checkout.
+        #
+        # Pure Python, deliberately. This used to shell out to `rsync -a`, which is
+        # not installed in the Neuron DLC -- so every run on a Kaizen pod raised
+        # FileNotFoundError here, `_auto_publish` caught it as non-fatal, and the
+        # result was that measurements survived while the row never appeared. A
+        # verified 1.045x on Qwen3.5-0.8B was earned and silently not published for
+        # exactly this reason. Publication must not depend on a binary that the
+        # machines doing the measuring do not have.
+        #
+        # `copytree(dirs_exist_ok=True)` matches what `rsync -a src/ dest/` did here:
+        # copy contents in, overwrite what collides, leave anything else alone (the
+        # old call had no --delete either).
         dest_models = repo_dir / "optimized_models"
         dest_models.mkdir(parents=True, exist_ok=True)
         for d in deliverables:
             dest = dest_models / d.rel_dir
             dest.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
-                ["rsync", "-a", f"{d.source_dir}/", f"{dest}/"],
-                capture_output=True, text=True, check=True,
-            )
+            shutil.copytree(d.source_dir, dest, dirs_exist_ok=True)
 
         # 1b. Per-model README enumerating that model's hardware routes. Written
         # for every model, including single-route ones, so the file is always there

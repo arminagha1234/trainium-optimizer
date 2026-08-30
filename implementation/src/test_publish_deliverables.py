@@ -437,3 +437,100 @@ def test_model_readme_is_written_for_single_route_models_too():
 
 def test_model_readme_is_empty_for_no_routes():
     assert render_model_readme("nothing", []) == ""
+
+
+# ---------------------------------------------------------------------------
+# Publication must not depend on tools the measuring machines do not have.
+#
+# `publish` shelled out to `rsync -a` to place bundles. rsync is NOT installed in
+# the Neuron DLC, so on every Kaizen pod this raised FileNotFoundError(2), which
+# `_auto_publish` correctly treats as non-fatal -- with the result that the
+# measurements survived and the row never appeared. Qwen3.5-0.8B earned a
+# grader-verified 1.045x (1,143 tok/s, drift 0.5%, equivalence ok) and was silently
+# not published for exactly this reason.
+#
+# The failure was invisible because it happened on the pod, was caught, and was
+# logged as non-fatal. So the test has to assert the property directly: publication
+# is pure Python and works with an empty PATH.
+# ---------------------------------------------------------------------------
+
+def _verified_bundle(root, slug="qwen3-5-0-8b", hardware="trn2.48xlarge",
+                     speedup=1.045):
+    import json
+    d = root / slug / hardware
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "recipe.json").write_text(json.dumps({
+        "model_id": "Qwen/Qwen3.5-0.8B", "backend": "native-pytorch-beta3",
+        "baseline_metric": 1094.0, "best_metric": 1143.0, "speedup": speedup,
+        "metric_label": "tok/s",
+        "config": {"tp_degree": 4, "weights_dtype": "bf16"},
+        "toolchain": {"instance_type": "trn2.48xlarge"}, "verified": "verified",
+    }))
+    (d / "results.tsv").write_text("commit\tstage\n")
+    (d / "optimization_timeline.png").write_bytes(b"\x89PNG\r\n")
+    return d
+
+
+def test_publish_needs_no_external_binaries(tmp_path, monkeypatch):
+    """With PATH emptied, publishing still works. rsync's absence broke this."""
+    from publish_deliverables import publish
+    src = tmp_path / "art" / "optimized_models"
+    _verified_bundle(src)
+    repo = tmp_path / "repo"
+    (repo / "optimized_models").mkdir(parents=True)
+    monkeypatch.setenv("PATH", "")
+    res = publish(repo_dir=repo, deploy_key="/nonexistent",
+                  optimized_models_dir=src,
+                  lock_path=str(tmp_path / "lock"), dry_run=True)
+    assert res["published"] == ["qwen3-5-0-8b"], res
+    assert not res.get("error")
+
+
+def test_the_bundle_actually_lands_in_the_checkout(tmp_path, monkeypatch):
+    """A row that qualifies is worthless if its folder never arrives."""
+    from publish_deliverables import publish
+    src = tmp_path / "art" / "optimized_models"
+    _verified_bundle(src)
+    repo = tmp_path / "repo"
+    (repo / "optimized_models").mkdir(parents=True)
+    monkeypatch.setenv("PATH", "")
+    publish(repo_dir=repo, deploy_key="/nonexistent", optimized_models_dir=src,
+            lock_path=str(tmp_path / "lock"), dry_run=True)
+    dest = repo / "optimized_models" / "qwen3-5-0-8b" / "trn2.48xlarge"
+    for name in ("recipe.json", "results.tsv", "optimization_timeline.png"):
+        assert (dest / name).is_file(), f"{name} did not arrive"
+    assert "Qwen3.5-0.8B" in (repo / "LEADERBOARD.md").read_text()
+
+
+def test_copying_a_bundle_twice_is_not_an_error(tmp_path, monkeypatch):
+    """Cycles re-publish the same model; the destination already exists."""
+    from publish_deliverables import publish
+    src = tmp_path / "art" / "optimized_models"
+    _verified_bundle(src)
+    repo = tmp_path / "repo"
+    (repo / "optimized_models").mkdir(parents=True)
+    monkeypatch.setenv("PATH", "")
+    kw = dict(repo_dir=repo, deploy_key="/nonexistent", optimized_models_dir=src,
+              lock_path=str(tmp_path / "lock"), dry_run=True)
+    publish(**kw)
+    res = publish(**kw)
+    assert res["published"] == ["qwen3-5-0-8b"]
+    assert not res.get("error")
+
+
+def test_a_newer_measurement_overwrites_the_bundle_in_place(tmp_path, monkeypatch):
+    from publish_deliverables import publish
+    import json
+    src = tmp_path / "art" / "optimized_models"
+    _verified_bundle(src, speedup=1.045)
+    repo = tmp_path / "repo"
+    (repo / "optimized_models").mkdir(parents=True)
+    monkeypatch.setenv("PATH", "")
+    kw = dict(repo_dir=repo, deploy_key="/nonexistent", optimized_models_dir=src,
+              lock_path=str(tmp_path / "lock"), dry_run=True)
+    publish(**kw)
+    _verified_bundle(src, speedup=1.31)
+    publish(**kw)
+    got = json.loads((repo / "optimized_models" / "qwen3-5-0-8b" /
+                      "trn2.48xlarge" / "recipe.json").read_text())
+    assert got["speedup"] == 1.31
