@@ -72,7 +72,16 @@ def merge_bundles(bundles: list[StagedBundle], dest_root: Path | str) -> list[st
         dst.mkdir(parents=True, exist_ok=True)
         for f in b.recipe.parent.iterdir():
             if f.is_file():
-                shutil.copy2(f, dst / f.name)
+                target = dst / f.name
+                shutil.copy2(f, target)
+                # A reproduce script that is not executable is a broken instruction:
+                # every RECIPE.md says to run `./reproduce.sh`. Bundles picked up from
+                # shared storage have whatever mode they were written with -- staging
+                # through tar, cp or an older run loses the bit -- so restore it here
+                # rather than trusting the source. Harvesting a stale bundle silently
+                # un-executabled eight of these in the live repo.
+                if target.suffix == ".sh":
+                    target.chmod(target.stat().st_mode | 0o755)
         written.append(str(b.rel_dir))
     return written
 

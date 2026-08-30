@@ -185,3 +185,26 @@ def test_the_route_readme_is_included_in_the_push(tmp_path):
     res = render_showcase(repo)
     paths = changed_paths(repo, res["qualified"])
     assert "optimized_models/qwen3-8-27b/README.md" in paths
+
+
+def test_a_merged_reproduce_script_stays_executable(tmp_path):
+    """Every RECIPE.md says to run `./reproduce.sh`, so the bit is part of the
+    deliverable. Staging through tar/cp loses it, and harvesting a stale bundle
+    silently un-executabled eight scripts in the live repo."""
+    stage = tmp_path / "stage"
+    d = _stage(stage, "band", "m/trn2-48xlarge", _recipe("M/m", speedup=1.4))
+    repro = d / "reproduce.sh"
+    repro.write_text("#!/usr/bin/env bash\necho hi\n")
+    repro.chmod(0o644)                      # arrives non-executable
+    repo = tmp_path / "repo" / "optimized_models"
+    merge_bundles(find_staged_bundles(stage), repo)
+    out = repo / "m" / "trn2-48xlarge" / "reproduce.sh"
+    assert out.stat().st_mode & 0o111, "reproduce.sh must be executable"
+
+
+def test_merging_does_not_make_data_files_executable(tmp_path):
+    stage = tmp_path / "stage"
+    _stage(stage, "band", "m/trn2-48xlarge", _recipe("M/m", speedup=1.4))
+    repo = tmp_path / "repo" / "optimized_models"
+    merge_bundles(find_staged_bundles(stage), repo)
+    assert not (repo / "m" / "trn2-48xlarge" / "recipe.json").stat().st_mode & 0o111
