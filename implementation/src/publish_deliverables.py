@@ -301,12 +301,12 @@ def collect_verified(optimized_models_dir: Path | str) -> list[Deliverable]:
         # trn2.48xlarge numbers entirely behind the trn2.3xlarge ones.
         key = (d.model_id, d.hardware)
         prev = best_by_model.get(key)
-        if prev is None or d.speedup > prev.speedup or (
-            d.speedup == prev.speedup and d.best > prev.best
+        if prev is None or d.best > prev.best or (
+            d.best == prev.best and d.speedup > prev.speedup
         ):
             best_by_model[key] = d
     return sorted(
-        best_by_model.values(), key=lambda x: (x.speedup, x.best), reverse=True
+        best_by_model.values(), key=lambda x: (x.best, x.speedup), reverse=True
     )
 
 
@@ -446,47 +446,77 @@ def render_model_readme(slug: str, rows: list[Deliverable]) -> str:
 
 
 def render_leaderboard(deliverables: list[Deliverable]) -> str:
-    """Regenerate the full standalone ``LEADERBOARD.md`` (sorted, medals top 3)."""
+    """Regenerate the full standalone ``LEADERBOARD.md``.
+
+    Two tables. The HEADLINE is **peak throughput**: one row per model per
+    hardware target, ranked by the highest tok/s achieved and the config that
+    achieved it (almost always ``torch.compile``). The second table is the same
+    results ranked by speedup over the eager baseline — useful context, but not
+    the headline. Both are derived solely from the on-disk ``recipe.json`` bundles.
+    """
+    by_tput = sorted(deliverables, key=lambda x: (x.best, x.speedup), reverse=True)
+    by_speedup = sorted(deliverables, key=lambda x: (x.speedup, x.best), reverse=True)
     lines = [
         "# Trainium Optimizer — Leaderboard",
         "",
-        "Verified optimized models, **one row per model per hardware target**, "
-        "sorted by speedup over the eager baseline on real Trainium hardware "
-        "(`native-pytorch-beta3`). Auto-published by the optimizer loop — do not "
-        "edit by hand.",
+        "**Peak measured throughput per model on real Trainium hardware "
+        "(`native-pytorch-beta3`), and the config that achieved it.** One row per "
+        "model per hardware target, ranked by throughput (tok/s). Auto-published "
+        "by the optimizer loop — do not edit by hand.",
         "",
-        "Speedup is relative to the eager baseline **on the same instance**, so "
-        "rows for different hardware are each internally consistent but are **not "
-        "comparable to one another** — a bigger box can score a lower multiple.",
-        "",
-        "Recipes and trajectory charts live under "
+        "Every row is generated from a `recipe.json` in an existing bundle: no "
+        "bundle, no row, and no number that is not read straight out of that file. "
+        "Rows are never hand-added — a hand-added row is removed on the next "
+        "publish. Recipes and trajectory charts live under "
         "[`optimized_models/`](./optimized_models/) — each folder holds "
         "`recipe.json`, `RECIPE.md`, `reproduce.sh`, `results.tsv`, and "
         "`optimization_timeline.png`.",
         "",
-        "Every row is generated from a `recipe.json` in an existing bundle: no bundle, "
-        "no row, and no number that is not read straight out of that file. Rows are "
-        "never hand-added — a hand-added row is removed on the next publish.",
+        "## Peak throughput",
         "",
-        "| Rank | Model | Family | Params | Baseline (tok/s) | Best (tok/s) | "
-        "Speedup | Best config | Hardware | Verified | Recipe |",
-        "|-----:|:------|:-------|-------:|-----------------:|-------------:|"
-        "--------:|:------------|:-------------|:---------|:-------|",
+        "| Rank | Model | Family | Params | Peak (tok/s) | Config | Hardware | "
+        "Verified | Recipe |",
+        "|-----:|:------|:-------|-------:|-------------:|:-------|:-------------|"
+        ":---------|:-------|",
     ]
-    for i, d in enumerate(deliverables, start=1):
+    for i, d in enumerate(by_tput, start=1):
         recipe_link = f"[recipe](./optimized_models/{d.rel_dir}/)"
         lines.append(
             f"| {_rank_label(i)} | {d.display_name} | {d.family} | {d.params} | "
-            f"{_fmt(d.baseline)} | **{_fmt(d.best)}** | **{d.speedup:g}×** | "
-            f"{d.config_summary} | {d.hardware} | ✅ verified | {recipe_link} |"
+            f"**{_fmt(d.best)}** | {d.config_summary} | {d.hardware} | "
+            f"✅ verified | {recipe_link} |"
         )
     lines += [
         "",
-        f"{len(deliverables)} verified result(s) across "
+        f"{len(by_tput)} verified result(s) across "
         f"{len({d.model_id for d in deliverables})} model(s) and "
-        f"{len({d.hardware for d in deliverables})} hardware target(s). "
-        "Speedup is measured against the eager baseline on the same instance and "
-        "probe shape. See [`HISTORY.tsv`](./HISTORY.tsv) for the append-only record.",
+        f"{len({d.hardware for d in deliverables})} hardware target(s). Throughput "
+        "is the prefill tok/s measured on real hardware at the recipe's probe "
+        "shape. Absolute throughput is comparable across rows on the same hardware "
+        "target.",
+        "",
+        "## Improvement over eager baseline",
+        "",
+        "The same verified results, ranked by speedup over the **eager** baseline "
+        "on the same instance and probe shape. A speedup is internally consistent "
+        "per row but **not comparable across hardware** — a bigger box can score a "
+        "lower multiple. This shows how far the optimizer moved each model; the "
+        "peak-throughput table above is the headline.",
+        "",
+        "| Model | Params | Baseline (tok/s) | Best (tok/s) | Speedup | Config | "
+        "Hardware |",
+        "|:------|-------:|-----------------:|-------------:|--------:|:-------|"
+        ":-------------|",
+    ]
+    for d in by_speedup:
+        lines.append(
+            f"| {d.display_name} | {d.params} | {_fmt(d.baseline)} | "
+            f"**{_fmt(d.best)}** | **{d.speedup:g}×** | {d.config_summary} | "
+            f"{d.hardware} |"
+        )
+    lines += [
+        "",
+        "See [`HISTORY.tsv`](./HISTORY.tsv) for the append-only record.",
         "",
     ]
     return "\n".join(lines)

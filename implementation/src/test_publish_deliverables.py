@@ -96,10 +96,10 @@ def test_collect_verified_filters_and_sorts():
         assert "Qwen/Qwen3-32B" not in ids, "0.0-speedup failure must be skipped"
         # exactly the four verified wins
         assert len(dels) == 4, ids
-        # sorted by speedup desc
-        speedups = [d.speedup for d in dels]
-        assert speedups == sorted(speedups, reverse=True)
-        assert dels[0].model_id == "Qwen/Qwen3-0.6B"
+        # sorted by throughput (best tok/s) desc -- the board primary metric
+        bests = [d.best for d in dels]
+        assert bests == sorted(bests, reverse=True), bests
+        assert dels[0].model_id == "Qwen/Qwen3-0.6B"  # highest tok/s
         # NEW model present with right params/family derivation
         q17 = next(d for d in dels if d.model_id == "Qwen/Qwen3-1.7B")
         assert q17.params == "1.7B"
@@ -117,7 +117,10 @@ def test_collect_verified_dedup_keeps_faster():
                       _recipe("Qwen/Qwen3-0.6B", speedup=27.05, baseline=3085.1, best=83450.3))
         dels = collect_verified(root)
         assert len(dels) == 1
-        assert dels[0].speedup == 27.05
+        # throughput-primary: the higher-tok/s recipe wins even though the
+        # other had a higher speedup over its own baseline
+        assert dels[0].best == 85937.2
+        assert dels[0].speedup == 25.788
 
 
 def test_collect_verified_speedup_derived_when_missing():
@@ -142,8 +145,15 @@ def test_render_leaderboard_sort_medals_and_exclusion():
         md = render_leaderboard(dels)
 
         assert "🥇" in md and "🥈" in md and "🥉" in md
-        # top of board is the fastest
-        assert md.index("Qwen3-0.6B") < md.index("Qwen2.5-0.5B-Instruct")
+        # two-table structure: peak-throughput headline + speedup context
+        assert "## Peak throughput" in md
+        assert "## Improvement over eager baseline" in md
+        # the MAIN table ranks by throughput (tok/s), NOT speedup:
+        # Qwen2.5-0.5B (74k tok/s, 15.4x) ranks ABOVE Qwen3-1.7B (44k tok/s,
+        # 17.2x) -- the reverse of a speedup sort, pinning the tput order.
+        peak = md.split("## Improvement over eager baseline")[0]
+        assert (peak.index("Qwen3-0.6B") < peak.index("Qwen2.5-0.5B-Instruct")
+                < peak.index("Qwen3-1.7B"))
         # NEW model appears
         assert "Qwen3-1.7B" in md
         # failed / unverified never appear

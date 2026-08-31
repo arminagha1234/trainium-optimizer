@@ -136,7 +136,10 @@ def test_two_boxes_for_one_model_both_survive_publication(tmp_path):
              hardware="trn2.48xlarge"),
     ])
     board = (repo / "LEADERBOARD.md").read_text()
-    assert board.count("Qwen3.8-27B") == 2
+    # Two tables now (peak throughput + improvement over baseline): each of the
+    # two independent hardware routes appears once per table -> 4 mentions.
+    assert "## Peak throughput" in board and "## Improvement over eager baseline" in board
+    assert board.count("Qwen3.8-27B") == 4
     for hw in ("trn2.3xlarge", "trn2.48xlarge"):
         assert hw in board
     md = (repo / "optimized_models" / "m" / "README.md").read_text()
