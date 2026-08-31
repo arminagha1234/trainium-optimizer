@@ -51,5 +51,6 @@ Every row is generated from a `recipe.json` in an existing bundle: no bundle, no
 | 39 | SmolLM2-1.7B | smollm2 | 1.7B | 10,573 | **14,460** | **1.368×** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-1-7b/) |
 | 40 | Qwen3.5-2B | qwen3.5 | 2B | 1,071 | **1,129** | **1.054×** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-2b/trn2.48xlarge/) |
 | 41 | Qwen3.5-0.8B | qwen3.5 | 0.8B | 1,093 | **1,143** | **1.045×** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-0-8b/trn2.48xlarge/) |
+| 42 | Qwen3.8-27B | qwen3.8 | 27B | 332 | **343** | **1.034×** | TP=8, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-8-27b/trn2.48xlarge/) |
 
-41 verified result(s) across 41 model(s) and 2 hardware target(s). Speedup is measured against the eager baseline on the same instance and probe shape. See [`HISTORY.tsv`](./HISTORY.tsv) for the append-only record.
+42 verified result(s) across 42 model(s) and 2 hardware target(s). Speedup is measured against the eager baseline on the same instance and probe shape. See [`HISTORY.tsv`](./HISTORY.tsv) for the append-only record.

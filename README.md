@@ -81,6 +81,7 @@ Full standings: [LEADERBOARD.md](./LEADERBOARD.md) · per-model recipes: [`optim
 | 39 | SmolLM2-1.7B | smollm2 | 1.7B | 10,573 | **14,460** | **1.368×** | (config-only) | trn2.3xlarge | ✅ Verified |
 | 40 | Qwen3.5-2B | qwen3.5 | 2B | 1,071 | **1,129** | **1.054×** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ Verified |
 | 41 | Qwen3.5-0.8B | qwen3.5 | 0.8B | 1,093 | **1,143** | **1.045×** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ Verified |
+| 42 | Qwen3.8-27B | qwen3.8 | 27B | 332 | **343** | **1.034×** | TP=8, bf16, batch=1 | trn2.48xlarge | ✅ Verified |
 <!-- LEADERBOARD:END -->
 
 *Speedup is vs the eager baseline on the same instance + probe shape. ✅ Verified
