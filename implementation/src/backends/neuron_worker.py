@@ -807,13 +807,22 @@ def main() -> None:
     tokens = a.batch * a.input_len
     tok_s = tokens / p50 if p50 > 0 else 0.0
 
-    # MFU: 2 * params * tok/s / (peak_per_core * tp_cores)
-    mfu = 100.0 * (2 * params * tok_s) / (PEAK_TFLOPS_BF16 * 1e12 * a.tp)
+    # MFU / %SOL against the tensor-engine ceiling, dtype-aware (roofline.py is the
+    # single source of the peak constants; falls back to the inline bf16 ceiling if
+    # the module is unavailable so the worker never fails over this).
+    try:
+        import roofline as _rf
+        mfu = _rf.model_mfu_percent(params, tok_s, a.tp, a.dtype)
+        sol_violation = _rf.is_implausible_mfu(mfu)
+    except Exception:  # noqa: BLE001 - never let the SoL calc crash a run
+        mfu = 100.0 * (2 * params * tok_s) / (PEAK_TFLOPS_BF16 * 1e12 * a.tp)
+        sol_violation = mfu > 100.0
     # Implausibility guard. MFU > 100% is physically impossible, so it means the
     # timed loop measured dispatch rather than compute (result cache, DCE'd
-    # output, or an un-synced queue). Surface it loudly instead of publishing a
-    # fabricated speedup -- a silent 100x is far more expensive than a failed run.
-    if mfu > 100.0:
+    # output, or an un-synced queue). We both log it loudly AND emit a machine-
+    # readable sol_violation flag (below) so a fabricated speedup is voided by the
+    # grader/harvester, not published on the strength of a log line nobody reads.
+    if sol_violation:
         _log(f"IMPLAUSIBLE: mfu={mfu:.1f}% exceeds the device FLOP ceiling "
              f"(tok_s={tok_s:.1f}, p50={p50 * 1e3:.4f}ms, params={params:.3g}, tp={a.tp}). "
              f"Timing is measuring dispatch, not compute -- treat this result as void.")
@@ -849,6 +858,7 @@ def main() -> None:
         "compile_s": compile_s,
         "load_s": load_s,
         "mfu_percent": mfu,
+        "sol_violation": bool(sol_violation),  # True => faster-than-physics, void it
         "hbm_peak_gb": hbm_peak,
         "hbm_available_gb": hbm_avail,
         "hbm_estimated": hbm_estimated,
