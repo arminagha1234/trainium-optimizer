@@ -352,6 +352,14 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
+    # tp>1 GDN compile fix (TRN_OPT_GDN_MATMUL_INV=1): swap the HF chunk
+    # forward-substitution inverse (NCC_IBCG901 'Too many strides' once the
+    # GatedDeltaNet is tp-sharded) for the numerically-identical matmul-only
+    # inverse. Verified cos 1.0 vs stock (out + state). See backends.gdn_matmul_inv.
+    if os.environ.get("TRN_OPT_GDN_MATMUL_INV", "") not in ("", "0"):
+        from backends.gdn_matmul_inv import install_gdn_matmul_inverse
+        install_gdn_matmul_inverse(_log)
+
     # Stage 2-5 lever: neuronx-cc compiler flags (graph rewrites / kernel
     # selection). Applied to the torch.compile(backend='neuron') path via the
     # NEURON_CC_FLAGS env var, which neuronx-cc reads at compile time.
