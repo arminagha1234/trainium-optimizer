@@ -354,21 +354,27 @@ def _fmt(n: float) -> str:
 
 
 def render_readme_table(deliverables: list[Deliverable]) -> str:
-    """The markdown table that lives between the README leaderboard markers."""
+    """The markdown table embedded in README.md between the leaderboard markers.
+
+    Mirrors LEADERBOARD.md's headline: peak throughput per model, ranked by tok/s,
+    and the config that achieved it. (The speedup-over-eager view lives in the
+    full LEADERBOARD.md.)
+    """
     header = (
-        "| Rank | Model | Family | Params | Baseline (tok/s) | "
-        "Optimized (tok/s) | Speedup | Best config | Hardware | Status |\n"
-        "|-----:|:------|:-------|-------:|-----------------:|"
-        "------------------:|--------:|:------------|:-------------|:-------|"
+        "| Rank | Model | Family | Params | Peak (tok/s) | Config | "
+        "Hardware | Status |\n"
+        "|-----:|:------|:-------|-------:|-------------:|:-------|"
+        ":-------------|:-------|"
     )
     rows = [header]
-    for i, d in enumerate(deliverables, start=1):
+    ranked = sorted(deliverables, key=lambda x: (x.best, x.speedup), reverse=True)
+    for i, d in enumerate(ranked, start=1):
         rows.append(
             f"| {_rank_label(i)} | {d.display_name} | {d.family} | {d.params} | "
-            f"{_fmt(d.baseline)} | **{_fmt(d.best)}** | **{d.speedup:g}×** | "
-            f"{d.config_summary} | {d.hardware} | ✅ Verified |"
+            f"**{_fmt(d.best)}** | {d.config_summary} | {d.hardware} | \u2705 Verified |"
         )
     return "\n".join(rows)
+
 
 
 def group_by_model(deliverables: list[Deliverable]) -> dict[str, list[Deliverable]]:

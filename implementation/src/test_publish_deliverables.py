@@ -168,8 +168,8 @@ def test_readme_table_has_expected_columns():
         root = Path(tmp)
         _standard_tree(root)
         table = render_readme_table(collect_verified(root))
-        for col in ("Rank", "Model", "Family", "Params", "Baseline",
-                    "Optimized", "Speedup", "Best config", "Hardware", "Status"):
+        for col in ("Rank", "Model", "Family", "Params", "Peak (tok/s)",
+                    "Config", "Hardware", "Status"):
             assert col in table, col
         assert "✅ Verified" in table
 
