@@ -88,3 +88,44 @@ def test_zero_inputs_never_fabricate_a_ratio():
     assert rf.sol_memory_bound(0, 1.0) == 0.0
     assert rf.sol_memory_bound(1e6, 0.0) == 0.0
     assert rf.sol_compute_bound(0, 1.0) == 0.0
+
+
+def test_model_mfu_percent_known_value():
+    # 1e9 params, 1e6 tok/s over 1 core, bf16 -> 2*1e9*1e6 / 79e12 = 2e15/79e12
+    # = 25.3% (as a fraction 0.0253 -> *100).
+    mfu = rf.model_mfu_percent(1e9, 1e6, 1, "bf16")
+    assert abs(mfu - 100.0 * 2e15 / 79e12) < 1e-6
+    # spreading the same work over 2 cores halves the per-core MFU
+    assert abs(rf.model_mfu_percent(1e9, 1e6, 2, "bf16")
+               - rf.model_mfu_percent(1e9, 1e6, 1, "bf16") / 2) < 1e-9
+
+
+def test_model_mfu_is_dtype_aware():
+    # fp8 has 2x the bf16 FLOP ceiling, so the SAME work is HALF the %SOL of fp8's
+    # roofline; fp32 has 1/4 the ceiling, so 4x the %SOL. Holds each run to its own
+    # roofline instead of the bf16 one.
+    base = rf.model_mfu_percent(1e9, 1e6, 1, "bf16")
+    assert abs(rf.model_mfu_percent(1e9, 1e6, 1, "fp8") - base / 2) < 1e-6
+    assert abs(rf.model_mfu_percent(1e9, 1e6, 1, "fp32") - base * (79.0 / 20.0)) < 1e-3
+
+
+def test_model_mfu_percent_bad_inputs_are_zero():
+    assert rf.model_mfu_percent(0, 1e6, 1) == 0.0
+    assert rf.model_mfu_percent(1e9, 0, 1) == 0.0
+    assert rf.model_mfu_percent(1e9, 1e6, 0) == 0.0
+
+
+def test_is_implausible_mfu_boundary():
+    assert rf.is_implausible_mfu(100.0001) is True     # over the ceiling -> void
+    assert rf.is_implausible_mfu(100.0) is False        # exactly at the ceiling is allowed
+    assert rf.is_implausible_mfu(37.0) is False         # a normal, healthy MFU
+    # a tolerance band lets small measurement noise through
+    assert rf.is_implausible_mfu(105.0, tol=0.10) is False
+    assert rf.is_implausible_mfu(111.0, tol=0.10) is True
+
+
+def test_implausible_mfu_catches_a_fake_speedup():
+    # the ~788x-fake class: a tiny latency implies an impossible model FLOP/s.
+    # 35e9 params, but "measured" 5e5 tok/s on ONE core -> way over the ceiling.
+    fake = rf.model_mfu_percent(35e9, 5e5, 1, "bf16")
+    assert fake > 100.0 and rf.is_implausible_mfu(fake)

@@ -77,6 +77,39 @@ def peak_tflops(dtype: str = "bf16", *, sparse: bool = False) -> float:
         return PEAK_TFLOPS_FP32_PER_CORE
     return PEAK_TFLOPS_BF16_PER_CORE
 
+
+# --- model-level MFU / implausibility (the KDA "faster than physics" gate) ---
+# A whole-model decoder step is matmul-dominated at ~2*params FLOP per token. Its
+# MFU is achieved model FLOP/s / (per-core tensor-engine ceiling * cores). MFU
+# ABOVE 100% is physically impossible -> the timing measured dispatch, not compute
+# (a result-cache hit, a DCE'd output, or an un-synced queue). Flag it MACHINE-
+# READABLY so a fabricated "speedup" is voided rather than published -- this is the
+# anti-reward-hacking detector the FlashInfer/KDA work found essential (a prompt
+# telling the agent "don't game it" is not enough; you need the physical ceiling
+# check). It is exactly the class of bug behind the ~788x fake speedup we hit.
+MFU_IMPLAUSIBLE_PCT = 100.0
+
+
+def model_mfu_percent(params: float, tok_s: float, tp: int,
+                      dtype: str = "bf16", *, sparse: bool = False) -> float:
+    """Whole-model MFU as a PERCENT of the tensor-engine FLOP ceiling (dense
+    decoder ~= 2*params FLOP/token). ``tp`` is the number of cores the FLOPs are
+    spread over; ``dtype`` picks the right per-core ceiling (fp8 has 2x the bf16
+    ceiling, fp32 1/4), so an fp8/fp32 run is held to ITS OWN roofline instead of
+    the bf16 one. Returns 0.0 on non-positive inputs (never a fabricated ratio)."""
+    peak = peak_tflops(dtype, sparse=sparse)
+    if params <= 0 or tok_s <= 0 or tp <= 0 or peak <= 0:
+        return 0.0
+    return 100.0 * (2.0 * params * tok_s) / (peak * tp)
+
+
+def is_implausible_mfu(mfu_percent: float, tol: float = 0.0) -> bool:
+    """True when MFU exceeds the physical ceiling (optionally with a tolerance
+    band for measurement noise). True means: do NOT trust or publish the latency --
+    it is measuring dispatch, not compute."""
+    return mfu_percent > MFU_IMPLAUSIBLE_PCT * (1.0 + max(0.0, tol))
+
+
 # Profitability thresholds (fractions of SOL). Tunable; the pivot's guidance is
 # "low %SOL = opportunity, ~80% = don't bother".
 OPPORTUNITY_MAX_SOL = 0.40   # <= 40% of SOL -> a real authoring opportunity
