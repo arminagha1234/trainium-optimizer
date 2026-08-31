@@ -29,7 +29,7 @@ not assumptions.
 - Encode the split as a **`ServeBackend` adapter** — *optimize on native, ACCEPT
   on vLLM*. `host_path` already routes host-vs-device per backend.
 
-### Targeting principle: author ONLY where the compiler is weak (measured, not assumed)
+### Targeting principle: author where there is measured %SOL headroom (weak OR beatable)
 
 On-device calibration (trn2, hd=128, fair fresh-input timing, 2026-08-28):
 - **Attention is mostly compiler-STRONG** — single-head dense beats/ties a flash
@@ -39,15 +39,26 @@ On-device calibration (trn2, hd=128, fair fresh-input timing, 2026-08-28):
 - **Scan / GatedDeltaNet is genuinely compiler-WEAK** — the chunked NKI kernel is
   **22.75× the naive recurrence**, whose graph is compile-intractable at
   S=2048. Author/harvest freely here.
-- The opportunity sweep drives target selection off measured %SOL; **skip what
-  the compiler already wins.**
+- Target selection is driven by the **opportunity sweep's measured %SOL gap**,
+  not a binary weak/strong prior. Two kinds of target:
+  1. **Weak** — the compiler fails / OOMs / ISA-errors (scan; batched-flash past
+     the OOM boundary). Author freely: the compiler can't do it at all.
+  2. **Beatable** — the compiler RUNS but leaves %SOL on the table (extra
+     materialization, poor tiling, a missed fusion). A hand kernel can win
+     head-to-head — this is the "beat the compiler" frontier we now pursue too.
+- **Win bar (the beat-the-compiler gate):** a kernel is promoted over
+  `torch.compile(neuron)` only if it is **>=5% faster at equal correctness**
+  (equivalence gate) **AND within speed-of-light** (no SoL violation, roofline.py).
+  The 5% is the invention margin (`<2%` is noise); the SoL check rejects
+  fake-fast wins. We now skip only ops already **near SoL** (no headroom) —
+  merely being *handled* by the compiler no longer disqualifies an op.
 
 ### What we're shooting for (expanded goals)
 
 1. **Cross-agent compounding bank** — the trn2.3xl + trn2.48xl instances share
    ONE bank so model N+1 measurably reuses model N's kernels (the flywheel, at
    fleet scale *and* across agents).
-2. **Kernel corpus growth on the compiler-weak frontier** — GLM-5.2 `GlmMoeDsa`,
+2. **Kernel corpus growth on the compiler-weak _and beatable_ frontier** — GLM-5.2 `GlmMoeDsa`,
    sliding-window / sparse attention, KDA, Mamba-2/3 — plus the validated
    batched-flash OOM-regime win.
 3. **Serving-path perf hygiene as a first-class gate** — every harvested kernel
