@@ -126,30 +126,39 @@ class ExpertParallelExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        # STATIC-SHAPE dense expert forward. Every token runs through every LOCAL
-        # expert; each expert's output is weighted by that token's router affinity
-        # for it (0 when the token was not routed to it) and summed. A non-routed
-        # token contributes exactly 0, so this equals the top-k mixture -- proven
-        # bit-for-bit vs the reference in test_moe_ep.py.
+        # STATIC-SHAPE dense expert forward, BATCHED across this rank's local experts.
+        # Mathematically identical to running each local expert separately and summing
+        # by router affinity -- a non-routed token has affinity 0, so this equals the
+        # top-k mixture (proven bit-for-bit vs the reference in test_moe_ep.py) -- but
+        # the per-expert python loop is fused into two batched matmuls. That removes the
+        # num_local separate op dispatches that dominate in eager mode and hands the
+        # compiler one clean batched matmul instead of a chain of small F.linear calls.
         #
-        # Why not the obvious gather-routed-tokens form: that uses nonzero()/where()
-        # to select each expert's tokens, which are DATA-DEPENDENT shapes. The Neuron
-        # compiler runs with dynamic=False and rejects dynamic shapes, so the gather
-        # form recompiles/stalls per token distribution. This trades a few extra FLOPs
-        # (all tokens through all local experts) for a fully static graph -- the
-        # standard MoE-on-Neuron shape, matching NxD forward_all_experts_EP.
-        final_hidden_states = torch.zeros_like(hidden_states)
-        num_local = self.hi - self.lo
-        for local in range(num_local):                 # STATIC: fixed local count
-            e = self.lo + local
-            gate, up = F.linear(hidden_states, self.gate_up_proj[local]).chunk(2, dim=-1)
-            h = self.act_fn(gate) * up
-            h = F.linear(h, self.down_proj[local])
-            # This token's weight for global expert e: sum of the router weights on
-            # whichever top-k slots selected e (0 if none did). No data-dependent
-            # indexing -- top_k_index/top_k_weights are [tokens, k], fixed shape.
-            aff = ((top_k_index == e) * top_k_weights).sum(dim=-1)
-            final_hidden_states = final_hidden_states + h * aff.unsqueeze(-1).to(h.dtype)
+        # Still fully STATIC: E=num_local is fixed and the affinity is built by comparing
+        # top_k_index against a fixed arange -- no nonzero()/where()/index_add()
+        # data-dependent gather (the Neuron dynamic=False invariant, pinned by
+        # test_expert_forward_has_no_data_dependent_shapes). Why not a truly routed
+        # (gather only the tokens each expert was assigned) form: that is a
+        # data-dependent shape, which the Neuron compiler rejects; the static routed
+        # alternative (fixed per-expert capacity) drops overflow tokens and is no longer
+        # bit-exact. Batching keeps exactness while cutting the eager dispatch overhead.
+        E = self.hi - self.lo
+        if E <= 0:                              # this rank owns no experts (ep>experts)
+            final_hidden_states = torch.zeros_like(hidden_states)
+        else:
+            # gate_up_proj: [E, 2I, H]; down_proj: [E, H, I]; hidden_states: [T, H].
+            # einsum('th,eoh->eto') == F.linear(x, gate_up_proj[e]) stacked over e.
+            gu = torch.einsum("th,eoh->eto", hidden_states, self.gate_up_proj)  # [E,T,2I]
+            gate, up = gu.chunk(2, dim=-1)                                      # [E,T,I]
+            h = self.act_fn(gate) * up                                         # [E,T,I]
+            h = torch.einsum("eti,ehi->eth", h, self.down_proj)                # [E,T,H]
+            # affinity[e,t]: sum of the router weights on whichever top-k slots picked
+            # global expert (lo+e), else 0. top_k_index/top_k_weights are [T, K].
+            global_ids = torch.arange(self.lo, self.hi, device=top_k_index.device)
+            match = top_k_index.unsqueeze(0) == global_ids.view(-1, 1, 1)      # [E,T,K]
+            aff = (match * top_k_weights.unsqueeze(0)).sum(dim=-1)             # [E,T]
+            final_hidden_states = torch.einsum(
+                "eth,et->th", h, aff.to(h.dtype))                             # [T,H]
         # Sum the per-rank partial sums over the EP subgroup. Every expert contributed
         # on exactly one rank within the group, so this reconstructs the full mixture;
         # group=None (EP=world) reduces over the whole world, the coupled default.
