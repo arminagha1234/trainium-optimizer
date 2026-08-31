@@ -1,52 +1,18 @@
-# Optimized Recipe: Qwen/Qwen3.5-4B
+# Qwen/Qwen3.5-4B — trn2.48xlarge
 
-**812 tok/s** — 1.37x over baseline
-(593 tok/s).
+**Peak: 20,470 tok/s** at `TP=16, torch.compile(neuron), bf16, batch=1` — **21.795× over the eager baseline** (939 tok/s), verified on real Trainium hardware (`native-pytorch-beta3`).
 
-Backend: `native-pytorch-beta3`  ·  Correctness: **verified** (trusted-grader re-measure)
-Generated: 2026-08-30T16:04:17Z
+## Correctness
+Top-1 token agreement vs the eager baseline: **16/16 (100%)**. SoL integrity check: no violation (14.2% MFU, well under the physical ceiling). The GatedDeltaNet now compiles at TP=16 via the matmul-only chunk inverse (`TRN_OPT_GDN_MATMUL_INV=1`, PR #176) plus the `qwen3_next_rewrites` — replacing the strided forward-substitution loop that made `neuronx-cc` fail (`NCC_IBCG901`/`NCC_IINAR001`) once the layer is tensor-parallel sharded.
 
-## Winning config
-
-```json
-{
-  "tp_degree": 8,
-  "weights_dtype": "bf16",
-  "attn_implementation": "eager",
-  "compile_mode": "eager",
-  "batch": 1,
-  "cp_degree": 1,
-  "dp_degree": 1,
-  "kv_replication": 1,
-  "cores_used": 8,
-  "cores_available": 64
-}
-```
-
-## Kernels
-
-- (none — config-only recipe)
-
-## Toolchain (reproducibility)
-
-```json
-{
-  "backend": "native-pytorch-beta3",
-  "stack": "native-pytorch-beta3",
-  "device_string": "neuron",
-  "instance_type": "trn2.48xlarge",
-  "torch": "2.12.1+cu130",
-  "torch_neuronx": "2.12.3.0.1636+5c472775",
-  "neuronx_cc": "2.27.2878.0+8220f7ac",
-  "nki": "0.6.0+30289107548.gd2d9cc57"
-}
-```
+## Config
+| field | value |
+|:--|:--|
+| tp_degree | 16 |
+| compile_mode | compile-default (`torch.compile(backend="neuron")`) |
+| weights_dtype | bf16 |
+| batch / input_len | 1 / 1024 |
+| instance | trn2.48xlarge |
 
 ## Reproduce
-
-```bash
-./reproduce.sh
-```
-
-See `results.tsv` for the full search trace and the trajectory chart for how
-this recipe was reached.
+See [`reproduce.sh`](./reproduce.sh). Toolchain at publish time: torch 2.12.1, torch_neuronx 2.12.3.0.1636, neuronx-cc 2.27.2878.0, nki 0.6.0.

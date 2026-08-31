@@ -1,20 +1,20 @@
 {
   "model_id": "Qwen/Qwen3.5-4B",
   "backend": "native-pytorch-beta3",
-  "baseline_metric": 592.8889088897432,
-  "best_metric": 812.0017794223381,
-  "speedup": 1.37,
+  "baseline_metric": 939.2,
+  "best_metric": 20470.0,
+  "speedup": 21.795,
   "metric_label": "tok/s",
   "config": {
-    "tp_degree": 8,
+    "tp_degree": 16,
     "weights_dtype": "bf16",
     "attn_implementation": "eager",
-    "compile_mode": "eager",
+    "compile_mode": "compile-default",
     "batch": 1,
     "cp_degree": 1,
     "dp_degree": 1,
     "kv_replication": 1,
-    "cores_used": 8,
+    "cores_used": 16,
     "cores_available": 64
   },
   "toolchain": {
@@ -28,8 +28,17 @@
     "nki": "0.6.0+30289107548.gd2d9cc57"
   },
   "kernels": [],
-  "measurements": {},
+  "measurements": {
+    "input_len": 1024,
+    "batch": 1,
+    "baseline_eager_tp1_tok_s": 939.2,
+    "best_tp16_compiled_tok_s": 20470.0,
+    "best_mfu_percent": 14.17,
+    "top1_agreement_vs_eager": "16/16",
+    "sol_violation": false,
+    "gate": "TRN_OPT_GDN_MATMUL_INV=1 (PR#176 matmul-only GDN inverse) + qwen3_next_rewrites; top1 100% vs eager baseline"
+  },
   "verified": "verified",
   "instance_type": "trn2.48xlarge",
-  "generated_at": "2026-08-30T16:04:17Z"
+  "generated_at": "2026-08-31T19:19:44Z"
 }
