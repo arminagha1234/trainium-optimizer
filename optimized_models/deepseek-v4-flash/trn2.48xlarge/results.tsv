@@ -1,2 +1,2 @@
 commit	stage	origin	metric	correctness	status	description
-verified	best	on-device-static-moe	0.02897	0.9808	verified	DeepSeek-V4-Flash 43L on-device eager, argmax 671, prefill 310.7s, MoE on-device 77%
+verified	best	bf16-resident-ep-decode	0.2948	671	verified	DeepSeek-V4-Flash 43L KV-cached decode, world=64 pure-EP, all-bf16-resident, 3.393s/step, argmax 671, 11.4x vs per-call-dequant
