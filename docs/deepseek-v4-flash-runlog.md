@@ -108,3 +108,26 @@ accuracy gate on real weights.
 
 Next: P4 — static shapes + `torch.compile(backend="neuron", dynamic=False)` on the shrunk config,
 with the router as iterative-argmax + fixed-capacity (Stage B) dispatch.
+
+## P3 — Component equivalence harness — GATE: PASS
+
+Two layers, per the runbook:
+- **Operational device ladder** (`implementation/src/deepseek_v4/p2_device.py`): re-runnable after
+  any change; returns nonzero on failure; emits the bottom-up per-component drill + the all-hash
+  math gate. This is what gets run on-device after each P4/P5 change.
+- **CPU CI checks** (`implementation/src/deepseek_v4/test_p3_components.py`): checkpoint-independent
+  (the public config.json is vendored as `deepseek_v4/v4_flash_config.json`, so no 160 GB download),
+  runnable in CI:
+  1. reference is finite and byte-reproducible;
+  2. **HyperConnection `comb` is doubly-stochastic** (row & column sums ≈ 1) — directly guards
+     against runbook Critical Bug #1 (row-softmax-only / missing column normalization). Measured:
+     column sums exact to 1.0, row sums within 1.1e-2 (converged Sinkhorn at 20 iters);
+  3. all 10 section-8 component classes are present in the module tree.
+
+Refactor: `build_shrunk_config` now builds from the vendored `v4_flash_config.json` (was loading
+the FSX-cached config), making P1-P3 truly checkpoint-independent and CI-runnable. Verified on the
+local venv (transformers 5.16.1, torch 2.13, CPU): 3/3 P3 tests pass.
+
+Next: P4 — `torch.compile(backend="neuron", dynamic=False)` on the shrunk config; the router must
+move to iterative-argmax + fixed-capacity (Stage B) dispatch since `torch.topk` + dynamic MoE
+shapes are the runbook's flagged compile hazards.
