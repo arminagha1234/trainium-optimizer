@@ -409,3 +409,32 @@ def test_world_one_recomputes_inv_freq_not_leaves_it_meta(tmp_path):
     inv = dict(m.named_buffers())["model.rotary_emb.inv_freq"]
     assert not inv.is_meta
     assert torch.equal(inv, base.model.rotary_emb.inv_freq)
+
+
+def test_remap_vl_text_keys_maps_language_model_and_drops_vision():
+    """Vision-language MoE checkpoints nest the text tower under
+    model.language_model.* and carry a model.visual.* tower. remap_vl_text_keys
+    rebases the text keys onto the CausalLM key space and drops vision."""
+    from backends.shard_stream import remap_vl_text_keys
+    vl = {
+        "model.language_model.embed_tokens.weight": 1,
+        "model.language_model.layers.0.mlp.experts.gate_up_proj": 2,
+        "model.visual.blocks.0.attn.qkv.weight": 3,
+        "lm_head.weight": 5,
+    }
+    out = remap_vl_text_keys(vl)
+    assert "model.embed_tokens.weight" in out
+    assert "model.layers.0.mlp.experts.gate_up_proj" in out
+    assert "lm_head.weight" in out
+    assert not any("visual" in k for k in out)
+    assert not any("language_model" in k for k in out)
+    assert len(out) == 3
+
+
+def test_remap_vl_text_keys_is_noop_for_text_native():
+    """A text-native checkpoint (no language_model. prefix) is returned unchanged."""
+    from backends.shard_stream import remap_vl_text_keys
+    native = {"model.embed_tokens.weight": 1,
+              "model.layers.0.self_attn.q_proj.weight": 2,
+              "lm_head.weight": 3}
+    assert remap_vl_text_keys(native) == native
