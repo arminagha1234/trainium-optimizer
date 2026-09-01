@@ -223,7 +223,8 @@ def estimate_params(config: dict[str, Any]) -> tuple[int, dict[str, Any]]:
 
     vocab = _int(tc, "vocab_size", 151936)
     inter = _int(tc, "intermediate_size", 4 * h)
-    n_exp = _int(tc, "num_experts") or _int(tc, "n_routed_experts")
+    n_exp = (_int(tc, "num_experts") or _int(tc, "n_routed_experts")
+             or _int(tc, "num_local_experts"))
     n_shared = _int(tc, "n_shared_experts") or _int(tc, "num_shared_experts")
     moe_inter = _int(tc, "moe_intermediate_size", inter)
 

@@ -574,3 +574,18 @@ def test_powers_of_two_models_are_unchanged():
 def test_the_gemma4_hard_cap_still_binds():
     cfg = _dense(h=4096, L=48, heads=32, arch="Gemma4ForConditionalGeneration")
     assert max_clean_tp(cfg, TRN2_48XLARGE) == 4
+
+
+def test_num_local_experts_counted_as_moe():
+    """Qwen3-MoE configs serialize the expert count as `num_local_experts`
+    (Mixtral-style) through `to_dict`, not `num_experts`. estimate_params must
+    still count it as MoE -- else a 30B MoE is sized as a ~3B dense model and the
+    baseline chooser puts a 60GB model on one core (tp=1) and OOMs."""
+    from capability import estimate_params
+    cfg = dict(hidden_size=2048, num_hidden_layers=48, vocab_size=151936,
+               intermediate_size=6144, moe_intermediate_size=768,
+               num_local_experts=128, num_experts_per_tok=8)
+    params, bd = estimate_params(cfg)
+    assert bd["is_moe"] is True
+    assert bd["num_experts"] == 128
+    assert params > 25e9  # ~30B, not the ~3B dense misread

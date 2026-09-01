@@ -39,7 +39,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-__all__ = ["Slice", "slice_for", "expert_range", "kv_range", "unrecognised"]
+__all__ = ["Slice", "slice_for", "expert_range", "kv_range", "unrecognised", "remap_vl_text_keys"]
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,27 @@ class Slice:
 
 
 _LAYER = re.compile(r"\.layers\.(\d+)\.")
+
+
+def remap_vl_text_keys(streamed: dict) -> dict:
+    """Remap a VL-wrapped checkpoint's tensors onto the text CausalLM key space.
+    Vision-language MoE checkpoints (e.g. Qwen3.5-MoE, which ships as a
+    ``*ForConditionalGeneration``) namespace the text tower under
+    ``model.language_model.`` and carry a ``model.visual.`` vision tower. The
+    meta CausalLM that shard-on-read builds expects ``model.<...>`` and has no
+    vision tower, so ``model.language_model.<x>`` -> ``model.<x>`` and vision keys
+    are dropped. No-op (returns the input) for an already text-native checkpoint,
+    so text models are untouched. Pure/torch-free, hence unit-testable; a wrong
+    result is still caught downstream by the no-meta-tensor guard in
+    ``load_ep_sharded`` (a mismapped key leaves a param on meta and RAISES)."""
+    if not any(".language_model." in n for n in streamed):
+        return streamed
+    out = {}
+    for n, t in streamed.items():
+        if ".visual." in n or "vision_model" in n or n.startswith("visual."):
+            continue
+        out[n.replace("model.language_model.", "model.", 1)] = t
+    return out
 
 
 def expert_range(num_experts: int, rank: int, world: int) -> tuple[int, int]:
@@ -271,6 +292,14 @@ def load_ep_sharded(model_id, files, cfg, rank, world, *, dtype=None,
 
     streamed = dict(stream_shard(files, cfg, rank, world,
                                  experts_only=True, log=log))
+    # VL-wrapped checkpoints (Qwen3.5-MoE ships as *ForConditionalGeneration)
+    # namespace the text tower under `model.language_model.`; remap it onto the
+    # text CausalLM key space and drop the vision tower. A wrong remap leaves
+    # params on meta -> the guard below RAISES, never silently ships mismapped weights.
+    _pre = len(streamed)
+    streamed = remap_vl_text_keys(streamed)
+    if log and len(streamed) != _pre:
+        log(f"shard-on-read: VL-wrapped -> remapped {len(streamed)}/{_pre} text keys, dropped vision")
 
     swapped = 0
     if world > 1 and n_exp:

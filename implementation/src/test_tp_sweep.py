@@ -131,3 +131,27 @@ def test_an_unknown_head_count_falls_back_to_the_power_of_two_ladder():
 def test_cap_is_at_least_one():
     assert tp_cap_for("X", 0, None, 0) == 1
     assert tp_candidates(24, 1) == [1]
+
+
+def test_skip_tp_env_removes_degenerate_world_sizes(monkeypatch):
+    """TRN_OPT_SKIP_TP excludes world sizes the box's NeuronLink topology cannot
+    form. On a trn2.48xlarge tp=8 spans exactly 2 devices and fails the collective
+    barrier, while tp=16 forms a valid 4-device ring -- so an operator skips 8.
+    Opt-in: unset leaves the ladder unchanged (default behaviour is preserved)."""
+    monkeypatch.delenv("TRN_OPT_SKIP_TP", raising=False)
+    assert tp_candidates(16, 16) == [1, 2, 4, 8, 16]
+    monkeypatch.setenv("TRN_OPT_SKIP_TP", "8")
+    assert tp_candidates(16, 16) == [1, 2, 4, 16]
+    assert tp_candidates(32, 32) == [1, 2, 4, 16, 32]
+    monkeypatch.setenv("TRN_OPT_SKIP_TP", "8,32")
+    assert tp_candidates(32, 32) == [1, 2, 4, 16]
+
+
+def test_max_tp_env_caps_the_degree(monkeypatch):
+    """TRN_OPT_MAX_TP caps the max TP for a memory- or topology-constrained box.
+    Opt-in: unset preserves the head/lvh/core-derived cap."""
+    monkeypatch.delenv("TRN_OPT_MAX_TP", raising=False)
+    assert tp_cap_for("X", 32, None, 64) == 32
+    monkeypatch.setenv("TRN_OPT_MAX_TP", "4")
+    assert tp_cap_for("X", 32, None, 64) == 4
+    assert tp_candidates(32, tp_cap_for("X", 32, None, 64)) == [1, 2, 4]

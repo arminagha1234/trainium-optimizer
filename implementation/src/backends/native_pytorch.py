@@ -242,7 +242,11 @@ def tp_cap_for(archs: str, heads: int | None, linear_value_heads: int | None,
     cap = 4 if "Gemma4" in archs else (heads or 64)
     if linear_value_heads:
         cap = min(cap, linear_value_heads)
-    return max(1, min(int(cap), int(core_count)))
+    cap = min(int(cap), int(core_count))
+    _mt = os.environ.get("TRN_OPT_MAX_TP")
+    if _mt and _mt.isdigit():
+        cap = min(cap, int(_mt))
+    return max(1, cap)
 
 
 def tp_candidates(heads: int | None, cap: int) -> list[int]:
@@ -283,7 +287,8 @@ def tp_candidates(heads: int | None, cap: int) -> list[int]:
     Falls back to the bare ladder when the head count is unknown, since without it
     there is nothing to divide.
     """
-    ladder = (1, 2, 4, 8, 16, 32, 64)
+    _skip = {int(x) for x in os.environ.get('TRN_OPT_SKIP_TP','').split(',') if x.strip().isdigit()}
+    ladder = tuple(t for t in (1, 2, 4, 8, 16, 32, 64) if t not in _skip)
     if not heads:
         return [t for t in ladder if t <= cap]
     return [t for t in ladder if t <= cap and heads % t == 0]
@@ -462,7 +467,10 @@ class NativePyTorchBackend:
         # 24GB per NeuronCore -> keep weights under ~10GB/rank so there is room
         # for activations + compiler scratch. tp only needs to divide the query
         # heads; the worker's GQA->MHA adapter expands K/V when kv<tp.
+        _skip = {int(x) for x in os.environ.get('TRN_OPT_SKIP_TP','').split(',') if x.strip().isdigit()}
         for tp in (1, 2, 4, 8, 16, 32, 64):
+            if tp in _skip:
+                continue
             if tp <= max_tp and heads % tp == 0:
                 best = tp
                 if weight_gb / tp < 10:
