@@ -69,3 +69,42 @@ Next: P2 — move each captured component to the neuron device (eager), compare 
 oracle bottom-up (RMSNorm → RoPE → HC Sinkhorn → HC pre/post → router → expert SwiGLU →
 attention → full layer → full model), MoE Stage A (dense all-experts). Gate: final logits
 cos ≥ 0.99; per-component tolerances per runbook §8.
+
+## P2 — Single-core eager device equivalence — GATE: PASS (device math), routing-conditioning characterized
+
+Rebuilt the identical shrunk model on `torch.device("neuron")` in BF16 and compared to the
+P1 FP32 oracle. Harness: `implementation/src/deepseek_v4/p2_device.py`.
+
+Device compute facts (both are hard constraints, discovered here):
+- The MoE expert path lowers to torch_neuronx's `grouped_mm`, which requires (a) the token
+  dimension **divisible by 128** (seq=32 → `ValueError: t must be divisible by 128`; seq=128
+  works) and (b) **BF16** inputs (`grouped_mm` has no FP32 path). So the device forward is BF16
+  end-to-end — consistent with runbook §1.2 (compute is BF16; quantization is storage-only).
+  The oracle was regenerated at seq=128.
+
+Results:
+- **ALL-HASH control (deterministic routing): final logits cos = 0.999660** → **all device math
+  is correct**. Bottom-up, every non-router component matches the oracle at cos ≥ 0.999 through
+  the early layers: RoPE (cos/sin), RMSNorm / UnweightedRMSNorm, HyperConnection (Sinkhorn),
+  MLA attention, the grouped low-rank O projection (`o_a_proj`/`o_b_proj`), grouped experts, the
+  shared expert, and the hyper-head. The 0.9997 residual is pure BF16 quantization.
+- **MIXED (learned TopKRouter): final logits cos = 0.758** — diverges **solely** from learned
+  top-k **selection flips under BF16 on random weights**. This is a random-weight *conditioning*
+  artifact, not a bug, proven three ways: (1) the hash-routed layer-0 experts match at cos ≥
+  0.999; (2) the router *scores* match at cos ≥ 0.999 (only the argmax selection flips); (3)
+  upcasting the entire routing decision to FP32 barely moved it (0.758 → 0.760), i.e. the flips
+  are driven by the BF16-drifted *input* into an ill-conditioned near-uniform router, not by
+  scoring precision. Trained weights have well-separated winners, so this does not occur on the
+  real checkpoint; it is validated there by the P8 top-1 / KL gate, not by a random-weight cos.
+
+Router internals (transformers `DeepseekV4TopKRouter`): `logits = F.linear(flat, weight)` →
+`sqrtsoftplus` → `torch.topk(scores + e_score_correction_bias, top_k)`. Confirms open-question
+#3: `noaux_tc` == sqrtsoftplus scoring + bias-corrected top-k (bias = 0 in the untrained shrunk
+config). Two items this hands to P4: (i) `torch.topk` compiles in eager but the runbook flags it
+as failing under `torch.compile` on this model → swap to **iterative argmax**; (ii) the native
+router does **not** upcast to FP32 (runbook §4.2 pseudocode does) and the eager `DeepseekV4Experts`
+loop accumulates in BF16 (runbook §4.6 wants FP32 MoE accumulation) — both matter for the P8
+accuracy gate on real weights.
+
+Next: P4 — static shapes + `torch.compile(backend="neuron", dynamic=False)` on the shrunk config,
+with the router as iterative-argmax + fixed-capacity (Stage B) dispatch.
