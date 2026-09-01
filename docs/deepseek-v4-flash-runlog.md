@@ -200,3 +200,35 @@ matching the P0 budget) in addition to this MLA-TP.
 
 Next: P6 — loader on the shrunk config with synthetic FP8+FP4 quantized weights (per-expert
 `slice_for`, shard-on-read host-RSS bound).
+
+## P6 — FP8/FP4 loader numerics + expert-parallel slice — GATE: PASS (dequant), EP loader designed
+
+`implementation/src/deepseek_v4/dequant.py` + `test_p6_dequant.py` (CPU, CI-safe):
+- **FP8 e4m3 + ue8m0 128x128 block-scale** dequant round-trip: cos 0.99965, rel_rms 0.027.
+- **FP4 e2m1** (routed-expert dtype) dequant round-trip: cos 0.98848, rel_rms 0.15 (4-bit is coarse).
+  Max-relative-error is the wrong metric for block quant (a tiny value in a high-dynamic-range
+  block flushes below the grid min -> ~1.0); cos / rel_rms are the right measures.
+- `expert_shard_range` / `slice_experts`: expert-parallel loader sharding (256 experts / 64 = 4/rank,
+  disjoint+covering), the loader side of EP.
+
+Research (code.amazon.com, via a dispatched agent) that reshapes P7-P9:
+- **GOLDENS** (flash/golden/, captured on 8xH100): true golden argmax = **51119 ("Paris")** at the
+  9-token prompt; golden_logits.npy [9,129280] + golden_ops.pt per-op i/o (CSA L2, HCA L3, MoE L2).
+  Prior trn2 pure-torch port: argmax **671**, cos **0.9808** vs golden -- RESOLVED as compounded
+  fp8/fp4 dequant quant-noise (per-op cos 0.99997+, ^86 ops), NOT a bug. Bit-exact argmax (51119)
+  needs bit-exact FP4/FP8 NKI kernels.
+- **MoE torch-gather deadlocks the Neuron runtime at 43L** (data-dependent torch.where/x[idx], 0% CPU
+  hang) -> prior work ran MoE on CPU. **Our P4 Stage-A dense experts (no gather, no data-dependent
+  shapes) is the on-device fix** and it compiles (P4).
+- **Reusable EP**: NeuronAutoFixerAIM DeltaNet `_ep_moe_forward` / `shard_moe_expert_parallel` (native
+  PyTorch: replicated router, local experts range, all_reduce, shared-expert-AFTER; CPU-validated
+  sum(partials)==dense to 1.1e-7); Pumice `qwen3_moe/model_bf16.py` two-group `enable_expert_parallel`;
+  ElementalStarfishVLLM round-robin expert_map (i%ep==rank). Real-model config = **pure-EP world=32**
+  (attention replicated, experts sharded) per FULLBOX_TP_EP plan.
+- **FP4 top lever (L1)**: keep FP4 in HBM, dequant in SBUF. Blocked on `tensor_scalar_bitvec` dst!=src
+  MLIR verify (ISA requires in==out dtype in {INT32,UINT32,UINT16,UINT8}); fix = keep bit-ops in uint8,
+  widen AFTER. Or use nkilib `dequantize_mxfp4` (GpSIMD). Batched MoE kernel `moe_block_tkg` over
+  stacked [E,H,2,I]/[E,I,H] = both the perf path and the fragmentation (status=4) fix.
+
+Next: P7 real 43L forward on-device via pure-EP world=32 with Stage-A dense experts (on-device MoE,
+no gather), validate vs golden (671 functional / 51119 bit-exact), then benchmark (P9) and publish.
