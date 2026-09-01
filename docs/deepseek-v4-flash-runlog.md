@@ -232,3 +232,34 @@ Research (code.amazon.com, via a dispatched agent) that reshapes P7-P9:
 
 Next: P7 real 43L forward on-device via pure-EP world=32 with Stage-A dense experts (on-device MoE,
 no gather), validate vs golden (671 functional / 51119 bit-exact), then benchmark (P9) and publish.
+
+## Ground-truth math verification vs the checkpoint's `inference/model.py` (+ P8 FP32 prep)
+
+Read the checkpoint's own `inference/model.py` (829 lines, on FSX) — the authoritative reference
+the P5 8xH100 goldens were captured from. Verified our transformers-native components match it
+**structurally** (so our path is faithful, not one of the tensor-name reconstructions that were
+materially wrong):
+- **MLA**: `wq_a -> q_norm -> wq_b -> per-head RMSNorm -> RoPE on the trailing rope_head_dim`;
+  `wkv` single latent (num_key_value_heads=1) + `kv_norm` + RoPE; **sink is denominator-only**
+  (`sparse_attn(q,kv,attn_sink,...)`, no value contribution); grouped-O
+  `einsum("bsgd,grd->bsgr")` with `wo_b` RowParallel. Matches transformers `DeepseekV4Attention`.
+- **Router** (`Gate`): `linear(x.float(), weight.float())` (**FP32**) -> `softplus(x).sqrt()`
+  (sqrtsoftplus) -> **bias added for top-k SELECTION only** -> `original_scores.gather(indices)`
+  -> renorm (since not softmax) -> `*route_scale`; hash `tid2eid` for the first n_hash layers.
+  Matches transformers `DeepseekV4TopKRouter`. Resolves open-q #3 (noaux_tc == this).
+- **Expert**: `gate=w1(x).float()`, `up=w3(x).float()` (**FP32**), swiglu clamp (gate max, up ±limit),
+  `silu(gate)*up`, `w2`. **MoE** `y=zeros(float32)`, per-local-expert `torch.where(indices==i)`
+  gather, `all_reduce(y)`, **shared expert AFTER** the all-reduce. This is the EP pattern.
+
+Five confirmations that de-risk P7-P9:
+1. Our transformers path is math-faithful to the reference (no reconstruction error).
+2. The reference computes **routing + expert + accumulation in FP32** -> aligned
+   `compile_patches.py` (stage_a experts + iter-argmax router) to FP32. **Device re-validated**:
+   still compiles at 2 batch sizes, cos-vs-eager 0.9961/0.9914 (slightly better than the BF16
+   version's 0.9937/0.9908). This is the P8 accuracy-precision the golden needs.
+3. `n_local_groups = n_groups // world_size` is the `o_groups=8` TP cap (dies at world>=16) —
+   our MLA-TP (all-gather heads + replicated O) sidesteps it.
+4. The MoE `torch.where(indices==i)` gather is the data-dependent dispatch that **deadlocks the
+   Neuron runtime at 43L** — our Stage-A dense experts avoids it and compiles.
+5. Reference FP8-simulates KV non-rope dims (`act_quant(kv[...,:-rd])`, QAT); transformers omits
+   this — a minor bit-exact detail to add for exact-argmax (51119) parity.

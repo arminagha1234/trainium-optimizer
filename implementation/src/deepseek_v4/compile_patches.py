@@ -22,30 +22,36 @@ import torch.nn.functional as F
 
 def stage_a_experts_forward(self, hidden_states, top_k_index, top_k_weights):
     """Dense MoE experts, unrolled over E (compile-time constant). No grouped_mm
-    top-k, no data-dependent shapes, no token dropping (=> drop count is zero).
+    top-k, no data-dependent shapes, no token dropping (=> drop count is zero),
+    and no torch.where gather (which deadlocks the Neuron runtime at 43L).
 
-    NOTE (P8): the accumulator is BF16 here (matches what was validated at P4).
-    Runbook 4.6 recommends FP32 MoE accumulation for real-weight accuracy; switch
-    `final` to float32 and cast back at P8, re-validating the compile.
+    Precision matches the checkpoint's inference/model.py Expert/MoE: gate/up and
+    the SiLU run in FP32, and the cross-expert accumulator is FP32 (`y` is
+    float32 in the reference). Verified structurally against inference/model.py.
     """
     T, H = hidden_states.shape
-    w = top_k_weights.to(hidden_states.dtype)
-    final = torch.zeros(T, H, dtype=hidden_states.dtype, device=hidden_states.device)
+    limit = self.limit
+    w = top_k_weights.float()
+    final = torch.zeros(T, H, dtype=torch.float32, device=hidden_states.device)   # FP32 accum (ref)
     for e in range(self.num_experts):                               # E compile-time const
-        we = (w * (top_k_index == e)).sum(dim=1, keepdim=True)      # [T,1]
-        ge = self._apply_gate(F.linear(hidden_states, self.gate_up_proj[e]))  # [T,I]
-        oe = F.linear(ge, self.down_proj[e])                        # [T,H]
+        we = (w * (top_k_index == e)).sum(dim=1, keepdim=True)      # [T,1] fp32
+        gu = F.linear(hidden_states, self.gate_up_proj[e]).float()  # [T,2I] -> fp32
+        gate, up = gu.chunk(2, dim=-1)
+        gate = gate.clamp(max=limit)                                # swiglu_limit (routed only)
+        up = up.clamp(min=-limit, max=limit)
+        inter = F.silu(gate) * up                                   # fp32 SiLU (ref)
+        oe = F.linear(inter.to(hidden_states.dtype), self.down_proj[e]).float()
         final = final + we * oe
-    return final
+    return final.to(hidden_states.dtype)
 
 
 def iter_argmax_router_forward(self, hidden_states):
     """Learned top-k router via iterative argmax instead of torch.topk (which
     lowers to AwsNeuronTopK and fails to compile). Selection matches torch.topk."""
     flat = hidden_states.reshape(-1, self.hidden_dim)
-    logits = F.linear(flat, self.weight)
-    scores = self.score_fn(logits)
-    biased = scores + self.e_score_correction_bias
+    logits = F.linear(flat.float(), self.weight.float())            # FP32 routing (ref)
+    scores = self.score_fn(logits)                                  # sqrtsoftplus in fp32
+    biased = scores + self.e_score_correction_bias.float()
     neg = torch.finfo(biased.dtype).min
     masked = biased
     picks = []
@@ -56,7 +62,8 @@ def iter_argmax_router_forward(self, hidden_states):
     indices = torch.cat(picks, dim=1)                               # [T,k]
     weights = scores.gather(1, indices)
     weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
-    return logits, weights * self.routed_scaling_factor, indices
+    dt = hidden_states.dtype
+    return logits.to(dt), (weights * self.routed_scaling_factor).to(dt), indices
 
 
 def apply_compile_patches(modeling_module=None):
