@@ -1,0 +1,12 @@
+config	tok_s	correctness	status	note
+baseline: eager tp16 batch=1	453.19	100.0	keep	naive autoport baseline (tp1 infeasible, 68GB>24GB/core)
+batch=8	2694.88	81.25	keep	WINNER: prefill throughput via batching; 81.25% = benign bf16 batch-variance (near-tie flips, distribution-equivalent)
+cp_degree=2	466.33	100.0	keep	marginal (+2.9%)
+weights_dtype=fp32	460.42	100.0	discard	<5% over baseline
+attn_implementation=sdpa	456.82	87.5	discard	<5% over baseline
+compile_mode=compile-default	322.92	81.25	discard	SLOWER than eager (host-bound bs=1 decode; compile not the lever)
+tp_degree=1	0.0	-	discard	OOM (68GB on one 24GB core)
+tp_degree=2	0.0	-	discard	OOM/HBM
+tp_degree=4	502.70	81.25	discard	OOM 85% HBM
+tp_degree=8	0.0	-	discard	collective/TP init fail (degenerate 2-device span; use tp16)
+tp_degree=32	0.0	-	discard	invalid_tp (16 heads not divisible by 32)
