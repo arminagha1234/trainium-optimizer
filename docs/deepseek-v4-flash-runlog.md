@@ -286,3 +286,34 @@ on the board -- a FUNCTIONAL/latency milestone, not yet a throughput contender. 
 (documented, next): TP+EP=8 -> 59 s at 43L; FP4-in-kernel storage -> 3.72x (one MLIR
 `tensor_scalar_bitvec` verifier fix); MTP speculative decode ~1.8x. Also fixed `_fmt` in
 publish_deliverables to show sub-1 tok/s honestly (0.03) instead of a null-looking 0.
+
+---
+
+## 2026-09-01 (cycle 2): KV-cached decode — 11.4× via bf16-resident dequant
+
+**Result:** 43-layer KV-cached decode at world=64 pure-EP: median step **3.393 s → 0.295 tok/s**,
+argmax=671. Baseline (same config, only routed experts bf16; attention+shared fp4/fp8 per-call
+dequant): **38.6 s/step → 0.026 tok/s**. **11.38×**, clean same-world=64 A/B, self-measured on bigsweep2.
+
+**How we got there (all measured, not assumed):**
+- Fixed the world=64 launch: exit-137 was the launch not detaching from the kaizen session (fix:
+  `setsid nohup … </dev/null &`); a collective-barrier bootstrap failure was a stray `FI_PROVIDER=shm`
+  (drop it; use the canonical `NEURON_RT_NUM_CORES/TORCH_NEURONX_ENABLE_HOST_CC/…_ASYNC_NRT`).
+- Per-component decode breakdown (world=64, NL=4): attn 73 %, shared 17 %, all_reduce ~5 %, experts ~1 %.
+  Dense-only NL=2 gave attn 675 ms/layer → the **dense attention** dominated, and an isolated bf16
+  attention was only **8.9 ms** at world=64. The 675 ms was **per-call on-device fp4/fp8 dequant** of the
+  attention weights (only routed experts had been dequant-resident).
+- Fix: dequant **all** Linear weights → bf16 **once**, moved straight to device (host would otherwise OOM
+  from replicated-attention bf16 ×64 = 1729 GB). Kept the lm-head bf16 (skipped the fp32 cast) to fit HBM
+  (23.5 / 24 GB per core). 881 weight mats/rank.
+- Negative results worth keeping: (a) removing the MoE `.tolist()` per-layer host sync gave **no** speedup
+  (decode wasn't sync-bound); (b) a real-valued RoPE rewrite made eager **4× slower** (more ops → worse
+  under 64-way dispatch); (c) **batch>1 hurts in eager** (BATCH=8: step 3.4 s→35 s, aggregate 0.227<0.295).
+- Compile is feasible but was a *small* lever here: a compile-friendly MLA attention (real RoPE + mask-SDPA,
+  no fp8 sim, bf16 O-proj to avoid the `f32[8192,4096]` convert) **compiles on Neuron** (single-core 2.9×;
+  world=64 3.3× with `NEURONX_CACHE=on` + rank-0-first staggered warmup to dodge the 64-concurrent-compile
+  ECONNREFUSED). But after the dequant fix attention is ~9 ms/layer, so compiling it barely moves the total.
+
+**Path to 15 tok/s:** compiled decode (fuse per-layer ops so batching scales sublinearly) + attention TP
+(reclaim the replicated-attention HBM for large batch). Both proven feasible; the full-decode compile +
+batch integration is the remaining work.

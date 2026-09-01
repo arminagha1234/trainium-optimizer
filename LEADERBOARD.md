@@ -51,7 +51,7 @@ Every row is generated from a `recipe.json` in an existing bundle: no bundle, no
 | 41 | Qwen3.5-0.8B | qwen3.5 | 0.8B | **1,143** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-0-8b/trn2.48xlarge/) |
 | 42 | Qwen3.5-2B | qwen3.5 | 2B | **1,129** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-2b/trn2.48xlarge/) |
 | 43 | Qwen3.8-27B | qwen3.8 | 27B | **343** | TP=8, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-8-27b/trn2.48xlarge/) |
-| 44 | DeepSeek-V4-Flash | deepseek | 284B | **0.03** | TP=1, fp4_experts+fp8_rest->bf16 (dequant on-device), batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/deepseek-v4-flash/trn2.48xlarge/) |
+| 44 | DeepSeek-V4-Flash | deepseek | 284B | **0.29** | TP=1, EP=64, bf16-resident (all Linears dequant-once), batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/deepseek-v4-flash/trn2.48xlarge/) |
 
 44 verified result(s) across 44 model(s) and 2 hardware target(s). Throughput is the prefill tok/s measured on real hardware at the recipe's probe shape. Absolute throughput is comparable across rows on the same hardware target.
 
@@ -75,6 +75,7 @@ The same verified results, ranked by speedup over the **eager** baseline on the 
 | SmolLM2-360M-Instruct | — | 3,661 | **48,064** | **13.13×** | (config-only) | trn2.3xlarge |
 | SmolLM2-1.7B-Instruct | 1.7B | 3,911 | **50,650** | **12.95×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge |
 | Qwen2.5-3B-Instruct | 3B | 2,856 | **35,343** | **12.375×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge |
+| DeepSeek-V4-Flash | 284B | 0.03 | **0.29** | **11.38×** | TP=1, EP=64, bf16-resident (all Linears dequant-once), batch=1 | trn2.48xlarge |
 | TinyLlama-1.1B-Chat-v1.0 | 1.1B | 4,355 | **48,108** | **11.048×** | torch.compile(neuron) | trn2.3xlarge |
 | gpt2-medium | — | 6,083 | **61,158** | **10.055×** | (config-only) | trn2.3xlarge |
 | bloom-1b7 | — | 2,556 | **24,852** | **9.723×** | (config-only) | trn2.3xlarge |
@@ -100,7 +101,6 @@ The same verified results, ranked by speedup over the **eager** baseline on the 
 | phi-2 | — | 4,176 | **9,841** | **2.357×** | (config-only) | trn2.3xlarge |
 | stablelm-3b-4e1t | 3B | 3,393 | **7,721** | **2.275×** | (config-only) | trn2.3xlarge |
 | pythia-2.8b | 2.8B | 3,108 | **6,450** | **2.076×** | (config-only) | trn2.3xlarge |
-| DeepSeek-V4-Flash | 284B | 0.02 | **0.03** | **1.433×** | TP=1, fp4_experts+fp8_rest->bf16 (dequant on-device), batch=1 | trn2.48xlarge |
 | SmolLM2-1.7B | 1.7B | 10,573 | **14,460** | **1.368×** | (config-only) | trn2.3xlarge |
 | Qwen3.5-2B | 2B | 1,071 | **1,129** | **1.054×** | TP=4, bf16, batch=1 | trn2.48xlarge |
 | Qwen3.5-0.8B | 0.8B | 1,093 | **1,143** | **1.045×** | TP=4, bf16, batch=1 | trn2.48xlarge |
