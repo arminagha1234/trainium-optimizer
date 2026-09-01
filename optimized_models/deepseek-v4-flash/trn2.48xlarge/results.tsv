@@ -1,0 +1,2 @@
+commit	stage	origin	metric	correctness	status	description
+verified	best	on-device-static-moe	0.02897	0.9808	verified	DeepSeek-V4-Flash 43L on-device eager, argmax 671, prefill 310.7s, MoE on-device 77%
