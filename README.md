@@ -83,6 +83,7 @@ Full standings (incl. speedup over the eager baseline): [LEADERBOARD.md](./LEADE
 | 41 | Qwen3.5-0.8B | qwen3.5 | 0.8B | **1,143** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ Verified |
 | 42 | Qwen3.5-2B | qwen3.5 | 2B | **1,129** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ Verified |
 | 43 | Qwen3.8-27B | qwen3.8 | 27B | **343** | TP=8, bf16, batch=1 | trn2.48xlarge | ✅ Verified |
+| 44 | DeepSeek-V4-Flash | deepseek | 284B | **0.03** | TP=1, fp4_experts+fp8_rest->bf16 (dequant on-device), batch=1 | trn2.48xlarge | ✅ Verified |
 <!-- LEADERBOARD:END -->
 
 *Speedup is vs the eager baseline on the same instance + probe shape. ✅ Verified

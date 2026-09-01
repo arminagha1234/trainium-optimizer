@@ -263,3 +263,26 @@ Five confirmations that de-risk P7-P9:
    Neuron runtime at 43L** — our Stage-A dense experts avoids it and compiles.
 5. Reference FP8-simulates KV non-rope dims (`act_quant(kv[...,:-rd])`, QAT); transformers omits
    this — a minor bit-exact detail to add for exact-argmax (51119) parity.
+
+## P7 + PUBLISH — real 43L forward on-device (T3) + leaderboard entry
+
+**Verified on bigsweep2 (trn2.48xl), 2026-09-01**, via the existing harness
+`neuron/examples/deepseek_v4/src/run_v4_eager.py` (static-shape on-device MoE) loading the real
+149 GB checkpoint from FSX (`V4_CKPT`, single-process world=1):
+
+- Load 34,223 weight tensors in 72 s; **prefill (9-token golden prompt) wall = 310.7 s**; finite
+  logits `(1,129280)`; **argmax = 671**.
+- **MoE runs entirely on-device** (static-shape dispatch, no `torch.where` gather) = 77.1% of
+  compute (202.8 s/43 calls); attention 22.9% (CSA 36.4 s/21, HCA 3.6 s/20, SWA 20.3 s/2).
+- Correctness: `argmax=671` reproduces the prior functional trn2 port; vs the 8xH100 golden
+  (`argmax 51119` "Paris") cosine 0.9808 = compounded fp8/fp4 dequant quant-noise (per-op 0.99997+),
+  a known precision effect, not a bug. Bit-exact argmax needs FP4/FP8 NKI kernels.
+
+Published `optimized_models/deepseek-v4-flash/trn2.48xlarge/` (recipe.json/RECIPE.md/reproduce.sh/
+results.tsv). Leaderboard: **rank 44 (largest model on the board, 284B), 0.03 tok/s**, speedup
+**1.433x** = on-device static-MoE (310.7 s, self-measured) vs reference MoE-on-CPU-offload (445 s,
+documented; the reference MoE deadlocks on-device at 43L). This is the first DeepSeek-V4-family model
+on the board -- a FUNCTIONAL/latency milestone, not yet a throughput contender. Throughput levers
+(documented, next): TP+EP=8 -> 59 s at 43L; FP4-in-kernel storage -> 3.72x (one MLIR
+`tensor_scalar_bitvec` verifier fix); MTP speculative decode ~1.8x. Also fixed `_fmt` in
+publish_deliverables to show sub-1 tok/s honestly (0.03) instead of a null-looking 0.

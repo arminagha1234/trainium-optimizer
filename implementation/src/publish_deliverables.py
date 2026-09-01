@@ -350,6 +350,11 @@ def _rank_label(i: int) -> str:
 
 
 def _fmt(n: float) -> str:
+    # Sub-1 throughputs (e.g. a very large model at single-process eager) are real
+    # but round to 0 under integer formatting, which reads as a broken/null entry.
+    # Show 2 decimals for 0 < n < 1 so such entries display honestly.
+    if 0 < n < 1:
+        return f"{n:.2f}"
     return f"{n:,.0f}"
 
 
