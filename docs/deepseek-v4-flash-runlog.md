@@ -164,3 +164,39 @@ is too large to partition); P7's first real forward can run the native grouped_m
 FP32 MoE accumulation (runbook §4.6) is deferred to P8 (accuracy) with re-validation.
 
 Next: P5 — TP ladder (tp=2→8→32→64) on the shrunk config; compare rank-0 logits vs tp=1.
+
+## P5 — TP ladder on the shrunk config — GATE: PASS (MLA-TP validated at tp=16/32/64)
+
+transformers 5.15 has **no TP plan** for DeepseekV4 (`_tp_plan=None`; `from_pretrained` has no
+`tp_plan` arg), so TP uses **manual sharding** like the framework's `qwen38_tp`. But MLA has
+`num_key_value_heads=1` (one shared low-rank latent KV), so GQA-style head-sharding slices the KV
+head to zero width — **this is the root cause of the DeepSeek-V2-Lite crash**
+("size of tensor a (4) must match tensor b (16)"/"...(0)").
+
+Correct MLA TP (`implementation/src/deepseek_v4/tp_mla.py`): shard the **query** heads
+(`q_b_proj` rows + per-head `sinks`), **replicate** the shared latent KV / norms / grouped-O, and
+**all-gather** the per-rank attention output across ranks before the (replicated) O projection.
+
+Results (shrunk all-hash config, rank-0 logits vs the tp=1 reference):
+
+| tp | cos vs tp=1 | verdict |
+|--:|--:|:--|
+| 16 | 0.999962 | PASS |
+| 32 | 0.999962 | PASS |
+| **64** | **0.999962** | **PASS (primary target)** |
+
+tp=2 and tp=8 are degenerate world sizes on this trn2.48xl at LNC=2 (P0), so the working ladder is
+16→32→64 — which covers both user targets. **GATE PASS.**
+
+Ops note (rule #4): a killed multi-rank run leaves orphaned `elastic_agent`/`multiprocessing`
+spawn processes that wedge the next `init_process_group` (every subsequent torchrun died with
+SIGKILL/137 and no output). `pkill -9 -f torchrun` alone is insufficient; also kill
+`elastic_agent`/`multiprocessing`/`spawn_main` and settle ~15 s. (Also: `ada` creds are
+short-lived — refresh before long runs.)
+
+Scope for the real model (P7): experts are replicated here (the shrunk 8 fit per rank). The real
+256-expert model needs **expert parallelism** (EP, ~4 experts/rank at tp=64 → ~8.9 GB/rank,
+matching the P0 budget) in addition to this MLA-TP.
+
+Next: P6 — loader on the shrunk config with synthetic FP8+FP4 quantized weights (per-expert
+`slice_for`, shard-on-read host-RSS bound).
