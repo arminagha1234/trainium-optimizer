@@ -10,23 +10,24 @@ head_dim 512, 64 heads, q_lora/o_lora 1024, o_groups 8, hc_mult 4,
 moe_intermediate 2048). CSA is OFF: all layer_types = ``sliding_attention``
 (the compress_ratio-0 dense path), so the model is architecturally valid and
 exercises MLA + grouped-O + HyperConnections + MoE router + experts without the
-compressor/indexer. No device, no 160 GB checkpoint.
+compressor/indexer.
 
-Emits ``ref.pt``: per-component (input, output) boundaries + final logits, which
-the P2 device component-equivalence ladder compares against. The reference is
-byte-reproducible for a fixed seed (P1 gate), so P2 can re-instantiate the same
-weights on the neuron device by re-seeding rather than shipping a state_dict.
+The config is built from the vendored public ``v4_flash_config.json`` (the real
+checkpoint's config, ~1.7 KB), so P1-P6 need **no 160 GB checkpoint** and run in
+CI. Emits ``ref.pt``: per-component (input, output) boundaries + final logits for
+the P2 device ladder. Byte-reproducible for a fixed seed (P1 gate).
 
-All ``transformers`` imports are lazy (inside functions) so this module imports
-cleanly in environments without transformers 5.15 (e.g. the core CI venv).
+All ``transformers`` imports are lazy so this module imports without transformers.
 """
 import os
 import sys
+import json
 import argparse
 
 import torch
 
 MODEL_ID = "deepseek-ai/DeepSeek-V4-Flash"
+_CONFIG_JSON = os.path.join(os.path.dirname(__file__), "v4_flash_config.json")
 
 # nn.Module classes whose (input, output) boundaries form the correctness ladder.
 CAPTURE_CLASSES = {
@@ -39,25 +40,33 @@ CAPTURE_CLASSES = {
 
 
 def build_shrunk_config(num_layers=4, n_experts=8, experts_per_tok=2, n_hash=1,
-                        vocab=4096, max_pos=8192, model_id=MODEL_ID):
-    """Build the shrunk V4-Flash config from the real config (dense, CSA off)."""
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    os.environ.setdefault("HF_HOME", "/ustore/fsx/team_shared_rw/hf_cache_shared")
-    from transformers import AutoConfig
-    cfg = AutoConfig.from_pretrained(model_id)             # config only, offline, tiny
-    cfg.num_hidden_layers = num_layers
-    cfg.layer_types = ["sliding_attention"] * num_layers   # compress_ratio 0 => dense; CSA OFF
+                        vocab=4096, max_pos=8192, config_json=None):
+    """Shrunk V4-Flash config from the vendored public config.json (dense, CSA off).
+
+    Keeps real hidden/head/lora/hc/moe dims; shrinks depth, experts, vocab. Sets
+    ``compress_ratios`` all-zero so every layer folds to ``sliding_attention``
+    (dense) and drops the FP8/FP4 quantization_config (random-weight reference).
+    """
+    from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+    with open(config_json or _CONFIG_JSON) as f:
+        raw = json.load(f)
+    raw.pop("quantization_config", None)       # random-weight ref: storage-quant N/A
+    raw.pop("layer_types", None)               # recomputed from compress_ratios
+    raw.pop("mlp_layer_types", None)           # recomputed from num_hash_layers
     n_hash = min(n_hash, num_layers)
-    cfg.mlp_layer_types = ["hash_moe"] * n_hash + ["moe"] * (num_layers - n_hash)
-    cfg.n_routed_experts = n_experts
-    cfg.num_experts_per_tok = experts_per_tok
-    cfg.n_shared_experts = 1
-    cfg.vocab_size = vocab
-    cfg.max_position_embeddings = max_pos
-    cfg.num_nextn_predict_layers = 0
-    cfg.quantization_config = None                         # random-weight fp32 ref: storage-quant N/A
-    cfg.use_cache = False
-    return cfg
+    raw.update(dict(
+        num_hidden_layers=num_layers,
+        compress_ratios=[0] * num_layers,      # legacy -> all sliding_attention (CSA off)
+        num_hash_layers=n_hash,
+        n_routed_experts=n_experts,
+        num_experts_per_tok=experts_per_tok,
+        n_shared_experts=1,
+        vocab_size=vocab,
+        max_position_embeddings=max_pos,
+        num_nextn_predict_layers=0,
+        use_cache=False,
+    ))
+    return DeepseekV4Config(**raw)
 
 
 def _to_cpu(x):
@@ -106,7 +115,7 @@ def main():
     ap = argparse.ArgumentParser(description="Generate the P1 CPU FP32 reference oracle.")
     ap.add_argument("--out", default="/tmp/v4ref")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--seq", type=int, default=32)
+    ap.add_argument("--seq", type=int, default=128)
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--experts", type=int, default=8)
     args = ap.parse_args()
@@ -137,8 +146,7 @@ def main():
     payload = {"input_ids": ids, "logits": logits1, "components": cap,
                "config": cfg.to_dict(), "seed": args.seed, "seq": args.seq}
     torch.save(payload, os.path.join(args.out, "ref.pt"))
-    sz = os.path.getsize(os.path.join(args.out, "ref.pt")) / 1e6
-    print(f"[P1] saved {args.out}/ref.pt ({sz:.1f} MB)")
+    print(f"[P1] saved {args.out}/ref.pt ({os.path.getsize(os.path.join(args.out,'ref.pt'))/1e6:.1f} MB)")
 
     ok = finite and reproducible
     print(f"[P1] GATE {'PASS' if ok else 'FAIL'}")
