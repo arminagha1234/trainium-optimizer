@@ -131,3 +131,36 @@ local venv (transformers 5.16.1, torch 2.13, CPU): 3/3 P3 tests pass.
 Next: P4 — `torch.compile(backend="neuron", dynamic=False)` on the shrunk config; the router must
 move to iterative-argmax + fixed-capacity (Stage B) dispatch since `torch.topk` + dynamic MoE
 shapes are the runbook's flagged compile hazards.
+
+## P4 — Static shapes + torch.compile(dynamic=False), shrunk config — GATE: PASS
+
+Root cause of the first compile failure (both routing configs): the native MoE lowers a
+**`AwsNeuronTopK`** custom-call that the Neuron compiler rejects — from the learned router's
+`torch.topk` AND from the grouped_mm expert backend's internal sort
+(`COMPILATION FAILED ... custom_call_target="AwsNeuronTopK"` inside `DeepseekV4Experts`,
+`transformers/integrations/moe.py`). This confirms runbook §4.2 on this toolchain
+(torch_neuronx 2.12.3).
+
+Fix (`implementation/src/deepseek_v4/compile_patches.py`):
+- **`stage_a_experts_forward`** — dense experts unrolled over E (compile-time constant): no
+  grouped_mm, no top-k, no data-dependent shapes, no token dropping. Numerically equivalent to
+  the native grouped_mm experts in eager: **cos 0.999963**.
+- **`iter_argmax_router_forward`** — top-k via iterative argmax instead of `torch.topk`.
+  Selection matches `torch.topk` exactly (agreement **1.0000** on random CPU scores).
+
+Results (`torch.compile(backend="neuron", dynamic=False)`, single core, seq 128):
+- **All-hash** (deterministic routing): compiles at batch 1 (152 s) and batch 2 (180 s);
+  compiled-vs-eager cos **0.9996** / 0.9995.
+- **Mixed** (learned router, the realistic path): compiles at batch 1 (151 s) and batch 2
+  (186 s); compiled-vs-eager cos **0.9937** / 0.9908 (≥ 0.99 gate; the small gap is the same
+  random-weight routing conditioning as P2, not a compile error).
+
+Rule #1 satisfied: each batch size compiles to its own NEFF. Drop count is zero (Stage A is
+dense). **GATE PASS.**
+
+Scope note: unrolled Stage A is for the **shrunk** config (8 experts). The real 256-expert model
+needs **Stage B** (fixed-capacity gather/scatter) for a compiled path (an unrolled 256×43 graph
+is too large to partition); P7's first real forward can run the native grouped_mm **eagerly**.
+FP32 MoE accumulation (runbook §4.6) is deferred to P8 (accuracy) with re-validation.
+
+Next: P5 — TP ladder (tp=2→8→32→64) on the shrunk config; compare rank-0 logits vs tp=1.
