@@ -47,10 +47,12 @@ Every row is generated from a `recipe.json` in an existing bundle: no bundle, no
 | 37 | stablelm-3b-4e1t | stablelm | 3B | **7,721** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/stablelm-3b-4e1t/) |
 | 38 | pythia-2.8b | pythia | 2.8B | **6,450** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/pythia-2-8b/) |
 | 39 | Qwen3-32B | qwen3 | 32B | **3,698** | TP=4, torch.compile(neuron), bf16, batch=1, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-32b/) |
-| 40 | Qwen3.5-0.8B | qwen3.5 | 0.8B | **1,143** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-0-8b/trn2.48xlarge/) |
-| 41 | Qwen3.5-2B | qwen3.5 | 2B | **1,129** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-2b/trn2.48xlarge/) |
+| 40 | Qwen3.5-35B-A3B | qwen3.5 | 35B | **2,695** | TP=16, bf16, batch=8 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-35b-a3b/trn2.48xlarge/) |
+| 41 | Qwen3.5-0.8B | qwen3.5 | 0.8B | **1,143** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-0-8b/trn2.48xlarge/) |
+| 42 | Qwen3.5-2B | qwen3.5 | 2B | **1,129** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-2b/trn2.48xlarge/) |
+| 43 | Qwen3.8-27B | qwen3.8 | 27B | **343** | TP=8, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-8-27b/trn2.48xlarge/) |
 
-41 verified result(s) across 41 model(s) and 2 hardware target(s). Throughput is the prefill tok/s measured on real hardware at the recipe's probe shape. Absolute throughput is comparable across rows on the same hardware target.
+43 verified result(s) across 43 model(s) and 2 hardware target(s). Throughput is the prefill tok/s measured on real hardware at the recipe's probe shape. Absolute throughput is comparable across rows on the same hardware target.
 
 ## Improvement over eager baseline
 
@@ -83,6 +85,7 @@ The same verified results, ranked by speedup over the **eager** baseline on the 
 | Qwen2.5-Math-7B | 7B | 2,930 | **19,826** | **6.765×** | torch.compile(neuron) | trn2.3xlarge |
 | Qwen2.5-Coder-7B | 7B | 2,949 | **19,866** | **6.736×** | torch.compile(neuron) | trn2.3xlarge |
 | Qwen3-14B | 14B | 1,699 | **10,343** | **6.087×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge |
+| Qwen3.5-35B-A3B | 35B | 453 | **2,695** | **5.946×** | TP=16, bf16, batch=8 | trn2.48xlarge |
 | Qwen2.5-14B-Instruct | 14B | 1,819 | **10,256** | **5.637×** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge |
 | Qwen3-32B | 32B | 975 | **3,698** | **3.794×** | TP=4, torch.compile(neuron), bf16, batch=1, CP=2 | trn2.3xlarge |
 | Qwen2.5-7B-Instruct | 7B | 2,916 | **9,870** | **3.384×** | TP=4, bf16, batch=8 | trn2.3xlarge |
@@ -99,5 +102,6 @@ The same verified results, ranked by speedup over the **eager** baseline on the 
 | SmolLM2-1.7B | 1.7B | 10,573 | **14,460** | **1.368×** | (config-only) | trn2.3xlarge |
 | Qwen3.5-2B | 2B | 1,071 | **1,129** | **1.054×** | TP=4, bf16, batch=1 | trn2.48xlarge |
 | Qwen3.5-0.8B | 0.8B | 1,093 | **1,143** | **1.045×** | TP=4, bf16, batch=1 | trn2.48xlarge |
+| Qwen3.8-27B | 27B | 332 | **343** | **1.034×** | TP=8, bf16, batch=1 | trn2.48xlarge |
 
 See [`HISTORY.tsv`](./HISTORY.tsv) for the append-only record.
