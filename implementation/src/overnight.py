@@ -701,7 +701,19 @@ def main() -> None:
     ap.add_argument("--family", default="dense_causal_lm",
                     help="architecture family for the ad-hoc --model")
     ap.add_argument("--out-root", type=Path, default=Path("../artifacts"))
-    ap.add_argument("--bank-root", type=Path, default=Path("../../knowledge-bank"))
+    # Anchored to THIS FILE, not the CWD. The previous default
+    # `Path("../../knowledge-bank")` is CWD-relative and only resolves correctly when
+    # launched from implementation/src/. run_overnight.py documents being launched from
+    # implementation/ (`python run_overnight.py --backend mock`), where it pointed OUTSIDE
+    # the repo. KnowledgeBank.load_all() returns [] for a missing root without raising, so
+    # the run silently proceeded with an EMPTY bank: no config priors and -- worse -- no
+    # anti-pattern pruning, which is the highest-ROI lesson type (each pruned candidate
+    # saves a 5-20 min compile). Note --out-root above is relative to implementation/, so
+    # the two defaults previously assumed different working directories.
+    ap.add_argument(
+        "--bank-root", type=Path,
+        default=Path(__file__).resolve().parents[2] / "knowledge-bank",
+    )
     ap.add_argument("--sdk", default="2.28.0")
     ap.add_argument("--instance-type", default="trn2.48xlarge",
                     help="fills the whole instance (DP/CP); '' to disable")
