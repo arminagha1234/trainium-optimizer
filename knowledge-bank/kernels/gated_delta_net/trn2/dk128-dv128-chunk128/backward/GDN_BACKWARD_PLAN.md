@@ -2,7 +2,7 @@
 
 Goal: NKI backward for the GatedDeltaNet chunked forward, returning dq,dk,dv,dg,dbeta,
 validated per-gradient on-device against the autograd oracle. Makes GDN fully
-trainable (Scaledown need). The one big remaining survey gap.
+trainable (customer_armin need). The one big remaining survey gap.
 
 ## Status
 - [x] **Autograd oracle** (`gdn_bwd_oracle.py`) — differentiable torch chunk forward,

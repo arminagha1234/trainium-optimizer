@@ -2,7 +2,7 @@
 verified_idioms.py  --  VERIFIED canonical NKI idioms
 =====================================================
 Stack: nki 0.6.0 / neuronx-cc 2.27.5334 / torch-neuronx 2.9 / torch 2.9.1
-Box:   trn2.3xlarge (tbc-porting)
+Box:   trn2.3xlarge (customer_armin-porting)
 Path:  torch_xla device tensors -> call jit'd kernel directly -> out.cpu().to(fp32)
        (NOT nki.baremetal -- that is offline-sim-only on this stack.)
 
