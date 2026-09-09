@@ -176,6 +176,81 @@ def _delta_inputs() -> dict:
     }
 
 
+# --- MLA (Multi-head Latent Attention) — DeepSeek-V2/V3, GLM-family ----------
+# The two implementations of MLA decode that MUST agree, computed by GENUINELY
+# different algorithms (so the parity check is non-vacuous):
+#
+#   reference — MATERIALIZE: reconstruct the per-head, per-position keys and
+#     values from the shared compressed latent (k_nope[h,s] = W_UK[h] @ c[s],
+#     v[h,s] = W_UV[h] @ c[s]), then run standard scaled-dot-product attention.
+#     A decoupled-RoPE key `kr` (shared across heads) adds a positional score
+#     term. This is the "naive" form — O(S * H * d_h) reconstructed KV.
+#
+#   sim — ABSORB (the form the efficient MLA decode kernel actually uses):
+#     fold W_UK into the query (q_abs[h] = q_nope[h] @ W_UK[h]) so attention runs
+#     directly against the compressed latent `c`, and fold W_UV into the output
+#     (out[h] = (a @ c) @ W_UV[h]^T). The per-position K/V are NEVER
+#     materialized. Algebraically identical to `reference` by associativity of
+#     the up-projection matmuls — the "matrix absorption" trick.
+#
+# Because one path reconstructs KV and the other never does, `sim is not
+# reference` in every sense that matters: agreement is real evidence.
+def _softmax_lastaxis(x: np.ndarray) -> np.ndarray:
+    x = x - x.max(axis=-1, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=-1, keepdims=True)
+
+
+def _mla_reference(inp: dict) -> np.ndarray:
+    c, kr = inp["c"], inp["kr"]          # c [S,d_c] latent cache; kr [S,d_r] rope key
+    qn, qr = inp["qn"], inp["qr"]        # qn [H,d_h] query-nope; qr [H,d_r] query-rope
+    w_uk, w_uv = inp["w_uk"], inp["w_uv"]  # [H,d_h,d_c], [H,d_v,d_c]
+    scale = inp["scale"]
+    c, kr, qn, qr = (a.astype(np.float64) for a in (c, kr, qn, qr))
+    w_uk, w_uv = w_uk.astype(np.float64), w_uv.astype(np.float64)
+    # reconstruct per-head keys/values from the latent (the expensive part)
+    k_nope = np.einsum("hxc,sc->hsx", w_uk, c)     # [H,S,d_h]
+    v = np.einsum("hvc,sc->hsv", w_uv, c)          # [H,S,d_v]
+    nope = np.einsum("hx,hsx->hs", qn, k_nope)     # [H,S]
+    rope = np.einsum("hr,sr->hs", qr, kr)          # [H,S] (shared rope key)
+    a = _softmax_lastaxis((nope + rope) * scale)   # [H,S]
+    out = np.einsum("hs,hsv->hv", a, v)            # [H,d_v]
+    return out.astype(np.float32)
+
+
+def _mla_sim(inp: dict) -> np.ndarray:
+    c, kr = inp["c"], inp["kr"]
+    qn, qr = inp["qn"], inp["qr"]
+    w_uk, w_uv = inp["w_uk"], inp["w_uv"]
+    scale = inp["scale"]
+    c, kr, qn, qr = (a.astype(np.float64) for a in (c, kr, qn, qr))
+    w_uk, w_uv = w_uk.astype(np.float64), w_uv.astype(np.float64)
+    # absorb W_UK into the query -> attend directly in the d_c latent space
+    q_abs = np.einsum("hx,hxc->hc", qn, w_uk)      # [H,d_c]
+    nope = np.einsum("hc,sc->hs", q_abs, c)        # [H,S]  (no K reconstructed)
+    rope = np.einsum("hr,sr->hs", qr, kr)          # [H,S]
+    a = _softmax_lastaxis((nope + rope) * scale)   # [H,S]
+    ctx = np.einsum("hs,sc->hc", a, c)             # [H,d_c] (weighted latent)
+    out = np.einsum("hc,hvc->hv", ctx, w_uv)       # [H,d_v] (absorb W_UV)
+    return out.astype(np.float32)
+
+
+def _mla_inputs() -> dict:
+    g = _rng(20260909)
+    H, S, d_c, d_h, d_r, d_v = 8, 64, 128, 32, 16, 32
+    sc = 1.0 / np.sqrt(d_h + d_r)          # DeepSeek scales over the full q dim
+    # up-projections scaled by 1/sqrt(d_c) so reconstructed K/V stay O(1).
+    return {
+        "c":  g.standard_normal((S, d_c)).astype(np.float32),
+        "kr": g.standard_normal((S, d_r)).astype(np.float32),
+        "qn": g.standard_normal((H, d_h)).astype(np.float32),
+        "qr": g.standard_normal((H, d_r)).astype(np.float32),
+        "w_uk": (g.standard_normal((H, d_h, d_c)) / np.sqrt(d_c)).astype(np.float32),
+        "w_uv": (g.standard_normal((H, d_v, d_c)) / np.sqrt(d_c)).astype(np.float32),
+        "scale": sc,
+    }
+
+
 # --- RoPE (dense-attention primitive, reused independent pair) --------------
 # invent_kernels already ships an independent reference (strided scatter) vs
 # kernel-shaped impl (scatter-free stack/flatten). Reuse them verbatim.
@@ -233,6 +308,13 @@ register_oracle(
     # resolves any PRIMITIVE_TO_KERNEL primitive spelling that maps to DeltaNet.
     aliases=("gated_delta_net", "gated-delta", "delta_rule"),
     notes="gated delta rule: outer/matmul reference vs einsum sim")
+
+register_oracle(
+    "MLA", _mla_reference, _mla_sim, _mla_inputs,
+    aliases=("mla", "multi_head_latent_attention", "multihead_latent_attention",
+             "latent_attention", "mla_decode", "mla_attention", "deepseek_mla"),
+    notes="multi-head latent attention decode: reconstruct-KV reference vs "
+          "absorbed-projection sim (attend in latent space; independent algorithms)")
 
 _register_rope()
 _register_attn_sink()

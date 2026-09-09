@@ -193,3 +193,57 @@ def test_attn_hd256_is_covered_by_audit():
     if o is None:
         return
     assert "AttnDecodeHD256" not in audit_oracles()["missing"]
+
+
+# -- MLA (Multi-head Latent Attention) decode oracle (DeepSeek-V2/V3, GLM) ----
+
+def test_mla_alias_resolution():
+    """The MLA oracle is reachable via its canonical name, explicit aliases, and
+    any PRIMITIVE_TO_KERNEL spelling that routes to it."""
+    canonical = get_oracle("MLA")
+    assert canonical is not None and canonical.name == "MLA"
+    for spelling in ("mla", "MLA", "multi_head_latent_attention",
+                     "multihead_latent_attention", "latent_attention",
+                     "mla_decode", "mla_attention", "deepseek_mla"):
+        o = get_oracle(spelling)
+        assert o is canonical, f"{spelling!r} did not resolve to the MLA oracle"
+
+
+def test_mla_oracle_reference_and_sim_agree():
+    """MATERIALIZE reference (reconstruct per-head K/V from the latent) vs ABSORB
+    sim (fold W_UK into Q and W_UV into the output, attend in latent space) — two
+    genuinely different algorithms that must agree by matrix absorption. A
+    non-vacuous parity check for MLA decode."""
+    o = get_oracle("MLA")
+    assert o is not None and not o.vacuous
+    inp = o.make_inputs()
+    out = o.reference(inp)
+    assert isinstance(out, np.ndarray) and np.all(np.isfinite(out))
+    # output is [H, d_v]
+    assert out.shape == (inp["qn"].shape[0], inp["w_uv"].shape[1])
+    assert np.array_equal(out, o.reference(o.make_inputs()))    # deterministic
+    assert np.allclose(out, o.sim(inp), atol=1e-4)              # absorb == materialize
+
+
+def test_mla_oracle_catches_a_dropped_rope_term():
+    """The oracle must actually VALIDATE the decoupled-RoPE key path — MLA's
+    distinctive, easy-to-drop piece. An impl that omits the shared rope score
+    term diverges from the reference, so the parity check rejects it."""
+    o = get_oracle("MLA")
+    assert o is not None
+    inp = o.make_inputs()
+    qn, w_uk, c, w_uv = inp["qn"], inp["w_uk"], inp["c"], inp["w_uv"]
+    scale = inp["scale"]
+    # nope-only attention (drops the decoupled rope key contribution)
+    q_abs = np.einsum("hx,hxc->hc", qn.astype(np.float64), w_uk.astype(np.float64))
+    nope = np.einsum("hc,sc->hs", q_abs, c.astype(np.float64)) * scale
+    e = np.exp(nope - nope.max(axis=1, keepdims=True))
+    a = e / e.sum(axis=1, keepdims=True)
+    ctx = np.einsum("hs,sc->hc", a, c.astype(np.float64))
+    no_rope = np.einsum("hc,hvc->hv", ctx, w_uv.astype(np.float64)).astype(np.float32)
+    assert not np.allclose(o.reference(inp), no_rope, atol=1e-4)
+
+
+def test_mla_is_covered_by_audit():
+    """audit_oracles no longer reports MLA as a missing (uncovered) primitive."""
+    assert "MLA" not in audit_oracles()["missing"]
