@@ -507,6 +507,63 @@ def _attn_decode_inputs(S: int, d: int, seed: int) -> Inputs:
     }
 
 
+# ---- attention with a learned SINK logit (decode; GPT-OSS / DeepSeek-V4) ----
+# A per-head "attention sink" is a virtual key with a LEARNED logit and NO value:
+# it joins the softmax denominator so a head can attend to "nothing" (dumping
+# probability mass off the real tokens). Two INDEPENDENT numpy derivations make
+# the oracle non-vacuous:
+#   _attn_sink_reference : ONE full softmax over all keys, sink appended to the
+#                          denominator (the ground truth).
+#   _attn_sink_impl      : ONLINE/blocked softmax (running max/sum, flash-style),
+#                          sink folded in ONCE at the end with the same max
+#                          rescaling -- the layout the NKI kernel uses.
+# Different code, identical math (the flash-softmax identity + a sink term).
+def _attn_sink_reference(inp: Inputs) -> np.ndarray:
+    q, k, v, sink = inp["q"], inp["k"], inp["v"], inp["sink"]   # q[1,d] k,v[S,d] sink[1,1]
+    d = q.shape[-1]
+    scores = (q @ k.T) / np.sqrt(d)                     # [1, S]
+    s = float(sink[0, 0])
+    m = max(float(scores.max()), s)                     # sink shares the max
+    p = np.exp(scores - m)                              # [1, S]
+    denom = float(p.sum()) + float(np.exp(s - m))       # sink joins denominator
+    return ((p @ v) / denom).astype(np.float32)         # [1, d]  (sink has no value)
+
+
+def _attn_sink_impl(inp: Inputs) -> np.ndarray:
+    q, k, v, sink = inp["q"], inp["k"], inp["v"], inp["sink"]
+    d = q.shape[-1]
+    S = k.shape[0]
+    scale = 1.0 / np.sqrt(d)
+    s = float(sink[0, 0])
+    run_m = -1.0e30
+    run_l = 0.0
+    acc = np.zeros((1, d), dtype=np.float64)
+    for j in range(0, S, 128):                          # online (flash) softmax
+        sc = (q @ k[j:j + 128].T) * scale               # [1, b]
+        new_m = max(run_m, float(sc.max()))
+        corr = np.exp(run_m - new_m)
+        e = np.exp(sc - new_m)                          # [1, b]
+        run_l = run_l * corr + float(e.sum())
+        acc = acc * corr + e @ v[j:j + 128]
+        run_m = new_m
+    new_m = max(run_m, s)                               # fold the sink in ONCE
+    corr = np.exp(run_m - new_m)
+    run_l = run_l * corr + float(np.exp(s - new_m))
+    acc = acc * corr
+    return (acc / run_l).astype(np.float32)
+
+
+def _attn_sink_inputs(S: int, d: int, seed: int) -> Inputs:
+    g = _rng(seed)
+    return {
+        "q": g.standard_normal((1, d)).astype(np.float32),
+        "k": g.standard_normal((S, d)).astype(np.float32),
+        "v": g.standard_normal((S, d)).astype(np.float32),
+        # a learned per-head sink logit (scalar), O(1) like the scaled scores.
+        "sink": g.standard_normal((1, 1)).astype(np.float32),
+    }
+
+
 # ---- long-context flash attention (whole-sequence, streaming softmax) -------
 # Matches the on-device-validated flash_nki_opt kernel banked under
 # kernels/FlashAttention: q,k,v are (d_head, seqlen); the output is
@@ -876,6 +933,56 @@ def attn_decode_kernel(q, k, v):
 '''
 
 
+def _src_attn_sink_decode() -> str:
+    return _HEADER + '''
+
+@nki.jit
+def attn_sink_decode_kernel(q, k, v, sink):
+    """Single-query decode attention with a learned per-head SINK logit
+    (GPT-OSS / DeepSeek-V4). q [1, d], k/v [S, d], sink [1, 1], head_dim d <= 128.
+    Online (streaming) softmax over 512-key tiles so scores never materialize;
+    the sink joins the denominator ONCE at the end (no value contribution) using
+    the SAME running-max rescaling. Borrowed from attn_decode_kernel + a sink
+    fold -- the compiler will not add the sink term to a fused softmax itself."""
+    one, d = q.shape
+    S, _ = k.shape
+    out = nl.ndarray((1, d), dtype=q.dtype, buffer=nl.shared_hbm)
+    scale = 1.0 / nl.sqrt(d * 1.0)
+    n_tiles = (S + _PSUM_FREE - 1) // _PSUM_FREE
+    ix = nl.mgrid[0:_PMAX, 0:_PSUM_FREE]
+
+    qd = nl.load(q[0:1, 0:d])                     # [1, d]
+    sk = nl.load(sink[0:1, 0:1])                  # [1, 1] learned sink logit
+    run_max = nl.full((1, 1), -1.0e30, dtype=nl.float32)
+    run_sum = nl.full((1, 1), 0.0, dtype=nl.float32)
+    acc = nl.full((1, d), 0.0, dtype=nl.float32)
+    for j in nl.affine_range(n_tiles):
+        ks = nl.load(k[j * _PSUM_FREE:j * _PSUM_FREE + _PSUM_FREE, 0:d],
+                     mask=(ix.p < 1))
+        vs = nl.load(v[j * _PSUM_FREE:j * _PSUM_FREE + _PSUM_FREE, 0:d],
+                     mask=(ix.p < 1))
+        scores = nl.multiply(nl.matmul(qd, ks, transpose_x=False), scale)  # [1, tile]
+        tile_max = nl.max(scores, axis=1)
+        new_max = nl.maximum(run_max, tile_max)
+        corr = nl.exp(nl.subtract(run_max, new_max))
+        p = nl.exp(nl.subtract(scores, new_max))
+        run_sum = nl.add(nl.multiply(run_sum, corr), nl.sum(p, axis=1))
+        acc = nl.add(nl.multiply(acc, corr), nl.matmul(p, vs, transpose_x=False))
+        run_max = new_max
+    # Fold the per-head sink into the denominator ONCE (it carries no value):
+    # renormalize the running max against the sink, add exp(sink - max) to the
+    # denominator, rescale the accumulator by the same correction.
+    final_max = nl.maximum(run_max, sk)
+    corr = nl.exp(nl.subtract(run_max, final_max))
+    sink_term = nl.exp(nl.subtract(sk, final_max))
+    run_sum = nl.add(nl.multiply(run_sum, corr), sink_term)
+    acc = nl.multiply(acc, corr)
+    res = nl.multiply(acc, nl.reciprocal(run_sum))
+    nl.store(out[0:1, 0:d], res)
+    return out
+'''
+
+
 def _src_rmsnorm() -> str:
     return _HEADER + '''
 
@@ -996,6 +1103,11 @@ _RECIPES: dict[str, _AuthorRecipe] = {
         _attn_decode_reference, _src_attn_decode, "attn_decode_kernel", "invented",
         "correctness-first single-query decode; online softmax over 512-key tiles; "
         "contraction dim d(<=128) -> partition"),
+    "attn_sink": _AuthorRecipe(
+        _attn_sink_impl, _src_attn_sink_decode, "attn_sink_decode_kernel", "invented",
+        "single-query decode attention + learned per-head sink logit (GPT-OSS / "
+        "DeepSeek-V4); online softmax over 512-key tiles, sink folded into the "
+        "denominator once at the end; full-softmax reference vs online-softmax impl"),
     # --- bootstrap seeds (regression only) ---------------------------------
     "rmsnorm": _AuthorRecipe(
         _rmsnorm_reference, _src_rmsnorm, "rmsnorm_kernel", "seed-adapted",
@@ -1115,6 +1227,17 @@ def _spec_attn_decode() -> OpSpec:
         notes="tiled QK^T-softmax-PV single-query decode block")
 
 
+def _spec_attn_sink() -> OpSpec:
+    return OpSpec(
+        "attn_sink", "dense_causal_lm", "attn-sink-hd128", "bf16",
+        _attn_sink_reference,
+        lambda: _attn_sink_inputs(128, 128, 41),
+        lambda: _attn_sink_inputs(512, 128, 42),
+        baseline="torch-eager SDPA + sink (1 query)", origin="invented",
+        notes="single-query decode attention with a learned per-head sink logit",
+        primitive="AttentionSink")
+
+
 def _spec_rmsnorm() -> OpSpec:
     return OpSpec(
         "rmsnorm", "dense_causal_lm", "rmsnorm-h128", "bf16",
@@ -1152,13 +1275,14 @@ _CATALOG_BUILDERS: dict[str, Callable[[], OpSpec]] = {
     "add_rmsnorm": _spec_add_rmsnorm,
     "layernorm": _spec_layernorm,
     "attn_decode": _spec_attn_decode,
+    "attn_sink": _spec_attn_sink,
     "rmsnorm": _spec_rmsnorm,
     "silu_gate": _spec_silu_gate,
     "softmax": _spec_softmax,
 }
 
 WRITE_NEW_OPS = ("rope_apply", "gelu_tanh", "softcap", "add_rmsnorm",
-                 "layernorm", "attn_decode")
+                 "layernorm", "attn_decode", "attn_sink")
 SEED_OPS = ("rmsnorm", "silu_gate", "softmax", "add_rmsnorm")
 
 

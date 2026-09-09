@@ -80,7 +80,11 @@ PRIMITIVE_TO_KERNEL: dict[str, str] = {
     "powerretention": "PowerRetention",
     # dense-attention variants that also need authored kernels
     "mla": "MLA",
-    "attentionsink": "AttentionSink",
+    "attentionsink": "AttentionSink",      # attention_sink
+    "attnsink": "AttentionSink",           # attn_sink
+    "sinkattention": "AttentionSink",       # sink_attention
+    "gptoss": "AttentionSink",             # gpt-oss uses per-head attention sinks
+    "gptossattention": "AttentionSink",
     # long-context flash attention — the streaming online-softmax kernel that
     # never materializes [S,S] and is the ONLY path that runs S=8192 attention
     # (the compiler OOMs on the dense form). On-device validated (rank 4).

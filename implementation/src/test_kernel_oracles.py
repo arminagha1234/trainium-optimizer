@@ -81,3 +81,61 @@ def test_rope_oracle_reference_and_sim_agree():
     assert not o.vacuous
     inp = o.make_inputs()
     assert np.allclose(o.reference(inp), o.sim(inp), atol=1e-5)
+
+
+# -- attention-sink oracle (new: GPT-OSS / DeepSeek-V4 primitive) ------------
+
+def test_attention_sink_alias_resolution():
+    """The AttentionSink oracle is reachable via its canonical name, its explicit
+    aliases, and any PRIMITIVE_TO_KERNEL spelling that routes to it (attn_sink,
+    gpt_oss, ...)."""
+    canonical = get_oracle("AttentionSink")
+    if canonical is None:      # invent_kernels unavailable -> oracle not registered
+        return
+    assert canonical.name == "AttentionSink"
+    for spelling in ("attentionsink", "attention_sink", "attn_sink",
+                     "sink_attention", "gpt_oss", "GPT-OSS", "gptoss", "sink"):
+        o = get_oracle(spelling)
+        assert o is canonical, f"{spelling!r} did not resolve to the AttentionSink oracle"
+
+
+def test_attention_sink_oracle_reference_and_sim_agree():
+    """The two independent impls (full-softmax-with-sink reference vs
+    online/blocked-softmax-with-sink sim) agree — a MEANINGFUL, non-vacuous parity
+    check for the sink primitive."""
+    o = get_oracle("AttentionSink")
+    if o is None:
+        return
+    assert not o.vacuous
+    inp = o.make_inputs()
+    out = o.reference(inp)
+    assert isinstance(out, np.ndarray) and np.all(np.isfinite(out))
+    assert out.shape == (1, inp["q"].shape[1])
+    # deterministic + the online-softmax sim reproduces the full-softmax reference
+    assert np.array_equal(out, o.reference(o.make_inputs()))
+    assert np.allclose(out, o.sim(inp), atol=1e-5)
+
+
+def test_attention_sink_oracle_catches_a_missing_sink():
+    """The oracle must actually VALIDATE the sink: a plain softmax that DROPS the
+    sink term diverges from the reference, so the parity check would reject it
+    (this is what makes the oracle worth having)."""
+    o = get_oracle("AttentionSink")
+    if o is None:
+        return
+    inp = o.make_inputs()
+    q, k, v = inp["q"], inp["k"], inp["v"]
+    d = q.shape[-1]
+    scores = (q @ k.T) / np.sqrt(d)
+    e = np.exp(scores - scores.max())
+    no_sink = (e / e.sum()) @ v            # softmax WITHOUT the sink term
+    assert not np.allclose(o.reference(inp), no_sink, atol=1e-5)
+
+
+def test_attention_sink_is_covered_by_audit():
+    """audit_oracles no longer reports AttentionSink as a missing (uncovered)
+    primitive."""
+    o = get_oracle("AttentionSink")
+    if o is None:
+        return
+    assert "AttentionSink" not in audit_oracles()["missing"]

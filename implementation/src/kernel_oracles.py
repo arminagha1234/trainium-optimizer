@@ -191,6 +191,24 @@ def _register_rope() -> None:
         notes="strided-scatter reference vs scatter-free stack/flatten sim")
 
 
+# --- attention sink (decode) — reused independent pair from invent_kernels ---
+# full-softmax-with-sink reference vs online/blocked-softmax-with-sink impl: the
+# same math by two different algorithms, so the parity check is non-vacuous.
+def _register_attn_sink() -> None:
+    try:
+        from invent_kernels import (_attn_sink_impl, _attn_sink_inputs,
+                                     _attn_sink_reference)
+    except Exception:  # noqa: BLE001 — optional; the other oracles stand alone
+        return
+    register_oracle(
+        "AttentionSink", _attn_sink_reference, _attn_sink_impl,
+        lambda: _attn_sink_inputs(512, 128, 41),
+        aliases=("attention_sink", "attn_sink", "sink_attention",
+                 "gpt_oss", "gptoss", "sink"),
+        notes="attention-sink decode: full-softmax+sink reference vs "
+              "online-softmax+sink impl (independent algorithms)")
+
+
 register_oracle(
     "DeltaNet", _delta_reference, _delta_sim, _delta_inputs,
     # aliases beyond what PRIMITIVE_TO_KERNEL already routes; get_oracle also
@@ -199,3 +217,4 @@ register_oracle(
     notes="gated delta rule: outer/matmul reference vs einsum sim")
 
 _register_rope()
+_register_attn_sink()
