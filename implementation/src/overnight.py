@@ -113,6 +113,86 @@ SEED_MODELS: dict[str, ModelSpec] = {
         param_count=27e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1,
         num_kv_heads=4,
     ),
+
+    # =====================================================================
+    # EXPANDED ZOO — a broad set of popular text-to-text HF models plus the
+    # Armin-Neuron causal-LM ports, so the forever-run keeps cycling MANY
+    # different architectures and banks a large corpus of real recipes.
+    # Non-causal Armin models (diffusion/encoder/protein/audio) need their
+    # own backends and are intentionally NOT listed here.
+    #
+    # num_kv_heads is left at its default (None) for these: preflight reads
+    # the real value from each model's HF config to size TP. `family` is set
+    # so the MoE router patch fires for MoE models. GATED entries
+    # (meta-llama/*, google/gemma*, mistralai/*) only run when an HF token is
+    # present; otherwise the HF prewarm fails open and they skip honestly.
+    # =====================================================================
+
+    # ---- Qwen2.5 / Qwen2 / QwQ (dense, ungated) ----
+    "qwen2-5-0-5b": ModelSpec(model_id="Qwen/Qwen2.5-0.5B-Instruct", family="dense_causal_lm", param_count=0.5e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1),
+    "qwen2-5-1-5b": ModelSpec(model_id="Qwen/Qwen2.5-1.5B-Instruct", family="dense_causal_lm", param_count=1.5e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1),
+    "qwen2-5-3b": ModelSpec(model_id="Qwen/Qwen2.5-3B-Instruct", family="dense_causal_lm", param_count=3e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1),
+    "qwen2-5-7b": ModelSpec(model_id="Qwen/Qwen2.5-7B-Instruct", family="dense_causal_lm", param_count=7e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1),
+    "qwen2-5-14b": ModelSpec(model_id="Qwen/Qwen2.5-14B-Instruct", family="dense_causal_lm", param_count=14e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1),
+    "qwen2-5-32b": ModelSpec(model_id="Qwen/Qwen2.5-32B-Instruct", family="dense_causal_lm", param_count=32e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1),
+    "qwen2-5-coder-7b": ModelSpec(model_id="Qwen/Qwen2.5-Coder-7B-Instruct", family="dense_causal_lm", param_count=7e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1),
+    "qwq-32b": ModelSpec(model_id="Qwen/QwQ-32B", family="dense_causal_lm", param_count=32e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1),
+    "qwen2-0-5b": ModelSpec(model_id="Qwen/Qwen2-0.5B-Instruct", family="dense_causal_lm", param_count=0.5e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1),
+    "qwen2-7b": ModelSpec(model_id="Qwen/Qwen2-7B-Instruct", family="dense_causal_lm", param_count=7e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1),
+
+    # ---- SmolLM2 (dense, ungated, tiny = fast cycles) ----
+    "smollm2-135m": ModelSpec(model_id="HuggingFaceTB/SmolLM2-135M-Instruct", family="dense_causal_lm", param_count=0.135e9, parent="huggingfacetb", probe_shape="chat 512/256", probe_batch=1),
+    "smollm2-360m": ModelSpec(model_id="HuggingFaceTB/SmolLM2-360M-Instruct", family="dense_causal_lm", param_count=0.36e9, parent="huggingfacetb", probe_shape="chat 512/256", probe_batch=1),
+    "smollm2-1-7b": ModelSpec(model_id="HuggingFaceTB/SmolLM2-1.7B-Instruct", family="dense_causal_lm", param_count=1.7e9, parent="huggingfacetb", probe_shape="chat 512/256", probe_batch=1),
+
+    # ---- Microsoft Phi (dense, ungated) ----
+    "phi-3-mini": ModelSpec(model_id="microsoft/Phi-3-mini-4k-instruct", family="dense_causal_lm", param_count=3.8e9, parent="microsoft", probe_shape="chat 512/256", probe_batch=1),
+    "phi-3-5-mini": ModelSpec(model_id="microsoft/Phi-3.5-mini-instruct", family="dense_causal_lm", param_count=3.8e9, parent="microsoft", probe_shape="chat 512/256", probe_batch=1),
+    "phi-4": ModelSpec(model_id="microsoft/phi-4", family="dense_causal_lm", param_count=14.7e9, parent="microsoft", probe_shape="chat 512/256", probe_batch=1),
+
+    # ---- TII Falcon3 (dense, ungated) ----
+    "falcon3-7b": ModelSpec(model_id="tiiuae/Falcon3-7B-Instruct", family="dense_causal_lm", param_count=7e9, parent="tiiuae", probe_shape="chat 512/256", probe_batch=1),
+    "falcon3-10b": ModelSpec(model_id="tiiuae/Falcon3-10B-Instruct", family="dense_causal_lm", param_count=10e9, parent="tiiuae", probe_shape="chat 512/256", probe_batch=1),
+
+    # ---- AllenAI OLMo / OLMoE (ungated; OLMoE is MoE -> router patch) ----
+    "olmo2-7b": ModelSpec(model_id="allenai/OLMo-2-1124-7B-Instruct", family="dense_causal_lm", param_count=7e9, parent="allenai", probe_shape="chat 512/256", probe_batch=1),
+    "olmoe-1b-7b": ModelSpec(model_id="allenai/OLMoE-1B-7B-0924-Instruct", family="moe_causal_lm", param_count=6.9e9, parent="allenai", probe_shape="chat 512/256", probe_batch=1),
+
+    # ---- DeepSeek (ungated; V2-Lite is MoE + MLA -> exercises both) ----
+    "deepseek-v2-lite": ModelSpec(model_id="deepseek-ai/DeepSeek-V2-Lite-Chat", family="moe_causal_lm", param_count=15.7e9, parent="deepseek", probe_shape="chat 512/256", probe_batch=1),
+    "deepseek-llm-7b": ModelSpec(model_id="deepseek-ai/deepseek-llm-7b-chat", family="dense_causal_lm", param_count=7e9, parent="deepseek", probe_shape="chat 512/256", probe_batch=1),
+    "ds-r1-distill-qwen-7b": ModelSpec(model_id="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", family="dense_causal_lm", param_count=7e9, parent="deepseek", probe_shape="chat 512/256", probe_batch=1),
+
+    # ---- 01-ai Yi, IBM Granite, StableLM, EleutherAI, InternLM, misc (ungated) ----
+    "yi-1-5-6b": ModelSpec(model_id="01-ai/Yi-1.5-6B-Chat", family="dense_causal_lm", param_count=6e9, parent="01-ai", probe_shape="chat 512/256", probe_batch=1),
+    "yi-1-5-9b": ModelSpec(model_id="01-ai/Yi-1.5-9B-Chat", family="dense_causal_lm", param_count=9e9, parent="01-ai", probe_shape="chat 512/256", probe_batch=1),
+    "granite-3-1-2b": ModelSpec(model_id="ibm-granite/granite-3.1-2b-instruct", family="dense_causal_lm", param_count=2e9, parent="ibm", probe_shape="chat 512/256", probe_batch=1),
+    "granite-3-1-8b": ModelSpec(model_id="ibm-granite/granite-3.1-8b-instruct", family="dense_causal_lm", param_count=8e9, parent="ibm", probe_shape="chat 512/256", probe_batch=1),
+    "stablelm-2-1-6b": ModelSpec(model_id="stabilityai/stablelm-2-1_6b-chat", family="dense_causal_lm", param_count=1.6e9, parent="stabilityai", probe_shape="chat 512/256", probe_batch=1),
+    "stablelm-zephyr-3b": ModelSpec(model_id="stabilityai/stablelm-zephyr-3b", family="dense_causal_lm", param_count=3e9, parent="stabilityai", probe_shape="chat 512/256", probe_batch=1),
+    "pythia-1-4b": ModelSpec(model_id="EleutherAI/pythia-1.4b", family="dense_causal_lm", param_count=1.4e9, parent="eleutherai", probe_shape="chat 512/256", probe_batch=1),
+    "gpt-neox-20b": ModelSpec(model_id="EleutherAI/gpt-neox-20b", family="dense_causal_lm", param_count=20e9, parent="eleutherai", probe_shape="chat 512/256", probe_batch=1),
+    "internlm2-5-7b": ModelSpec(model_id="internlm/internlm2_5-7b-chat", family="dense_causal_lm", param_count=7e9, parent="internlm", probe_shape="chat 512/256", probe_batch=1),
+    "tinyllama-1-1b": ModelSpec(model_id="TinyLlama/TinyLlama-1.1B-Chat-v1.0", family="dense_causal_lm", param_count=1.1e9, parent="tinyllama", probe_shape="chat 512/256", probe_batch=1),
+    "bloomz-1b1": ModelSpec(model_id="bigscience/bloomz-1b1", family="dense_causal_lm", param_count=1.1e9, parent="bigscience", probe_shape="chat 512/256", probe_batch=1),
+
+    # ---- Armin-Neuron causal-LM ports not already above ----
+    #      (gemma-4-e4b gated; Qwen3.5/3.6 are forward-looking ports whose HF
+    #       ids may not resolve yet -> they skip cleanly if undownloadable.)
+    "gemma-4-e4b": ModelSpec(model_id="google/gemma-4-E4B-it", family="dense_causal_lm", param_count=4e9, parent="google", probe_shape="chat 512/256", probe_batch=1),
+    "qwen3-5-4b": ModelSpec(model_id="Qwen/Qwen3.5-4B", family="dense_causal_lm", param_count=4e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1),
+    "qwen3-6-27b": ModelSpec(model_id="Qwen/Qwen3.6-27B", family="dense_causal_lm", param_count=27e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1),
+
+    # ---- GATED (need an HF token; otherwise skipped) ----
+    "llama-3-2-1b": ModelSpec(model_id="meta-llama/Llama-3.2-1B-Instruct", family="dense_causal_lm", param_count=1e9, parent="meta", probe_shape="chat 512/256", probe_batch=1),
+    "llama-3-2-3b": ModelSpec(model_id="meta-llama/Llama-3.2-3B-Instruct", family="dense_causal_lm", param_count=3e9, parent="meta", probe_shape="chat 512/256", probe_batch=1),
+    "llama-3-1-8b": ModelSpec(model_id="meta-llama/Llama-3.1-8B-Instruct", family="dense_causal_lm", param_count=8e9, parent="meta", probe_shape="chat 512/256", probe_batch=1),
+    "gemma-2-2b": ModelSpec(model_id="google/gemma-2-2b-it", family="dense_causal_lm", param_count=2e9, parent="google", probe_shape="chat 512/256", probe_batch=1),
+    "gemma-2-9b": ModelSpec(model_id="google/gemma-2-9b-it", family="dense_causal_lm", param_count=9e9, parent="google", probe_shape="chat 512/256", probe_batch=1),
+    "gemma-2-27b": ModelSpec(model_id="google/gemma-2-27b-it", family="dense_causal_lm", param_count=27e9, parent="google", probe_shape="chat 512/256", probe_batch=1),
+    "mistral-7b": ModelSpec(model_id="mistralai/Mistral-7B-Instruct-v0.3", family="dense_causal_lm", param_count=7e9, parent="mistralai", probe_shape="chat 512/256", probe_batch=1),
+    "mistral-nemo": ModelSpec(model_id="mistralai/Mistral-Nemo-Instruct-2407", family="dense_causal_lm", param_count=12e9, parent="mistralai", probe_shape="chat 512/256", probe_batch=1),
+    "mixtral-8x7b": ModelSpec(model_id="mistralai/Mixtral-8x7B-Instruct-v0.1", family="moe_causal_lm", param_count=46.7e9, parent="mistralai", probe_shape="chat 512/256", probe_batch=1),
 }
 
 
