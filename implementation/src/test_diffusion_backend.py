@@ -62,7 +62,9 @@ def _requested_backend(monkeypatch, spec: ModelSpec, backend_name: str,
     except returns a failed ModelResult), so the captured name is the assertion."""
     captured: dict[str, str] = {}
 
-    def _spy(name, instance_type=None):
+    def _spy(name, instance_type=None, *args, **kwargs):
+        # Accept any extra args (e.g. serve_target) so the spy stays valid as the
+        # real _make_backend signature grows — we only assert on `name` here.
         captured["name"] = name
         raise RuntimeError("stop-after-selection")   # abort before any measurement
 
