@@ -251,6 +251,61 @@ def _mla_inputs() -> dict:
     }
 
 
+# --- Mamba2 / SSD (state-space duality) -------------------------------------
+# The selective state-space scan at the heart of Mamba2, and the primitive the
+# harvested mamba2_ssd kernel implements. Two independent derivations:
+#
+#   reference — SEQUENTIAL RECURRENCE: carry the state h[P,N] step by step,
+#     h_t = a_t * h_{t-1} + x_t (outer) B_t, and read out y_t = h_t @ C_t. This
+#     is the "linear/recurrent" side of the duality.
+#
+#   sim — MATERIALIZED SEMISEPARABLE (the "quadratic"/attention side of SSD):
+#     build the T x T 1-semiseparable mixing matrix M[t,s] = (C_t . B_s) *
+#     prod_{r=s+1..t} a_r for s<=t (0 above the diagonal) and apply y = M @ x.
+#     No state is carried; the whole sequence mixes at once.
+#
+# Same output by the state-space duality, computed by opposite algorithms — a
+# non-vacuous parity check that also pins the causal decay (the part that makes
+# it a state-space scan and not plain causal linear attention).
+def _mamba2_reference(inp: dict) -> np.ndarray:
+    x, a, B, C = inp["x"], inp["a"], inp["B"], inp["C"]   # x[T,P] a[T] B[T,N] C[T,N]
+    x, a, B, C = (t.astype(np.float64) for t in (x, a, B, C))
+    T, P = x.shape
+    N = B.shape[1]
+    h = np.zeros((P, N), dtype=np.float64)
+    y = np.zeros((T, P), dtype=np.float64)
+    for t in range(T):
+        h = a[t] * h + np.outer(x[t], B[t])              # decay + rank-1 input
+        y[t] = h @ C[t]                                  # [P,N]@[N] -> [P]
+    return y.astype(np.float32)
+
+
+def _mamba2_sim(inp: dict) -> np.ndarray:
+    x, a, B, C = inp["x"], inp["a"], inp["B"], inp["C"]
+    x, a, B, C = (t.astype(np.float64) for t in (x, a, B, C))
+    pcum = np.cumprod(a)                                 # [T], prod_{0..t} a_r
+    # L[t,s] = prod_{r=s+1..t} a_r = pcum[t]/pcum[s] for s<=t, else 0
+    ratio = pcum[:, None] / pcum[None, :]                # [T,T]
+    L = np.tril(ratio)                                   # causal (incl diagonal)
+    scores = C @ B.T                                     # [T,T], C_t . B_s
+    M = L * scores                                       # 1-semiseparable mixer
+    y = M @ x                                            # [T,P]
+    return y.astype(np.float32)
+
+
+def _mamba2_inputs() -> dict:
+    g = _rng(20260910)
+    T, P, N = 32, 8, 16
+    return {
+        "x": g.standard_normal((T, P)).astype(np.float32),
+        "B": g.standard_normal((T, N)).astype(np.float32),
+        "C": g.standard_normal((T, N)).astype(np.float32),
+        # per-step decay in (0.8,0.99): bounded, and not so small the semisep
+        # cumulative-product ratios underflow at T=32.
+        "a": (0.8 + 0.19 * g.random(T)).astype(np.float32),
+    }
+
+
 # --- RoPE (dense-attention primitive, reused independent pair) --------------
 # invent_kernels already ships an independent reference (strided scatter) vs
 # kernel-shaped impl (scatter-free stack/flatten). Reuse them verbatim.
@@ -315,6 +370,13 @@ register_oracle(
              "latent_attention", "mla_decode", "mla_attention", "deepseek_mla"),
     notes="multi-head latent attention decode: reconstruct-KV reference vs "
           "absorbed-projection sim (attend in latent space; independent algorithms)")
+
+register_oracle(
+    "Mamba2", _mamba2_reference, _mamba2_sim, _mamba2_inputs,
+    aliases=("mamba2", "mamba_2", "ssd", "ssm", "mamba2_ssd", "state_space_dual",
+             "selective_scan"),
+    notes="Mamba2/SSD: sequential state-recurrence reference vs materialized "
+          "1-semiseparable (quadratic-dual) sim (state-space duality)")
 
 _register_rope()
 _register_attn_sink()

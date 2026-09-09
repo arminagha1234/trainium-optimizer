@@ -247,3 +247,51 @@ def test_mla_oracle_catches_a_dropped_rope_term():
 def test_mla_is_covered_by_audit():
     """audit_oracles no longer reports MLA as a missing (uncovered) primitive."""
     assert "MLA" not in audit_oracles()["missing"]
+
+
+# -- Mamba2 / SSD (state-space duality) decode oracle -------------------------
+
+def test_mamba2_alias_resolution():
+    """The Mamba2 oracle is reachable via its canonical name, explicit aliases,
+    and any PRIMITIVE_TO_KERNEL spelling that routes to it."""
+    canonical = get_oracle("Mamba2")
+    assert canonical is not None and canonical.name == "Mamba2"
+    for spelling in ("mamba2", "Mamba2", "mamba_2", "ssd", "ssm", "mamba2_ssd",
+                     "state_space_dual", "selective_scan"):
+        o = get_oracle(spelling)
+        assert o is canonical, f"{spelling!r} did not resolve to the Mamba2 oracle"
+
+
+def test_mamba2_oracle_reference_and_sim_agree():
+    """Sequential state-recurrence reference vs materialized 1-semiseparable sim
+    (the two sides of the state-space duality) agree — a non-vacuous parity
+    check for the SSD scan."""
+    o = get_oracle("Mamba2")
+    assert o is not None and not o.vacuous
+    inp = o.make_inputs()
+    out = o.reference(inp)
+    assert isinstance(out, np.ndarray) and np.all(np.isfinite(out))
+    assert out.shape == (inp["x"].shape[0], inp["x"].shape[1])     # [T, P]
+    assert np.array_equal(out, o.reference(o.make_inputs()))       # deterministic
+    assert np.allclose(out, o.sim(inp), atol=1e-4)                 # recurrence == semisep
+
+
+def test_mamba2_oracle_catches_dropped_decay():
+    """Dropping the state decay collapses SSD into plain causal linear attention;
+    the oracle must reject that (it pins the state-space part, not just
+    causality)."""
+    o = get_oracle("Mamba2")
+    assert o is not None
+    inp = o.make_inputs()
+    x = inp["x"].astype(np.float64)
+    B = inp["B"].astype(np.float64)
+    C = inp["C"].astype(np.float64)
+    m_nodecay = np.tril(C @ B.T)           # L = 1 everywhere (decay removed)
+    y_bug = (m_nodecay @ x).astype(np.float32)
+    assert not np.allclose(o.reference(inp), y_bug, atol=1e-4)
+
+
+def test_mamba2_is_covered_by_audit():
+    """audit_oracles no longer reports Mamba2 as a missing (uncovered)
+    primitive."""
+    assert "Mamba2" not in audit_oracles()["missing"]
