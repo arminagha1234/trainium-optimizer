@@ -139,3 +139,57 @@ def test_attention_sink_is_covered_by_audit():
     if o is None:
         return
     assert "AttentionSink" not in audit_oracles()["missing"]
+
+
+# -- head_dim=256 decode oracle (validates the harvested decode_hd256 kernels) -
+
+def test_attn_hd256_alias_resolution():
+    """The AttnDecodeHD256 oracle is reachable via its canonical name, explicit
+    aliases, and PRIMITIVE_TO_KERNEL spellings (hd256, decode_hd256, ...)."""
+    canonical = get_oracle("AttnDecodeHD256")
+    if canonical is None:      # invent_kernels unavailable -> oracle not registered
+        return
+    assert canonical.name == "AttnDecodeHD256"
+    for spelling in ("attndecodehd256", "decode_hd256", "attn_hd256", "hd256",
+                     "head_dim_256", "attention_decode_hd256"):
+        assert get_oracle(spelling) is canonical, f"{spelling!r} did not resolve"
+
+
+def test_attn_hd256_oracle_reference_and_sim_agree():
+    """Full-head_dim softmax reference vs split-K/split-V online-softmax sim —
+    the two independent derivations agree (non-vacuous parity for the primitive
+    the harvested customer_armin decode_hd256 kernels implement)."""
+    o = get_oracle("AttnDecodeHD256")
+    if o is None:
+        return
+    assert not o.vacuous
+    inp = o.make_inputs()
+    out = o.reference(inp)
+    assert isinstance(out, np.ndarray) and np.all(np.isfinite(out))
+    assert out.shape == (1, inp["q"].shape[1]) and inp["q"].shape[1] == 256
+    assert np.array_equal(out, o.reference(o.make_inputs()))    # deterministic
+    assert np.allclose(out, o.sim(inp), atol=1e-4)             # split-K == full
+
+
+def test_attn_hd256_oracle_catches_a_dropped_head_half():
+    """The oracle validates that BOTH 128-halves of the split-K head dim are
+    used: an impl that drops the hi half (a real split-K bug) diverges from the
+    reference, so the parity check rejects it."""
+    o = get_oracle("AttnDecodeHD256")
+    if o is None:
+        return
+    inp = o.make_inputs()
+    q, k, v = inp["q"], inp["k"], inp["v"]
+    d = q.shape[-1]
+    h = d // 2
+    scores = (q[:, :h] @ k[:, :h].T) / np.sqrt(d)     # lo half only (dropped hi)
+    e = np.exp(scores - scores.max())
+    lo_only = (e / e.sum()) @ v
+    assert not np.allclose(o.reference(inp), lo_only, atol=1e-4)
+
+
+def test_attn_hd256_is_covered_by_audit():
+    o = get_oracle("AttnDecodeHD256")
+    if o is None:
+        return
+    assert "AttnDecodeHD256" not in audit_oracles()["missing"]

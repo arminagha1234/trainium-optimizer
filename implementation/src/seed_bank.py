@@ -302,6 +302,39 @@ def seed_lessons() -> list[Lesson]:
             confidence=Confidence(n_models_validated=2, human_verified=True),
             last_reverified_sdk="2.28.0",
         ),
+
+        # --- measurement-validity guardrail (baseline hygiene) --------------
+        Lesson(
+            lesson_id="kernel-ab-baseline-compile-mode-hygiene",
+            type=LessonType.ANTI_PATTERN,
+            applicability=Applicability(dense, (0, 300e9), neuron_sdk_versions=sdk),
+            layer=Layer.KERNEL, migration_risk="low",
+            # No matcher ON PURPOSE: this is a MEASUREMENT-VALIDITY warning, not a
+            # config to pre-prune. It guards HOW a kernel A/B is measured, not
+            # which config to pick — so it never blocks a candidate, it warns.
+            reason=(
+                "When A/B-benchmarking a hand kernel against a baseline, BOTH "
+                "arms MUST use the same compile mode. Real case (customer_armin "
+                "decode_hd256): the kernel first measured 0.93x — '20% SLOWER' — "
+                "against a baseline LABELLED 'eager' that was actually "
+                "torch.compile'd. Re-run against a TRUE eager baseline, the SAME "
+                "kernel was 4.77x FASTER; the verdict flipped purely by fixing "
+                "the denominator. Never trust a kernel speedup whose baseline "
+                "compile mode is unstated or mismatched: record the baseline's "
+                "exact compile mode next to the number and compare like-for-like."
+            ),
+            symptoms_addressed=[Symptom(
+                bottleneck="measurement_validity",
+                signature="kernel A/B speedup hinges on an unstated/mismatched "
+                          "baseline compile mode",
+                observed_via="a kernel reported 'slower than eager' where the "
+                             "'eager' arm was really torch.compile'd",
+            )],
+            source="Armin-Neuron nki-kernels decode_hd256 v1-vs-eager "
+                   "verdict-reversal (compile-mode mislabel)",
+            confidence=Confidence(n_models_validated=1, human_verified=True),
+            last_reverified_sdk="2.28.0",
+        ),
     ]
 
 

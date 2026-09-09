@@ -564,6 +564,55 @@ def _attn_sink_inputs(S: int, d: int, seed: int) -> Inputs:
     }
 
 
+# ---- head_dim=256 decode attention (split-K/split-V; Qwen3.5/3.6, Gemma-4) --
+# head_dim 256 > 128, and the tensor engine contracts on <=128 partitions, so the
+# head dim must be SPLIT into two 128-halves: score = Q_lo@K_lo^T + Q_hi@K_hi^T,
+# and out = [P@V_lo | P@V_hi]. Stock NF.attention_decode REJECTS head_dim>128, so
+# this needs a hand kernel (the harvested customer_armin decode_hd256 kernels).
+# Two INDEPENDENT numpy derivations make the oracle non-vacuous:
+#   _attn_hd256_reference : one dense softmax attention at the FULL head_dim=256.
+#   _attn_hd256_impl      : the SPLIT-K + online-softmax + SPLIT-V accumulation
+#                           the kernel actually performs. Different code, same math.
+def _attn_hd256_reference(inp: Inputs) -> np.ndarray:
+    q, k, v = inp["q"], inp["k"], inp["v"]          # q[1,256] k,v[S,256]
+    d = q.shape[-1]
+    scores = (q @ k.T) / np.sqrt(d)                 # [1,S] full head_dim contraction
+    return (_softmax(scores, axis=-1) @ v).astype(np.float32)   # [1,256]
+
+
+def _attn_hd256_impl(inp: Inputs) -> np.ndarray:
+    q, k, v = inp["q"], inp["k"], inp["v"]
+    d = q.shape[-1]
+    S = k.shape[0]
+    h = d // 2                                      # 128-wide head-dim halves
+    scale = 1.0 / np.sqrt(d)
+    q_lo, q_hi = q[:, :h], q[:, h:]
+    run_m = -1.0e30
+    run_l = 0.0
+    acc_lo = np.zeros((1, h), dtype=np.float64)
+    acc_hi = np.zeros((1, h), dtype=np.float64)
+    for j in range(0, S, 128):                      # online softmax over ctx tiles
+        k_lo, k_hi = k[j:j + 128, :h], k[j:j + 128, h:]
+        sc = (q_lo @ k_lo.T + q_hi @ k_hi.T) * scale   # split-K score accumulation
+        new_m = max(run_m, float(sc.max()))
+        corr = np.exp(run_m - new_m)
+        e = np.exp(sc - new_m)
+        run_l = run_l * corr + float(e.sum())
+        acc_lo = acc_lo * corr + e @ v[j:j + 128, :h]  # split-V accumulation
+        acc_hi = acc_hi * corr + e @ v[j:j + 128, h:]
+        run_m = new_m
+    return np.concatenate([acc_lo / run_l, acc_hi / run_l], axis=-1).astype(np.float32)
+
+
+def _attn_hd256_inputs(S: int, seed: int) -> Inputs:
+    g = _rng(seed)
+    return {
+        "q": g.standard_normal((1, 256)).astype(np.float32),
+        "k": g.standard_normal((S, 256)).astype(np.float32),
+        "v": g.standard_normal((S, 256)).astype(np.float32),
+    }
+
+
 # ---- long-context flash attention (whole-sequence, streaming softmax) -------
 # Matches the on-device-validated flash_nki_opt kernel banked under
 # kernels/FlashAttention: q,k,v are (d_head, seqlen); the output is
@@ -983,6 +1032,55 @@ def attn_sink_decode_kernel(q, k, v, sink):
 '''
 
 
+def _src_attn_hd256_decode() -> str:
+    return _HEADER + '''
+
+@nki.jit
+def attn_hd256_decode_kernel(q, k, v):
+    """Single-query decode attention for head_dim=256 via split-K / split-V
+    (Qwen3.5/3.6 GQA, Gemma-4). q [1, 256], k/v [S, 256]. The tensor engine
+    contracts on <=128 partitions, so the head dim is split into two 128-halves:
+    score = Q_lo@K_lo^T + Q_hi@K_hi^T (split-K), online softmax over 512-key
+    tiles, out = [P@V_lo | P@V_hi] (split-V). Stock attention_decode rejects
+    head_dim>128, so this is the borrow-before-invent hand kernel."""
+    one, d = q.shape
+    S, _ = k.shape
+    h = d // 2
+    out = nl.ndarray((1, d), dtype=q.dtype, buffer=nl.shared_hbm)
+    scale = 1.0 / nl.sqrt(d * 1.0)
+    n_tiles = (S + _PSUM_FREE - 1) // _PSUM_FREE
+    ix = nl.mgrid[0:_PMAX, 0:_PSUM_FREE]
+
+    q_lo = nl.load(q[0:1, 0:h])
+    q_hi = nl.load(q[0:1, h:d])
+    run_max = nl.full((1, 1), -1.0e30, dtype=nl.float32)
+    run_sum = nl.full((1, 1), 0.0, dtype=nl.float32)
+    acc_lo = nl.full((1, h), 0.0, dtype=nl.float32)
+    acc_hi = nl.full((1, h), 0.0, dtype=nl.float32)
+    for j in nl.affine_range(n_tiles):
+        base = j * _PSUM_FREE
+        k_lo = nl.load(k[base:base + _PSUM_FREE, 0:h], mask=(ix.p < 1))
+        k_hi = nl.load(k[base:base + _PSUM_FREE, h:d], mask=(ix.p < 1))
+        v_lo = nl.load(v[base:base + _PSUM_FREE, 0:h], mask=(ix.p < 1))
+        v_hi = nl.load(v[base:base + _PSUM_FREE, h:d], mask=(ix.p < 1))
+        sc_lo = nl.matmul(q_lo, k_lo, transpose_x=False)     # [1, tile]
+        sc_hi = nl.matmul(q_hi, k_hi, transpose_x=False)     # [1, tile]
+        scores = nl.multiply(nl.add(sc_lo, sc_hi), scale)    # split-K score sum
+        tile_max = nl.max(scores, axis=1)
+        new_max = nl.maximum(run_max, tile_max)
+        corr = nl.exp(nl.subtract(run_max, new_max))
+        p = nl.exp(nl.subtract(scores, new_max))
+        run_sum = nl.add(nl.multiply(run_sum, corr), nl.sum(p, axis=1))
+        acc_lo = nl.add(nl.multiply(acc_lo, corr), nl.matmul(p, v_lo, transpose_x=False))
+        acc_hi = nl.add(nl.multiply(acc_hi, corr), nl.matmul(p, v_hi, transpose_x=False))
+        run_max = new_max
+    inv = nl.reciprocal(run_sum)
+    nl.store(out[0:1, 0:h], nl.multiply(acc_lo, inv))    # split-V write: lo half
+    nl.store(out[0:1, h:d], nl.multiply(acc_hi, inv))    # split-V write: hi half
+    return out
+'''
+
+
 def _src_rmsnorm() -> str:
     return _HEADER + '''
 
@@ -1108,6 +1206,12 @@ _RECIPES: dict[str, _AuthorRecipe] = {
         "single-query decode attention + learned per-head sink logit (GPT-OSS / "
         "DeepSeek-V4); online softmax over 512-key tiles, sink folded into the "
         "denominator once at the end; full-softmax reference vs online-softmax impl"),
+    "attn_hd256": _AuthorRecipe(
+        _attn_hd256_impl, _src_attn_hd256_decode, "attn_hd256_decode_kernel", "invented",
+        "head_dim=256 split-K/split-V single-query decode attention (Qwen3.5/3.6 "
+        "GQA, Gemma-4); stock attention_decode rejects head_dim>128; full-head_dim "
+        "softmax reference vs split-K online-softmax impl. Validates the harvested "
+        "customer_armin decode_hd256 kernels"),
     # --- bootstrap seeds (regression only) ---------------------------------
     "rmsnorm": _AuthorRecipe(
         _rmsnorm_reference, _src_rmsnorm, "rmsnorm_kernel", "seed-adapted",
@@ -1238,6 +1342,17 @@ def _spec_attn_sink() -> OpSpec:
         primitive="AttentionSink")
 
 
+def _spec_attn_hd256() -> OpSpec:
+    return OpSpec(
+        "attn_hd256", "dense_causal_lm", "attn-decode-hd256", "bf16",
+        _attn_hd256_reference,
+        lambda: _attn_hd256_inputs(512, 51),
+        lambda: _attn_hd256_inputs(2048, 52),
+        baseline="torch-eager split-K SDPA (head_dim=256, 1 query)", origin="invented",
+        notes="head_dim=256 split-K/split-V single-query decode attention",
+        primitive="AttnDecodeHD256")
+
+
 def _spec_rmsnorm() -> OpSpec:
     return OpSpec(
         "rmsnorm", "dense_causal_lm", "rmsnorm-h128", "bf16",
@@ -1276,13 +1391,14 @@ _CATALOG_BUILDERS: dict[str, Callable[[], OpSpec]] = {
     "layernorm": _spec_layernorm,
     "attn_decode": _spec_attn_decode,
     "attn_sink": _spec_attn_sink,
+    "attn_hd256": _spec_attn_hd256,
     "rmsnorm": _spec_rmsnorm,
     "silu_gate": _spec_silu_gate,
     "softmax": _spec_softmax,
 }
 
 WRITE_NEW_OPS = ("rope_apply", "gelu_tanh", "softcap", "add_rmsnorm",
-                 "layernorm", "attn_decode", "attn_sink")
+                 "layernorm", "attn_decode", "attn_sink", "attn_hd256")
 SEED_OPS = ("rmsnorm", "silu_gate", "softmax", "add_rmsnorm")
 
 

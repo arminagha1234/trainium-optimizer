@@ -85,6 +85,13 @@ PRIMITIVE_TO_KERNEL: dict[str, str] = {
     "sinkattention": "AttentionSink",       # sink_attention
     "gptoss": "AttentionSink",             # gpt-oss uses per-head attention sinks
     "gptossattention": "AttentionSink",
+    # head_dim=256 decode attention (split-K/split-V) — stock attention_decode
+    # rejects head_dim>128; needed by Qwen3.5/3.6 GQA and Gemma-4.
+    "attndecodehd256": "AttnDecodeHD256",
+    "decodehd256": "AttnDecodeHD256",
+    "attnhd256": "AttnDecodeHD256",
+    "hd256": "AttnDecodeHD256",
+    "headdim256": "AttnDecodeHD256",
     # long-context flash attention — the streaming online-softmax kernel that
     # never materializes [S,S] and is the ONLY path that runs S=8192 attention
     # (the compiler OOMs on the dense form). On-device validated (rank 4).

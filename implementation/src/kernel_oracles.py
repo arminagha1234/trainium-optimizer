@@ -209,6 +209,24 @@ def _register_attn_sink() -> None:
               "online-softmax+sink impl (independent algorithms)")
 
 
+# --- head_dim=256 decode attention — validates the harvested decode_hd256 ----
+# full-head_dim softmax reference vs split-K/split-V online-softmax impl (what
+# the customer_armin decode_hd256 kernels do). Independent -> non-vacuous.
+def _register_attn_hd256() -> None:
+    try:
+        from invent_kernels import (_attn_hd256_impl, _attn_hd256_inputs,
+                                     _attn_hd256_reference)
+    except Exception:  # noqa: BLE001 — optional; the other oracles stand alone
+        return
+    register_oracle(
+        "AttnDecodeHD256", _attn_hd256_reference, _attn_hd256_impl,
+        lambda: _attn_hd256_inputs(512, 51),
+        aliases=("decode_hd256", "attn_hd256", "hd256", "head_dim_256",
+                 "attention_decode_hd256"),
+        notes="head_dim=256 decode: full-head_dim softmax reference vs "
+              "split-K/split-V online-softmax impl (independent algorithms)")
+
+
 register_oracle(
     "DeltaNet", _delta_reference, _delta_sim, _delta_inputs,
     # aliases beyond what PRIMITIVE_TO_KERNEL already routes; get_oracle also
@@ -218,3 +236,4 @@ register_oracle(
 
 _register_rope()
 _register_attn_sink()
+_register_attn_hd256()
