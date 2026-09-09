@@ -151,8 +151,11 @@ def test_publish_refuses_empty_run(tmp_path: Path):
 
 
 def test_native_pytorch_is_structurally_a_backend():
-    """The stub must satisfy the Backend protocol shape (methods present),
-    even though they raise NotImplementedError when called."""
+    """The native backend satisfies the Backend protocol shape and is
+    constructible + introspectable off-device: config_axes() and
+    toolchain_stamp() are safe to read on a laptop (no torch/transformers),
+    while the heavier methods import their on-device deps lazily — so importing
+    and inspecting the backend never requires those deps."""
     from backends.base import Backend
     from backends.native_pytorch import NativePyTorchBackend
 
@@ -162,6 +165,10 @@ def test_native_pytorch_is_structurally_a_backend():
     # config_axes and toolchain_stamp are safe to call off-device
     assert "tp_degree" in be.config_axes()
     assert be.toolchain_stamp()["device_string"] == "neuron"
-    # the on-device methods raise until implemented
-    with pytest.raises(NotImplementedError):
-        be.build_baseline("google/gemma-4-31B")
+    # The protocol methods that touch HF config / the device are present and
+    # callable; they pull transformers/torch in lazily, so the construction and
+    # introspection above required neither. (build_baseline reads HF config, so
+    # it is exercised by the on-device suite, not here.)
+    for method in ("build_baseline", "compile", "measure", "profile",
+                   "kernel_swap_points"):
+        assert callable(getattr(be, method)), method
