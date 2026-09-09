@@ -80,6 +80,20 @@ SEED_MODELS: dict[str, ModelSpec] = {
         model_id="Qwen/Qwen3-8B", family="dense_causal_lm",
         param_count=8e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1,
     ),
+    # MoE seed (family="moe_causal_lm") — mirrors the Armin-Neuron MoE zoo
+    # (Qwen3-30B-A3B in Armin-Neuron/qwen3-30b-a3b). 30B total / ~3B active,
+    # GQA-4, 128 experts (8 active/token). At tp4 the weights are ~15GB/rank in
+    # bf16, so unlike the 27-32B *dense* seeds (which need tp8) this one FITS
+    # trn2.3xlarge and actually runs. Exercises the MoE-specific paths: the
+    # router top-k dtype shim (backends/moe_router_patch, the OLMoE int64-topk
+    # fix) and the grouped-expert dispatch. This is the one causal-LM *family*
+    # the Armin zoo has that the seed list was missing (the dense Qwen3.5-4B /
+    # Qwen3.6-27B / Gemma4 ports already map onto the dense seeds below).
+    "qwen3-30b-a3b": ModelSpec(
+        model_id="Qwen/Qwen3-30B-A3B", family="moe_causal_lm",
+        param_count=30e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1,
+        num_kv_heads=4,
+    ),
     # Large dense text seed — replaces the non-open muse-glimmer-30b. Verified
     # working at tp8 (8.4GB/rank) on real HW, 2026-08-18.
     "qwen3-32b": ModelSpec(
