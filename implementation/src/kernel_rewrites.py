@@ -339,8 +339,10 @@ REWRITES: tuple[Rewrite, ...] = (
         name="argsort-to-argmax-mask",
         summary="Replace an unlowerable argsort/topk-sort with a sort-free "
                 "iterative argmax-on-equality-mask (N/8 passes).",
-        error_signatures=("argsort", "sort is not", "unlowerable sort",
-                          "aten::argsort"),
+        # "sort is not" removed: it is a fragment of "Operation sort is not
+        # supported" (NCC_EVRF029), which is topk-sort-to-argmax's exact signature.
+        # argsort failures are distinguished by the literal "argsort" token.
+        error_signatures=("argsort", "unlowerable sort", "aten::argsort"),
         hostile_ops=("aten::argsort", "aten::sort", "argsort"),
         fix=(
             "# argsort/sort do not lower on Neuron. Rank via iterative argmax with\n"
@@ -442,7 +444,10 @@ REWRITES: tuple[Rewrite, ...] = (
         name="fp8-e4m3-240-saturate",
         summary="Byte-saturate OCP e4m3 codes >240 onto the trn2 ±240 grid; do "
                 "NOT rescale by 240/448 (that moves every element off the grid).",
-        error_signatures=("e4m3", "448", "240", "inf", "NaN from fp8"),
+        # fp8-qualified tokens only: bare "240"/"448"/"inf" over-matched (e.g.
+        # "240" appears inside compiler location ids like loc(fused<132406>)).
+        # Any genuine e4m3 range error names the dtype, so "e4m3" is the anchor.
+        error_signatures=("e4m3", "float8_e4m3", "fp8_e4m3", "e4m3fn", "NaN from fp8"),
         hostile_ops=(),
         fix=(
             "# trn2 legacy e4m3 max is 240; OCP e4m3 max is 448. Out-of-range OCP\n"

@@ -244,3 +244,23 @@ def test_compiler_log_signatures_do_not_appear_in_lint_messages():
     for msg in lint_msgs:
         names = {r.name for r in match_error(msg)}
         assert not (names & graph_entries), (msg, names)
+
+
+def test_harvested_rules_do_not_cross_match_canonical_compiler_logs():
+    # Regression guard for PR #74's harvested rules. They shipped with over-broad
+    # signatures — fp8-e4m3-240-saturate carried a bare "240" (which matches the
+    # digits inside compiler location ids like loc(fused<132406>)), and
+    # argsort-to-argmax-mask carried "sort is not" (a fragment of the NCC_EVRF029
+    # "Operation sort is not supported" log that belongs to topk-sort-to-argmax).
+    # Both must fire ONLY on their own error class, never on the three canonical
+    # compiler logs that route elsewhere.
+    for log in (AFFINE_SELECT_LOG, TOPK_LOG, SORT_LOG):
+        names = [r.name for r in match_error(log)]
+        assert "fp8-e4m3-240-saturate" not in names, (log, names)
+        assert "argsort-to-argmax-mask" not in names, (log, names)
+    # ...but each still routes on a genuine failure in its own class.
+    fp8_log = ("RuntimeError: reading float8_e4m3 codes produced NaN from fp8 "
+               "overflow (OCP e4m3 max 448 vs trn2 legacy 240)")
+    assert "fp8-e4m3-240-saturate" in [r.name for r in match_error(fp8_log)]
+    argsort_log = "error: aten::argsort is an unlowerable sort on trn2"
+    assert "argsort-to-argmax-mask" in [r.name for r in match_error(argsort_log)]
