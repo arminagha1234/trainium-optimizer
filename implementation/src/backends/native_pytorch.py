@@ -38,8 +38,11 @@ from backends.base import (
     Profile,
     placement_axes,
 )
-from transformers import AutoConfig
-
+# transformers is imported lazily inside _hf_config (not at module top): it is a
+# heavy on-device dependency, and keeping it out of the import path lets this
+# backend be constructed and introspected on a laptop (config axes, structural
+# checks) without transformers/torch installed — the mock/test surface never
+# needs it. Only the actual on-device config read pulls it in.
 from backends.device_reap import reap as _reap
 
 _WORKER = Path(__file__).resolve().parent / "neuron_worker.py"
@@ -386,6 +389,7 @@ class NativePyTorchBackend:
 
     def _hf_config(self, model_id: str):
         if model_id not in self._cfg_cache:
+            from transformers import AutoConfig  # lazy: heavy on-device dep only
             self._cfg_cache[model_id] = AutoConfig.from_pretrained(
                 model_id, trust_remote_code=True)
         return self._cfg_cache[model_id]
