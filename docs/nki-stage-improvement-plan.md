@@ -1,8 +1,10 @@
 # NKI / Megakernel-Writing Stage — Improvement Plan (living doc)
 
-> **Status:** DRAFT v2 · started 2026-09-10 · owner: Armin
+> **Status:** DRAFT v3 · started 2026-09-10 · owner: Armin
 > **v2 (2026-09-10):** added §6 cross-hardware research (TPU playbook from the verified
 > SAIL Gemma-v6e blog + GPU algorithmic patterns), new rec R25 (silent-perf detectors).
+> **v3 (2026-09-10):** began implementation. R1 landed (◐ — offline plumbing done+tested,
+> device activation pending one on-device run), R17 landed (☑). See §9 implementation log.
 > **Purpose:** a reviewable, add-to-later plan for improving the framework's Stage-4
 > (invent / NKI kernel authoring) and megakernel-writing path. This is a PLAN, not a
 > changelog — every recommendation has a status box so we can check things off and
@@ -127,7 +129,7 @@ Legend: **Effort** S/M/L · **Device?** Y (needs Trainium) / N (offline-safe) ·
 - **R1. Adopt `nki.simulate` as the offline correctness gate.** Run the actual NKI source on
   CPU vs `spec.reference` → kills the tautology; add NaN-uninit assertion; turn HW-constraint
   exceptions into error→fix keys; run `NKI_PRECISE_FP=0` then `=1` to separate algorithm bugs
-  from precision. Slots into the rank ladder as passed-simulate (rank 3). *Files:* `invent_engine.offline_gate`, `kernel_validation`. **Effort M · Device N · ☐**
+  from precision. Slots into the rank ladder as passed-simulate (rank 3). *Files:* `invent_engine.offline_gate`, `kernel_validation`. **Effort M · Device N · ◐** — *landed 2026-09-10: `kernel_simulate.py` (import-guarded runner, honest off-simulator deferral, `NKI_PRECISE_FP` algorithm-vs-precision triage, NaN/Inf reject), `offline_gate` folds the verdict in as the authoritative independent parity signal, `KernelValidation.from_simulate()` (rank-3 simulate tier). 20 tests; device-activation of the real simulate path pending one on-device run.*
 - **R2. Reuse the internal `nki.simulate` test harness** (`OutputValidator`, `golden_provider`,
   `determinism_checker`, `core_lock_manager`, `kaizen_host_source`) instead of hand-rolling.
   **Effort M · Device N · ☐**
@@ -157,7 +159,7 @@ Legend: **Effort** S/M/L · **Device?** Y (needs Trainium) / N (offline-safe) ·
 - **R14. Test-set minimizer** to keep the gate cheap as the set grows. **Effort S · Device N · ☐**
 - **R15. Framework custom-op path** for end-to-end model validation + HLO dump. **Effort M · Device Y · ☐**
 - **R16. `nrtpy` framework-free race harness.** **Effort S · Device Y · ☐**
-- **R17. Grow oracle coverage + `audit_oracles()` as a CI gate** (simulator largely supersedes hand sims; keep as coverage insurance). **Effort S · Device N · ☐**
+- **R17. Grow oracle coverage + `audit_oracles()` as a CI gate** (simulator largely supersedes hand sims; keep as coverage insurance). **Effort S · Device N · ☑** — *landed 2026-09-10: added a non-vacuous FlashAttention oracle (full-softmax ref vs independent online-softmax sim), shrank the audit missing set 10→9, added the `KNOWN_UNCOVERED` documented+shrinking allowlist for the 9 primitives still needing a grounded reference (→R3), and `test_audit_oracles_is_a_ci_gate` (fresh-subprocess gate: zero vacuous, every uncovered kernel consciously allowlisted, allowlist only shrinks).*
 - **R18. Enforce the NKI coding-guidelines/review rubric + hard constraints** (output=`shared_hbm`; one E4M3/trace; module-scope helpers). **Effort S · Device N · ☐**
 
 ### Tier 3 — longer-term / experimental
@@ -368,7 +370,7 @@ recs, which is the honest outcome:
 
 | # | Rec | Tier | Effort | Device | Status |
 |---|---|---|---|---|---|
-| R1 | nki.simulate offline gate | 0 | M | N | ☐ |
+| R1 | nki.simulate offline gate | 0 | M | N | ◐ (offline done+tested; device-activation pending) |
 | R2 | reuse sim test harness | 0 | M | N | ☐ |
 | R3 | harvest nki-library + twins | 0 | M | N | ☐ |
 | R4 | NAKB/NKIBench scoreboard | 0 | M | Y | ☐ |
@@ -384,7 +386,7 @@ recs, which is the honest outcome:
 | R14 | test-set minimizer | 2 | S | N | ☐ |
 | R15 | framework custom-op e2e | 2 | M | Y | ☐ |
 | R16 | nrtpy race harness | 2 | S | Y | ☐ |
-| R17 | oracle coverage + CI audit | 2 | S | N | ☐ |
+| R17 | oracle coverage + CI audit | 2 | S | N | ☑ (FlashAttention oracle + audit CI gate + allowlist) |
 | R18 | coding-guidelines rubric | 2 | S | N | ☐ |
 | R19 | gpt_oss giga-kernel imitation | 3 | L | Y | ☐ |
 | R20 | schedule-search template | 3 | M | N | ☐ |
@@ -410,3 +412,39 @@ recs, which is the honest outcome:
 - `nki_knowledge.py` — retrieval corpus (nki-library exemplars) — A/B its value first.
 - `kernel_perf.py` / `kernel_mutator.py` — perf oracle + profile-guided levers.
 - `fusion.py` — megakernel targets + fused-in-name-only detector (M4).
+
+
+---
+
+## 9. Implementation log
+
+Chronological record of landed work (branch `feat/attention-sink-kernel`). Each
+entry is offline-safe and verified against the framework pytest in the trainopt
+venv (923 baseline passing; pre-existing torch/boto3-only failures untouched).
+The running 72h soak is NOT disturbed — it runs from a separate checkout on the
+Kaizen desktop and Stage-4 invent is still a stub there, so these edits are dormant
+until Stage 4 is wired (a later rec) and a fresh launch is authorized.
+
+- **2026-09-10 — R1 (nki.simulate offline gate) ◐.** New `kernel_simulate.py`:
+  import-guarded runner that executes the REAL authored kernel on CPU via
+  `nki.simulate_kernel` and compares to the reference (breaking the numpy_impl
+  tautology). Honest deferral (`ran=False`) off a simulator box; `NKI_PRECISE_FP=0→1`
+  algorithm-vs-precision triage; NaN/Inf reject; both invocation conventions;
+  injectable `sim_fn`/`load_entry` seams for CPU testing. Wired into
+  `invent_engine.offline_gate` (new `simulate_fn` seam + `_simulate` + OfflineGate
+  fields `simulate_ran/ok/precise_fp`) as the authoritative independent parity
+  signal. `kernel_validation.from_simulate()` maps the outcome onto the ladder
+  (rank-3 simulate → REVALIDATE_ON_DEVICE per the Mamba lesson). 20 new tests, all
+  green; off-simulator behaviour byte-for-byte unchanged. **Open:** the real
+  `simulate_kernel` execution path needs one on-device validation (can't run `nki`
+  on the dev laptop) — until then it cleanly defers.
+- **2026-09-10 — R17 (oracle coverage + audit CI gate) ☑.** Added a non-vacuous
+  FlashAttention oracle (full-`[S,S]`-softmax reference vs an independent streaming
+  online-softmax sim; test proves it catches a dropped-K/V-block bug). Audit
+  `missing` set shrank 10→9. Added `KNOWN_UNCOVERED` — a documented, shrinking
+  allowlist for the 9 primitives (KDA, LightningAttn, RWKV6/7, mLSTM, sLSTM, RGLRU,
+  PowerRetention, GlmMoeDsa) that still lack a GROUNDED reference (deliberately not
+  faked from memory — a wrong ground truth is worse than none; they land as R3
+  harvests their `_torch` twins). `test_audit_oracles_is_a_ci_gate` runs the audit in
+  a fresh subprocess and enforces: zero vacuous oracles, every uncovered kernel
+  consciously allowlisted, allowlist only shrinks.
