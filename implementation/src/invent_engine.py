@@ -1306,6 +1306,34 @@ class InventEngine:
                                 lesson_id=lid, detail=f"incorrect on device{desc_sfx}",
                                 lessons_consulted=n)
 
+        # RUN-LOG ARBITRATION (R8 / anti-reward-hacking): a CORRECT kernel whose
+        # MEASURED %SOL exceeds the physical roofline is faster than the hardware
+        # allows — the timing caught dispatch, a result-cache hit, or a DCE'd
+        # output, NOT real compute (the ~788x fake-speedup class). The physical
+        # ceiling ARBITRATES the measured number: such a "win" is an artifact and
+        # is banked as an anti-pattern, never a win. Fail-open (sol<=0 unmeasured
+        # is not vetoed); only reached for a correct, actually-raced result, so the
+        # off-device / injected-race paths with sol=0.0 are unaffected.
+        try:
+            import roofline  # noqa: PLC0415 — optional, self-contained
+            _implausible = roofline.is_implausible_sol(
+                float(getattr(race, "sol", 0.0) or 0.0))
+        except Exception:  # noqa: BLE001 — the veto is advisory; never break the gate
+            _implausible = False
+        if _implausible:
+            lid = self._bank_anti_pattern(
+                spec, f"implausible speedup {race.speedup:.3f}x at "
+                f"{race.sol * 100:.0f}% of SOL (> physical roofline) — timing "
+                f"measured dispatch, not compute; NOT banked as a win", race)
+            self._record(spec, Status.DISCARD, race.speedup, race.correctness_pct,
+                         f"implausible speedup (sol={race.sol * 100:.0f}% > "
+                         f"roofline) — measuring dispatch, not compute", n_lessons=n)
+            return InventResult(spec.name, spec.shape_class, spec.origin,
+                                "anti_pattern", offline, race, lesson_id=lid,
+                                detail=(f"implausible {race.speedup:.3f}x "
+                                        f"(sol={race.sol * 100:.0f}% > roofline)"),
+                                lessons_consulted=n)
+
         # PERF LOOP (only when asked): a kernel can be CORRECT but slow (the 0.08x
         # rmsnorm case, which otherwise dead-ends here as an anti-pattern). When
         # ``max_perf_rounds > 1`` we try to make it FAST *before* the invention

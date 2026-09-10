@@ -1343,3 +1343,39 @@ def test_catalog_kernels_have_no_nested_helpers(tmp_path):
     for name, spec in catalog().items():
         v = static_lint(author_kernel(spec).nki_src)
         assert not any("module scope" in s.lower() for s in v), f"{name}: {v}"
+
+
+# -- R8: implausible (faster-than-physics) speedup is NOT banked as a win -----
+def _implausible_win_race(_author, _spec) -> RaceResult:
+    # correct + "fast", but a %SOL of 250% is physically impossible: the timing
+    # measured dispatch, not compute (the ~788x fake-speedup class).
+    return RaceResult(True, correct=True, correctness_pct=100.0, speedup=50.0,
+                      kernel_ms=0.01, baseline_ms=0.5, reason="mock implausible",
+                      sol=2.5, profit_verdict="near_sol")
+
+
+def _plausible_win_race(_author, _spec) -> RaceResult:
+    # correct + fast + a healthy near-SOL reading -> a real win.
+    return RaceResult(True, correct=True, correctness_pct=100.0, speedup=1.30,
+                      kernel_ms=0.70, baseline_ms=0.91, reason="mock plausible",
+                      sol=0.90, profit_verdict="near_sol")
+
+
+def test_implausible_sol_speedup_banks_anti_pattern_not_win(tmp_path):
+    eng = InventEngine(out_dir=tmp_path)
+    res = eng.run_op(catalog()["softcap"], race_fn=_implausible_win_race)
+    assert res.status == "anti_pattern"
+    assert "implausible" in res.detail.lower()
+
+
+def test_plausible_near_sol_speedup_still_wins(tmp_path):
+    eng = InventEngine(out_dir=tmp_path)
+    res = eng.run_op(catalog()["gelu_tanh"], race_fn=_plausible_win_race)
+    assert res.status == "win"
+
+
+def test_win_with_unmeasured_sol_is_unaffected(tmp_path):
+    """The default injected races carry sol=0.0 (unmeasured) — the veto is
+    fail-open and must never void them."""
+    eng = InventEngine(out_dir=tmp_path)
+    assert eng.run_op(catalog()["softcap"], race_fn=_win_race).status == "win"

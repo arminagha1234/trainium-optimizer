@@ -110,6 +110,26 @@ def is_implausible_mfu(mfu_percent: float, tol: float = 0.0) -> bool:
     return mfu_percent > MFU_IMPLAUSIBLE_PCT * (1.0 + max(0.0, tol))
 
 
+# Default tolerance band for the PER-OP %SOL plausibility veto: a well-tiled
+# kernel can legitimately sit right at the roofline, and the measured peaks
+# (roofline.py) carry a few-% uncertainty, so only a clearly-impossible reading
+# is vetoed. 10% is generous enough never to void an honest near-SOL win while
+# still catching a dispatch-timed "faster than physics" number (the ~788x class,
+# where achieved FLOP/s or bandwidth is MANY times the ceiling).
+SOL_IMPLAUSIBLE_TOL = 0.10
+
+
+def is_implausible_sol(sol: float, tol: float = SOL_IMPLAUSIBLE_TOL) -> bool:
+    """True when a measured PER-OP %SOL (a fraction, 1.0 == the roofline) exceeds
+    the physical ceiling beyond the tolerance band — i.e. the kernel appears
+    faster than the hardware allows, so the timing measured DISPATCH, a result-
+    cache hit, or a dead-code-eliminated output, NOT real compute. The per-op
+    analog of ``is_implausible_mfu``; a True verdict means the measured speedup
+    is an artifact and must NOT be banked as a win. ``sol <= 0`` (unmeasured) is
+    NOT implausible — it is simply unknown (fail-open)."""
+    return sol > 1.0 * (1.0 + max(0.0, tol))
+
+
 # Profitability thresholds (fractions of SOL). Tunable; the pivot's guidance is
 # "low %SOL = opportunity, ~80% = don't bother".
 OPPORTUNITY_MAX_SOL = 0.40   # <= 40% of SOL -> a real authoring opportunity

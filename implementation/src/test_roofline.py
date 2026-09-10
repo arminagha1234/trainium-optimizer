@@ -129,3 +129,17 @@ def test_implausible_mfu_catches_a_fake_speedup():
     # 35e9 params, but "measured" 5e5 tok/s on ONE core -> way over the ceiling.
     fake = rf.model_mfu_percent(35e9, 5e5, 1, "bf16")
     assert fake > 100.0 and rf.is_implausible_mfu(fake)
+
+
+# -- per-op %SOL plausibility veto (R8 / anti-reward-hacking) -----------------
+
+def test_is_implausible_sol_boundary():
+    # sol is a fraction: 1.0 == the roofline. Default 10% tolerance band.
+    assert rf.is_implausible_sol(1.5) is True          # 150% of SOL -> impossible
+    assert rf.is_implausible_sol(1.05) is False        # within the noise band
+    assert rf.is_implausible_sol(1.11) is True         # past the band
+    assert rf.is_implausible_sol(0.9) is False         # healthy near-SOL
+    assert rf.is_implausible_sol(0.0) is False         # unmeasured -> not implausible
+    # explicit tolerance
+    assert rf.is_implausible_sol(1.2, tol=0.5) is False
+    assert rf.is_implausible_sol(1.6, tol=0.5) is True
