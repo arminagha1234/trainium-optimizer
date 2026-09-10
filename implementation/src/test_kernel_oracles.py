@@ -295,3 +295,114 @@ def test_mamba2_is_covered_by_audit():
     """audit_oracles no longer reports Mamba2 as a missing (uncovered)
     primitive."""
     assert "Mamba2" not in audit_oracles()["missing"]
+
+
+# -- FlashAttention oracle (long-context dense attention) --------------------
+
+def test_flash_alias_resolution():
+    """The FlashAttention oracle is reachable via its canonical name, explicit
+    aliases, and any PRIMITIVE_TO_KERNEL spelling that routes to it (flash,
+    flash_attention, sliding_window_attention, gemma4_attention, ...)."""
+    canonical = get_oracle("FlashAttention")
+    if canonical is None:      # invent_kernels unavailable -> oracle not registered
+        return
+    assert canonical.name == "FlashAttention"
+    for spelling in ("flash", "flashattn", "flash_attention", "FlashAttention",
+                     "attention_long_context", "sliding_window_attention",
+                     "gemma4_attention", "hetero_attention", "long_context_attention"):
+        o = get_oracle(spelling)
+        assert o is canonical, f"{spelling!r} did not resolve to the FlashAttention oracle"
+
+
+def test_flash_oracle_reference_and_sim_agree():
+    """Full-[S,S]-softmax reference vs streaming online-softmax (blocked running
+    max/denom) sim — two independent algorithms for the same attention, so the
+    parity check is non-vacuous and pins the online-softmax rescale."""
+    o = get_oracle("FlashAttention")
+    if o is None:
+        return
+    assert not o.vacuous
+    inp = o.make_inputs()
+    out = o.reference(inp)
+    assert isinstance(out, np.ndarray) and np.all(np.isfinite(out))
+    # reference is [S, d_head]; inputs are [d_head, S]
+    assert out.shape == (inp["q"].shape[1], inp["q"].shape[0])
+    assert np.array_equal(out, o.reference(o.make_inputs()))    # deterministic
+    assert np.allclose(out, o.sim(inp), atol=1e-4)              # online == full
+
+
+def test_flash_oracle_catches_a_truncated_context():
+    """The oracle validates that the kernel attends to the WHOLE key sequence: an
+    impl that drops half the K/V blocks (a real flash-blocking bug) diverges from
+    the full-softmax reference, so the parity check rejects it."""
+    o = get_oracle("FlashAttention")
+    if o is None:
+        return
+    inp = o.make_inputs()
+    q, k, v = inp["q"], inp["k"], inp["v"]         # each [d, S]
+    half = k.shape[1] // 2
+    scores = q.T @ k[:, :half]                     # attend to first half only
+    e = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    p = e / e.sum(axis=-1, keepdims=True)
+    truncated = p @ v[:, :half].T
+    assert not np.allclose(o.reference(inp), truncated, atol=1e-4)
+
+
+def test_flash_is_covered_by_audit():
+    o = get_oracle("FlashAttention")
+    if o is None:
+        return
+    assert "FlashAttention" not in audit_oracles()["missing"]
+
+
+# -- audit_oracles() as a CI gate (R17) --------------------------------------
+
+def test_audit_oracles_is_a_ci_gate():
+    """The audit is a real gate. Run it in a FRESH subprocess (so cross-test
+    oracle registrations like the vacuous sentinel above cannot pollute the
+    production invariant) and enforce:
+      (1) ZERO vacuous production oracles — the orphan-oracle bug;
+      (2) every uncovered kernel is consciously in KNOWN_UNCOVERED — a NEW
+          primitive with no oracle fails CI until it is covered or listed;
+      (3) KNOWN_UNCOVERED contains NO already-covered kernel — the allowlist can
+          only shrink as oracles land.
+    This is the exact check CI / preflight should run.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "import json, kernel_oracles as ko;"
+        "rep = ko.audit_oracles();"
+        "print(json.dumps({"
+        "'vacuous': rep['vacuous'],"
+        "'missing': rep['missing'],"
+        "'known': sorted(ko.KNOWN_UNCOVERED),"
+        "'covered': sorted({o.name for o in ko._ORACLES.values()}),"
+        "}))"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True,
+        cwd=os.path.dirname(os.path.abspath(__file__)))
+    assert proc.returncode == 0, f"audit subprocess failed: {proc.stderr}"
+    data = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    # (1) no vacuous production oracles
+    assert data["vacuous"] == [], f"vacuous oracles present: {data['vacuous']}"
+    # (2) every uncovered kernel is consciously allowlisted
+    unexpected = set(data["missing"]) - set(data["known"])
+    assert not unexpected, (
+        f"kernels missing an oracle and not in KNOWN_UNCOVERED: {sorted(unexpected)}")
+    # (3) the allowlist only shrinks: no already-covered kernel is still listed
+    stale = set(data["known"]) & set(data["covered"])
+    assert not stale, f"KNOWN_UNCOVERED lists already-covered kernels: {sorted(stale)}"
+
+
+def test_known_uncovered_shrank_by_flashattention():
+    """Regression: FlashAttention was uncovered before R17; it must no longer be
+    in the allowlist (the allowlist shrank when its oracle landed)."""
+    from kernel_oracles import KNOWN_UNCOVERED
+    assert "FlashAttention" not in KNOWN_UNCOVERED

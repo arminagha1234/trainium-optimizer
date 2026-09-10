@@ -357,6 +357,87 @@ def _register_attn_hd256() -> None:
               "split-K/split-V online-softmax impl (independent algorithms)")
 
 
+# --- FlashAttention (long-context dense attention) --------------------------
+# The registered, on-device-validated FlashAttention kernel was UNCOVERED by an
+# oracle (audit "missing"). Two genuinely independent algorithms for the SAME
+# math: the reference MATERIALIZES the full [S,S] score matrix and softmaxes it;
+# the sim never materializes it — it streams over K/V blocks with a running max +
+# running denominator (the online-softmax rescale flash attention is built on).
+# Same result, opposite memory pattern -> a non-vacuous parity check that also
+# pins the online-softmax rescale (the part a flash kernel gets wrong).
+def _flash_attn_sim(inp: dict) -> np.ndarray:
+    q, k, v = inp["q"], inp["k"], inp["v"]           # each [d, S]
+    qT = q.T.astype(np.float64)                      # [S, d] (queries as rows)
+    kT = k.T.astype(np.float64)                      # [S, d] (keys as rows)
+    vT = v.T.astype(np.float64)                      # [S, d] (values as rows)
+    S, d = qT.shape
+    m = np.full(S, -np.inf)                          # running max per query
+    l = np.zeros(S)                                  # running denom per query
+    acc = np.zeros((S, d))                           # running weighted sum
+    block = 17                                       # NOT a divisor of S: exercise rescale
+    for j0 in range(0, S, block):
+        kb = kT[j0:j0 + block]                       # [b, d]
+        vb = vT[j0:j0 + block]                       # [b, d]
+        s = qT @ kb.T                                # [S, b] unscaled scores
+        m_new = np.maximum(m, s.max(axis=1))
+        alpha = np.exp(m - m_new)                    # rescale prior stats
+        p = np.exp(s - m_new[:, None])               # [S, b]
+        l = l * alpha + p.sum(axis=1)
+        acc = acc * alpha[:, None] + p @ vb
+        m = m_new
+    return (acc / l[:, None]).astype(np.float32)
+
+
+def _register_flash() -> None:
+    try:
+        from invent_kernels import (_flash_attention_inputs,
+                                     _flash_attention_reference)
+    except Exception:  # noqa: BLE001 — optional; the other oracles stand alone
+        return
+    register_oracle(
+        "FlashAttention", _flash_attention_reference, _flash_attn_sim,
+        lambda: _flash_attention_inputs(64, 32, 43),
+        aliases=("flash", "flashattn", "flash_attention", "flashattention",
+                 "attention_long_context", "long_context_attention",
+                 "sliding_window_attention", "gemma4_attention",
+                 "hetero_attention"),
+        notes="long-context flash attention: full-[S,S]-softmax reference vs "
+              "streaming online-softmax (blocked, running max/denom) sim "
+              "(independent algorithms)")
+
+
+# ---------------------------------------------------------------------------
+# Known-uncovered primitives — the audit CI gate's explicit, SHRINKING allowlist.
+# ---------------------------------------------------------------------------
+# These kernels are named in PRIMITIVE_TO_KERNEL but have NO oracle yet, on
+# PURPOSE: a non-vacuous oracle needs TWO independent implementations of the same
+# math, and for these primitives we do not yet have a GROUNDED reference (a
+# published/harvested spec or a _torch twin). Writing the recurrence from memory
+# risks a WRONG ground truth — strictly worse than no oracle, since every kernel
+# would then be validated against a bug. So they are tracked here, not faked.
+#
+# The audit gate (test_audit_oracles_is_a_ci_gate) enforces:
+#   * ZERO vacuous oracles (the orphan-oracle bug) — always.
+#   * every uncovered kernel is IN this set — so adding a NEW primitive without
+#     an oracle fails CI until it is either given an oracle or consciously listed.
+#   * this set contains NO already-covered kernel — so the allowlist can only
+#     SHRINK as oracles land (R3 harvests the _torch twins that ground them).
+KNOWN_UNCOVERED: frozenset[str] = frozenset({
+    "KDA",            # Kimi Delta Attention — fine-grained (per-channel) gated
+                      # delta rule; exact gate form needs a grounded ref (R3).
+    "LightningAttn",  # MiniMax lightning attention — per-head decay + norm
+                      # convention varies by version; needs a grounded ref.
+    "RWKV6",          # RWKV-6 (Finch) WKV recurrence — data-dependent decay.
+    "RWKV7",          # RWKV-7 (Goose) delta-rule-with-vector-gating recurrence.
+    "mLSTM",          # xLSTM matrix-memory LSTM (parallel form) — specific gates.
+    "sLSTM",          # xLSTM scalar LSTM — new exponential gating + normalizer.
+    "RGLRU",          # Griffin/RecurrentGemma real-gated linear recurrent unit.
+    "PowerRetention", # power-retention variant — grounded ref needed.
+    "GlmMoeDsa",      # GLM MoE + sparse attention — composite/model-specific;
+                      # a single numeric oracle may not be the right shape.
+})
+
+
 register_oracle(
     "DeltaNet", _delta_reference, _delta_sim, _delta_inputs,
     # aliases beyond what PRIMITIVE_TO_KERNEL already routes; get_oracle also
@@ -381,3 +462,4 @@ register_oracle(
 _register_rope()
 _register_attn_sink()
 _register_attn_hd256()
+_register_flash()
