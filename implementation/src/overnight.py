@@ -890,6 +890,16 @@ def main() -> None:
     ap.add_argument("--invent-max-targets", type=int, default=1,
                     help="Stage-4: max ops authored per model (harvest dedupes "
                          "wins across models; 1 keeps per-model authoring bounded).")
+    ap.add_argument("--invent-ops", default="",
+                    help="Stage-4: author an EXPLICIT op list (comma-separated "
+                         "names, or 'write-new'/'seeds'/'all'), BYPASSING the "
+                         "opportunity prune. Use with --invent-provider recipe to "
+                         "exercise the full author->gate->race->bank pipeline on "
+                         "the box with the deterministic catalog authors (no LLM "
+                         "provider needed) — even for compiler-strong ops (their "
+                         "losses bank as honest anti-patterns; the point is "
+                         "validating the machinery on device). Empty = only the "
+                         "compiler-weak targets from opportunity.select_targets.")
     ap.add_argument("--invent-repair-rounds", type=int, default=2,
                     help="Stage-4: max author->compile->re-author repair rounds "
                          "(R6; >1 activates the compile-verify-fix loop).")
@@ -991,6 +1001,7 @@ def main() -> None:
                 arch="trn2",
             )
             invent_engine._invent_max_targets = max(1, a.invent_max_targets)
+            invent_engine._invent_ops = a.invent_ops or ""
             invent_engine._attempted_shape_classes = set()
             log(f"invent: Stage 4 ENABLED (provider={a.invent_provider}, "
                 f"max_targets={a.invent_max_targets}, "

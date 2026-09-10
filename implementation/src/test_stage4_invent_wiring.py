@@ -152,3 +152,30 @@ def test_seed_op_specs_dense_returns_the_scan(tmp_path: Path):
     assert "gated_delta_rule" in names
     # memory-bound catalog ops (rmsnorm/gelu/...) are pruned by the opportunity gate
     assert "rmsnorm" not in names and "gelu_tanh" not in names
+
+
+# -- force-ops mode (author an explicit list, bypassing the opportunity prune) --
+
+def test_seed_op_specs_force_ops_bypasses_prune():
+    ops = _seed_op_specs(DENSE, max_targets=8, force_ops="write-new")
+    names = [o.name for o in ops]
+    # memory-bound catalog ops the prune would normally drop are now present
+    assert "rope_apply" in names and "add_rmsnorm" in names
+    assert len(names) >= 5
+
+
+def test_seed_op_specs_force_ops_unknown_is_empty_not_crash():
+    assert _seed_op_specs(DENSE, max_targets=2, force_ops="no_such_op_xyz") == []
+
+
+def test_stage4_force_ops_authors_catalog_ops(tmp_path: Path):
+    eng = _FakeEngine(status="anti_pattern", max_targets=8)
+    eng._invent_ops = "write-new"            # force the catalog write-new ops
+    orch = _orch(tmp_path, engine=eng)
+    orch.establish_baseline(DENSE)
+    orch.run_deep_stages(DENSE)
+    # authored several catalog ops directly (bypassing the compiler-weak prune)
+    assert len(eng.calls) >= 5
+    assert "rope_apply" in eng.calls
+    rows = _invent_rows(orch)
+    assert rows and all(r.status is Status.DISCARD for r in rows)   # compiler-strong -> anti-patterns

@@ -79,21 +79,35 @@ class NoBaselineError(RuntimeError):
     """
 
 
-def _seed_op_specs(spec: "ModelSpec", max_targets: int = 1) -> list:
-    """Build the compiler-weak OpSpecs worth inventing a kernel for, for a model.
+def _seed_op_specs(spec: "ModelSpec", max_targets: int = 1,
+                   force_ops: str = "") -> list:
+    """Build the OpSpecs to author kernels for, for a model.
 
-    ModelSpec carries no op list, so seed from the built-in op catalog PLUS the
-    genuinely compiler-weak, fleet-wide ops — the sequential gated-delta scan
-    (always a real WIN candidate) and, in the long-context regime, flash
-    attention — then prune to the worth-authoring targets via
-    ``opportunity.select_targets`` (analytic off-device: the compiler already wins
-    the memory-bound elementwise/norm catalog ops, so they are dropped). The
-    compiler-weak ops are OP-centric — a kernel banked from one model is harvested
-    by the next — so seeding them for any model populates the shared bank. Returns
-    the capped list of OpSpecs (possibly empty when nothing is worth authoring).
-    Imports are local so the backend-independent core keeps no hard dependency on
-    the invent stack."""
-    from invent_kernels import catalog, flash_attention_spec, gated_delta_rule_spec
+    Two modes:
+      * ``force_ops`` set (comma-separated op names, or the groups 'write-new' /
+        'seeds' / 'all') — author EXACTLY those, bypassing the opportunity prune.
+        Used to exercise the full author->gate->race->bank pipeline on the box
+        with the deterministic catalog authors (no LLM provider needed), even for
+        ops the compiler already wins (their losses bank as honest anti-patterns).
+      * default — ModelSpec carries no op list, so seed from the built-in op
+        catalog PLUS the genuinely compiler-weak, fleet-wide ops (the sequential
+        gated-delta scan; long-context flash attention), then prune to the
+        worth-authoring targets via ``opportunity.select_targets`` (the compiler
+        already wins the memory-bound elementwise/norm catalog ops, so they are
+        dropped). The compiler-weak ops are OP-centric — a kernel banked from one
+        model is harvested by the next.
+
+    Returns the capped list of OpSpecs (possibly empty). Imports are local so the
+    backend-independent core keeps no hard dependency on the invent stack."""
+    from invent_kernels import (catalog, flash_attention_spec,
+                                 gated_delta_rule_spec, resolve_ops)
+    if force_ops:
+        names = [o.strip() for o in force_ops.split(",") if o.strip()]
+        try:
+            ops = resolve_ops(names)
+        except Exception:  # noqa: BLE001 — an unknown op name must not break the run
+            ops = []
+        return ops[:max_targets] if max_targets else ops
     from opportunity import select_targets
     specs = list(catalog().values())
     # The canonical compiler-weak scan — banked for the whole fleet (Qwen3-Next /
@@ -759,8 +773,9 @@ class Orchestrator:
         failure is recorded and the loop continues."""
         eng = self.invent_engine
         max_targets = int(getattr(eng, "_invent_max_targets", 1) or 1)
+        force_ops = getattr(eng, "_invent_ops", "") or ""
         try:
-            targets = _seed_op_specs(spec, max_targets=max_targets)
+            targets = _seed_op_specs(spec, max_targets=max_targets, force_ops=force_ops)
         except Exception as e:  # noqa: BLE001 — selection must never break the run
             self._record(
                 Candidate(config=base_cfg, provenance="stage4-invent", layer=Layer.KERNEL),
