@@ -822,23 +822,36 @@ def _src_add_rmsnorm() -> str:
 def add_rmsnorm_kernel(x, residual, gamma):
     """Fused residual-add + RMSNorm. x/residual [T, H]; gamma [H].
     Tiling: partition = T rows (<=128 per tile); free = H. mgrid masks the
-    tail. One multi-partition DMA per operand — no per-index DMA."""
+    tail. One multi-partition DMA per operand — no per-index DMA.
+
+    Mirrors the on-device-validated ``rmsnorm_kernel`` idiom (same file), which
+    fixed three things this op had in common with the old rmsnorm seed:
+      * sum-of-squares is FUSED via ``nisa.activation_reduce`` into a [P,1]
+        ``reduce_res`` out-param — the ``nl.sum(h*h, axis=1)`` no-keepdims form
+        collapses to 1-D (NCC_INIC902) and then forces an illegal implicit
+        partition broadcast on the normalize;
+      * the mean-square inv is kept 2-D [P,1] and broadcast EXPLICITLY;
+      * gamma [H] is loaded as a [1,H] FREE-axis row via ``reshape((1, H))`` — the
+        old ``nl.load(gamma[0:H])`` put H on the PARTITION axis, applying gamma on
+        the wrong (transposed) axis at H=128 (the ~1.11-err R1-simulate bug)."""
     T, H = x.shape
     out = nl.ndarray((T, H), dtype=x.dtype, buffer=nl.shared_hbm)
     ix = nl.mgrid[0:_PMAX, 0:H]
     n_tiles = (T + _PMAX - 1) // _PMAX
+    gs = nl.load(gamma.reshape((1, H)))              # [1,H] free-axis row
+    gb = nl.broadcast_to(gs, shape=(_PMAX, H))       # broadcast over partition rows
     for t in nl.affine_range(n_tiles):
         rows = ix.p + t * _PMAX
         m = rows < T
         xs = nl.load(x[t * _PMAX:t * _PMAX + _PMAX, 0:H], mask=m)
         rs = nl.load(residual[t * _PMAX:t * _PMAX + _PMAX, 0:H], mask=m)
-        gs = nl.load(gamma[0:H])
-        h = nl.add(xs, rs)
-        sq = nl.multiply(h, h)
-        ms = nl.sum(sq, axis=1) * (1.0 / H)
-        inv = nl.rsqrt(ms + 1.0e-6)
-        normed = nl.multiply(h, inv)
-        res = nl.multiply(normed, gs)
+        h = nl.add(xs, rs)                           # fused residual add, one pass
+        ms = nl.ndarray((_PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation_reduce(op=nl.square, data=h, reduce_op=nl.add,
+                               reduce_res=ms[...])    # [P,1] sum-of-squares
+        inv = nl.rsqrt(ms * (1.0 / H) + 1.0e-6)       # [P,1], kept 2-D
+        ib = nl.broadcast_to(inv, shape=(_PMAX, H))   # EXPLICIT free-axis broadcast
+        res = nl.multiply(nl.multiply(h, ib), gb)
         nl.store(out[t * _PMAX:t * _PMAX + _PMAX, 0:H], res, mask=m)
     return out
 '''
@@ -854,17 +867,24 @@ def layernorm_kernel(x, gamma, beta):
     out = nl.ndarray((T, H), dtype=x.dtype, buffer=nl.shared_hbm)
     ix = nl.mgrid[0:_PMAX, 0:H]
     n_tiles = (T + _PMAX - 1) // _PMAX
+    # gamma/beta are per-free-element (per-H) affine params: load each as a [1,H]
+    # FREE-axis row (reshape((1,H))) and broadcast EXPLICITLY over the T/partition
+    # rows to a full [_PMAX,H] tile. The old ``nl.load(gamma[0:H])`` /
+    # ``nl.load(beta[0:H])`` put H on the PARTITION axis, applying the affine on
+    # the wrong (transposed) axis. Loop-invariant -> hoisted out of the tile loop.
+    gs = nl.load(gamma.reshape((1, H)))
+    gb = nl.broadcast_to(gs, shape=(_PMAX, H))
+    bs = nl.load(beta.reshape((1, H)))
+    bb = nl.broadcast_to(bs, shape=(_PMAX, H))
     for t in nl.affine_range(n_tiles):
         rows = ix.p + t * _PMAX
         m = rows < T
         xs = nl.load(x[t * _PMAX:t * _PMAX + _PMAX, 0:H], mask=m)
-        gs = nl.load(gamma[0:H])
-        bs = nl.load(beta[0:H])
         mu = nl.sum(xs, axis=1) * (1.0 / H)
         cx = nl.subtract(xs, mu)
         var = nl.sum(nl.multiply(cx, cx), axis=1) * (1.0 / H)
         inv = nl.rsqrt(var + 1.0e-6)
-        res = nl.add(nl.multiply(nl.multiply(cx, inv), gs), bs)
+        res = nl.add(nl.multiply(nl.multiply(cx, inv), gb), bb)
         nl.store(out[t * _PMAX:t * _PMAX + _PMAX, 0:H], res, mask=m)
     return out
 '''
