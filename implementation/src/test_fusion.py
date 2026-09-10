@@ -120,3 +120,58 @@ def test_select_fusion_targets_empty_when_nothing_fusable():
 def test_max_targets_cap():
     specs = [_rmsnorm(), _attention(), _matmul(), _rmsnorm(), _attention()]
     assert len(select_fusion_targets(specs, max_targets=1)) == 1
+
+
+# -- M4: fused-in-name-only detector -----------------------------------------
+from fusion import count_kernel_seams, detect_fused_in_name_only
+
+
+_ONE_TRACE = (
+    "import neuronxcc.nki as nki\n"
+    "import neuronxcc.nki.language as nl\n"
+    "def _stage1(x):\n"          # inline subkernel — NOT separately jitted
+    "    return x\n"
+    "def _stage2(x):\n"
+    "    return x\n"
+    "@nki.jit\n"                  # exactly ONE torch->NKI seam
+    "def fused_kernel(x):\n"
+    "    return _stage2(_stage1(x))\n"
+)
+
+_TWO_SEAMS = (
+    "import neuronxcc.nki as nki\n"
+    "@nki.jit\n"
+    "def stage1_kernel(x):\n"
+    "    return x\n"
+    "@nki.jit\n"                  # TWO separate compiled kernels => fused in name only
+    "def stage2_kernel(x):\n"
+    "    return x\n"
+)
+
+
+def test_count_kernel_seams():
+    assert count_kernel_seams("") == 0
+    assert count_kernel_seams(_ONE_TRACE) == 1
+    assert count_kernel_seams(_TWO_SEAMS) == 2
+    # @nki.baremetal / @nki_op / wrap_nki also count as seams
+    assert count_kernel_seams("@nki.baremetal\ndef k(x):\n    return x\n") == 1
+    assert count_kernel_seams("y = wrap_nki(k)\nz = wrap_nki(j)\n") == 2
+
+
+def test_count_kernel_seams_ignores_comments_and_strings():
+    src = (
+        "# @nki.jit in a comment must not count\n"
+        "'''@nki.jit in a docstring must not count'''\n"
+        "@nki.jit\n"
+        "def real_kernel(x):\n"
+        "    return x\n"
+    )
+    assert count_kernel_seams(src) == 1
+
+
+def test_detect_fused_in_name_only():
+    assert detect_fused_in_name_only(_ONE_TRACE) is None      # one trace: legit
+    assert detect_fused_in_name_only("") is None
+    reason = detect_fused_in_name_only(_TWO_SEAMS)            # two seams: anti-pattern
+    assert reason is not None and "fused-in-name-only" in reason
+    assert "round-trip through HBM" in reason

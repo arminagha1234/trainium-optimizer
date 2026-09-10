@@ -783,6 +783,21 @@ class InventEngine:
         # (2) static lint.
         violations = static_lint(author.nki_src)
 
+        # (2b) M4 — for a FUSED megakernel spec, reject a "fused-in-name-only"
+        # kernel: >=2 separate torch->NKI seams means the intermediates round-trip
+        # through HBM between kernels instead of staying SBUF-resident (defeating
+        # the entire point of fusing). Only runs for fused specs, so non-fused ops
+        # are byte-for-byte unaffected. Local import mirrors the run() call site.
+        if (getattr(spec, "primitive", "") == "fused"
+                or (getattr(spec, "name", "") or "").startswith("fused_")):
+            try:
+                from fusion import detect_fused_in_name_only  # noqa: PLC0415
+                fino = detect_fused_in_name_only(author.nki_src)
+            except Exception:  # noqa: BLE001 — detector must never break the gate
+                fino = None
+            if fino:
+                violations = [*violations, fino]
+
         # (3) R1 — CPU simulate of the REAL kernel source. This EXECUTES the
         # actual authored kernel (via nki.simulate_kernel), so unlike the
         # numpy_impl comparison above it is NEVER a tautology. When it runs it is

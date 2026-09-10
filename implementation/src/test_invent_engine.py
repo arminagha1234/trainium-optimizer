@@ -1239,3 +1239,61 @@ def test_from_simulate_nonfinite_trips_adversarial_veto_rank0():
     v = KernelValidation.from_simulate(correct=False, nonfinite=True)
     assert v.status == "failed-adversarial" and v.rank == 0
     assert "NaN/Inf" in v.notes
+
+
+# -- M4: fused-in-name-only rejected by the offline gate ----------------------
+def _fused_spec():
+    ins = lambda: {"x": np.zeros((128, 128), np.float32)}
+    return OpSpec(name="fused_rmsnorm_attention", family="fused",
+                  shape_class="fused", dtype="bf16",
+                  reference=lambda inp: inp["x"], offline_inputs=ins,
+                  real_inputs=ins, primitive="fused")
+
+
+def _fused_author(src: str) -> AuthoredKernel:
+    spec = _fused_spec()
+    return AuthoredKernel(op=spec.name, origin="invented",
+                          numpy_impl=spec.reference, nki_src=src,
+                          entry="fused_kernel")
+
+
+def test_offline_gate_rejects_fused_in_name_only(tmp_path):
+    """A 'fused' megakernel whose source has TWO separate @nki.jit seams is
+    fused in name only (intermediates round-trip through HBM); the offline gate
+    (M4) must reject it before any device time."""
+    two_seams = (
+        "import neuronxcc.nki as nki\n"
+        "@nki.jit\n"
+        "def stage1_kernel(x):\n    return x\n"
+        "@nki.jit\n"
+        "def stage2_kernel(x):\n    return x\n"
+    )
+    eng = InventEngine(out_dir=tmp_path)
+    g = eng.offline_gate(_fused_author(two_seams), _fused_spec())
+    assert g.passed is False
+    assert "fused-in-name-only" in g.reason
+
+
+def test_offline_gate_allows_single_trace_megakernel(tmp_path):
+    """A single-trace megakernel (one @nki.jit entry, inline subkernels) does NOT
+    trip the M4 detector."""
+    one_trace = (
+        "import neuronxcc.nki as nki\n"
+        "def _stage1(x):\n    return x\n"
+        "@nki.jit\n"
+        "def fused_kernel(x):\n    return _stage1(x)\n"
+    )
+    eng = InventEngine(out_dir=tmp_path)
+    g = eng.offline_gate(_fused_author(one_trace), _fused_spec())
+    assert "fused-in-name-only" not in g.reason
+
+
+def test_m4_detector_only_applies_to_fused_specs(tmp_path):
+    """A NON-fused op with (hypothetically) two seams is NOT subject to the M4
+    check — it only runs for fused megakernel specs, so ordinary ops are
+    unaffected."""
+    cat = catalog()
+    eng = InventEngine(out_dir=tmp_path)
+    # softcap is a normal single-op spec; its authored source clears the gate.
+    g = eng.offline_gate(author_kernel(cat["softcap"]), cat["softcap"])
+    assert "fused-in-name-only" not in g.reason

@@ -38,6 +38,7 @@ fusion changes WHAT we author, never what we trust.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -225,3 +226,56 @@ def select_fusion_targets(specs: list, max_targets: int | None = None,
     ranked = rank_fusion_groups(specs, fusable, max_group)
     specs_out = [t.spec for t in ranked]
     return specs_out[:max_targets] if max_targets is not None else specs_out
+
+
+# ---------------------------------------------------------------------------
+# M4 — the "fused-in-name-only" anti-pattern detector
+# ---------------------------------------------------------------------------
+# The whole point of a megakernel is ONE nki trace with the intermediates kept
+# resident in SBUF. The architectural fact (internal megakernel skill): the
+# subkernels run INLINE inside the active trace as plain functions — they are NOT
+# each decorated @nki.jit and invoked separately. A @nki.jit (or @nki.baremetal /
+# @nki_op / wrap_nki) function CALLED from torch is a SEPARATE compiled kernel: a
+# distinct trace whose output round-trips through HBM before the next kernel reads
+# it. So a legitimate megakernel has AT MOST ONE torch->NKI seam (the single entry,
+# forced by host index math); TWO OR MORE seams means the "fused" kernel is really
+# several kernels bolted together with the intermediates spilling to HBM between
+# them — fused in NAME ONLY, defeating the entire reason to fuse. This is the exact
+# anti-pattern the worked megakernel example warns against.
+_KERNEL_SEAM = re.compile(
+    r"@\s*nki\s*\.\s*(?:jit|baremetal)\b"   # @nki.jit / @nki.baremetal
+    r"|@\s*nki_op\b"                          # @nki_op
+    r"|\bwrap_nki\s*\(")                      # wrap_nki(...)
+
+
+def count_kernel_seams(nki_src: str) -> int:
+    """Number of distinct torch->NKI compiled-kernel entry seams in the source
+    (@nki.jit / @nki.baremetal / @nki_op / wrap_nki). Counted over comment- and
+    string-scrubbed text so a decorator mentioned in a docstring or a commented-out
+    line is not counted. 0 on empty source; never raises."""
+    if not nki_src:
+        return 0
+    try:
+        from invent_kernels import _scrub_comments_and_strings  # noqa: PLC0415
+        text = _scrub_comments_and_strings(nki_src)
+    except Exception:  # noqa: BLE001 — scrub is best-effort; fall back to raw text
+        text = nki_src
+    return len(_KERNEL_SEAM.findall(text))
+
+
+def detect_fused_in_name_only(nki_src: str) -> str | None:
+    """M4: flag a megakernel that is fused in NAME ONLY — i.e. its source defines
+    TWO OR MORE separate torch->NKI kernel seams, so the intermediates round-trip
+    through HBM between kernels instead of staying resident in SBUF (the whole
+    point of fusing). Returns a violation reason when >= 2 seams are found, else
+    None (0 or 1 seam is a legitimate single-trace megakernel). A cheap static
+    text smell for the offline gate + the bank — not a substitute for the compiler."""
+    n = count_kernel_seams(nki_src)
+    if n >= 2:
+        return (f"fused-in-name-only: {n} separate torch->NKI kernel seams "
+                f"(@nki.jit/@nki.baremetal/@nki_op/wrap_nki) in one 'fused' kernel. "
+                f"A true megakernel is ONE trace with the subkernels INLINE (SBUF-"
+                f"resident); >= 2 seams means the intermediates round-trip through "
+                f"HBM between kernels — no fusion benefit. Inline the subkernels "
+                f"into a single trace (one entry, forced by host index math).")
+    return None
