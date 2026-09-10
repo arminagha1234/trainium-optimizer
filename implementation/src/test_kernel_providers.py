@@ -198,15 +198,17 @@ def test_bedrock_omits_temperature_when_none_includes_when_set(monkeypatch):
 # ---------------------------------------------------------------------------
 def test_bedrock_client_built_with_long_read_timeout(monkeypatch):
     # Opus-5's thinking pass exceeds boto3's 60s default read timeout; the client
-    # must be built with read_timeout=600 (+ connect_timeout + retries).
+    # must be built with read_timeout=1800 and max_attempts=1 (the 2026-08-27 fix:
+    # a 600s timeout + retries let boto silently RETRY a timed-out 10-min
+    # generation, tripling wall-clock; a single long attempt surfaces cleanly).
     sink: dict = {}
     _install_fake_boto3(monkeypatch, sink)
     bedrock_complete_fn(region="us-west-2", temperature=None)("hi def x_kernel(")
     cfg = sink["config"]
     assert cfg is not None, "client must be built with an explicit botocore Config"
-    assert cfg.read_timeout == 600
+    assert cfg.read_timeout == 1800
     assert cfg.connect_timeout == 15
-    assert cfg.retries == {"max_attempts": 3}
+    assert cfg.retries == {"max_attempts": 1}
 
 
 def test_bedrock_default_max_tokens_is_32000():

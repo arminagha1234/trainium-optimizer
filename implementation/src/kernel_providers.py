@@ -190,10 +190,10 @@ def _guard_empty_completion(text: str, stop_reason, max_tokens: int) -> str:
 # ---------------------------------------------------------------------------
 # Bedrock (primary)
 # ---------------------------------------------------------------------------
-def bedrock_complete_fn(model_id: str = "anthropic.claude-opus-5",
+def bedrock_complete_fn(model_id: str | None = None,
                         region: str | None = None,
                         max_tokens: int = 32000,
-                        temperature: float | None = 0.0) -> CompleteFn:
+                        temperature: float | None = None) -> CompleteFn:
     """Return a ``complete_fn`` backed by boto3 ``bedrock-runtime`` InvokeModel.
 
     Uses the Anthropic Messages request/response schema. ``region`` falls back
@@ -210,10 +210,11 @@ def bedrock_complete_fn(model_id: str = "anthropic.claude-opus-5",
     default read timeout — a small default caused mid-authoring read timeouts),
     a 15s ``connect_timeout``, and 3 retry attempts.
 
-    Note on ``temperature``: current Anthropic models reject sampling params
-    (400). Pass ``temperature=None`` when the resolved ``model_id`` is a
-    current-generation model; the default ``0.0`` suits older models where a
-    deterministic sample is still accepted.
+    Note on ``temperature``: the default is ``None`` (the param is OMITTED)
+    because the default ``model_id`` is a current-generation Opus that REJECTS
+    any sampling parameter with a 400 (``temperature is deprecated for this
+    model``). Pass an explicit ``temperature`` only when targeting an older model
+    that still accepts a deterministic sample.
 
     ``max_tokens`` defaults to 32000 (BUG #2): Opus-5 is a thinking model and a
     small cap (the old 4096) can be exhausted entirely by the ``thinking`` block
@@ -238,6 +239,16 @@ def bedrock_complete_fn(model_id: str = "anthropic.claude-opus-5",
             "Bedrock provider requires boto3. Install it (`pip install boto3`) "
             "or select provider='anthropic' with ANTHROPIC_API_KEY set."
         ) from exc
+
+    # Opus (and the other large current Anthropic models) are NOT invocable by
+    # their BARE on-demand model id on Bedrock — InvokeModel raises a
+    # ValidationException ("...isn't supported. Retry with ... an inference
+    # profile...") unless you pass a cross-region INFERENCE PROFILE id. So the
+    # default resolves to the US inference profile ``us.anthropic.claude-opus-5``;
+    # override via $BEDROCK_MODEL_ID (e.g. ``global.anthropic.claude-opus-5`` or a
+    # pinned Opus version). An explicitly-passed model_id is used verbatim.
+    if model_id is None:
+        model_id = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-opus-5")
 
     resolved_region = (region or os.environ.get("AWS_REGION")
                        or os.environ.get("AWS_DEFAULT_REGION"))
