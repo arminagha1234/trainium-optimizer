@@ -1126,3 +1126,116 @@ def test_is_environment_error_classifies_imports_and_libs():
     # a genuine numerical/kernel failure is NOT an environment error
     assert not _is_environment_error(ValueError("cosine 0.2 below tolerance"))
     assert not _is_environment_error(RuntimeError("nc_matmul moving free dim 4096 > 512"))
+
+
+# -- R1: nki.simulate offline gate (injected simulate_fn seam) ---------------
+# The real nki.simulate_kernel runs only on a simulator box; here we drive the
+# offline gate's simulate step with a deterministic injected simulate_fn (the
+# same pattern as race_fn / compile_fn), proving the WIRING: a simulate pass
+# breaks the numpy_impl tautology, a simulate miss rejects offline before any
+# device time, and off-simulator (no simulate_fn) behaviour is unchanged.
+from invent_engine import SimulateResult
+
+
+def _sim_pass(_author, _spec) -> SimulateResult:
+    return SimulateResult(True, correct=True, max_abs_err=1e-6)
+
+
+def _sim_fail(_author, _spec) -> SimulateResult:
+    return SimulateResult(True, correct=False, max_abs_err=3.2e-1,
+                          precise_fp=True,
+                          reason="algorithm bug: simulate miss at both "
+                                 "NKI_PRECISE_FP=0 and =1")
+
+
+def _sim_defer(_author, _spec) -> SimulateResult:
+    return SimulateResult(False, reason="off-simulator: no nki.simulate_kernel")
+
+
+def test_simulate_pass_breaks_the_tautology(tmp_path):
+    """softcap's numpy_impl IS spec.reference (a tautology). With a simulate_fn
+    that RUNS the real kernel and passes, the offline gate now reports a genuine,
+    INDEPENDENT parity pass — the tautology is broken, not merely deferred."""
+    eng = InventEngine(out_dir=tmp_path, simulate_fn=_sim_pass)
+    cat = catalog()
+    g = eng.offline_gate(author_kernel(cat["softcap"]), cat["softcap"])
+    assert g.simulate_ran is True and g.simulate_ok is True
+    assert g.parity_ok is True                 # a REAL pass (not the tautology skip)
+    assert g.parity_independent is True        # simulating the real kernel is independent
+    assert g.passed is True
+    assert "simulate pass" in g.reason
+
+
+def test_simulate_miss_rejects_offline_before_device(tmp_path):
+    """A simulate miss on the real kernel FAILS the offline gate (passed=False)
+    with a 'simulate reject' reason — the math bug is caught for a CPU interpret,
+    never reaching the scarce on-device compile."""
+    eng = InventEngine(out_dir=tmp_path, simulate_fn=_sim_fail)
+    cat = catalog()
+    g = eng.offline_gate(author_kernel(cat["softcap"]), cat["softcap"])
+    assert g.simulate_ran is True and g.simulate_ok is False
+    assert g.parity_ok is False and g.passed is False
+    assert "simulate reject" in g.reason
+
+
+def test_run_op_offline_rejects_on_simulate_miss_and_skips_device(tmp_path):
+    """End-to-end: a failing simulate makes run_op record 'offline_reject' and it
+    must NEVER call the device race (spy race asserts it is not reached)."""
+    def spy_race(_a, _s):
+        raise AssertionError("device race must not run after a simulate miss")
+
+    eng = InventEngine(out_dir=tmp_path, simulate_fn=_sim_fail)
+    res = eng.run_op(catalog()["softcap"], race_fn=spy_race)
+    assert res.status == "offline_reject"
+    assert res.offline.simulate_ran is True and res.offline.simulate_ok is False
+
+
+def test_simulate_defer_preserves_pre_r1_behaviour(tmp_path):
+    """When the simulate step defers (ran=False) — the off-simulator state on any
+    CPU box — the gate is byte-for-byte the pre-R1 numpy-parity path: softcap is
+    still a (deferred) tautology, rope still an independent pass."""
+    eng = InventEngine(out_dir=tmp_path, simulate_fn=_sim_defer)
+    cat = catalog()
+    g_soft = eng.offline_gate(author_kernel(cat["softcap"]), cat["softcap"])
+    assert g_soft.simulate_ran is False
+    assert g_soft.parity_independent is False and g_soft.parity_ok is False
+    assert g_soft.passed is True and "tautology" in g_soft.reason
+
+    g_rope = eng.offline_gate(author_kernel(cat["rope_apply"]), cat["rope_apply"])
+    assert g_rope.simulate_ran is False
+    assert g_rope.parity_independent is True and g_rope.parity_ok is True
+    assert g_rope.passed is True
+
+
+def test_default_engine_offline_gate_unchanged_off_simulator(tmp_path):
+    """With NO simulate_fn (the default) on this no-simulator box, the built-in
+    _simulate defers and every catalog op still clears the gate exactly as before
+    R1 — the default path is unchanged where the simulator is absent."""
+    eng = InventEngine(out_dir=tmp_path)          # default: built-in _simulate
+    for name, spec in catalog().items():
+        g = eng.offline_gate(author_kernel(spec), spec)
+        assert g.simulate_ran is False, f"{name}: simulator must be absent here"
+        assert g.passed, f"{name} should still clear the offline gate"
+
+
+# -- R1: KernelValidation.from_simulate ladder mapping -----------------------
+def test_from_simulate_pass_is_rank3_simulate_tier():
+    from kernel_validation import KernelValidation, reuse_decision, REVALIDATE_ON_DEVICE
+    v = KernelValidation.from_simulate(correct=True, numeric_error=1e-6)
+    assert v.status == "passed" and v.rank == 3 and v.tier == "simulate"
+    assert v.passed is True
+    # a simulate pass must be re-proven on device, never reused blind (Mamba lesson)
+    assert reuse_decision(v) == REVALIDATE_ON_DEVICE
+
+
+def test_from_simulate_miss_is_failed_numerical_rank2():
+    from kernel_validation import KernelValidation
+    v = KernelValidation.from_simulate(correct=False, numeric_error=3.0)
+    assert v.status == "failed-numerical" and v.rank == 2 and v.tier == "simulate"
+
+
+def test_from_simulate_nonfinite_trips_adversarial_veto_rank0():
+    from kernel_validation import KernelValidation
+    v = KernelValidation.from_simulate(correct=False, nonfinite=True)
+    assert v.status == "failed-adversarial" and v.rank == 0
+    assert "NaN/Inf" in v.notes

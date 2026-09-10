@@ -151,6 +151,37 @@ class KernelValidation:
         return cls(status=status, rank=STATUS_RANK.get(status, 0), tier=tier,
                    numeric_error=numeric_error, artifact=artifact, notes=notes)
 
+    @classmethod
+    def from_simulate(cls, *, correct: bool, numeric_error: float = float("inf"),
+                      nonfinite: bool = False, notes: str = ""
+                      ) -> "KernelValidation":
+        """Map a CPU ``nki.simulate_kernel`` outcome onto the ladder (R1).
+
+        The simulator executes the FULL authored kernel and produces a traced
+        result — the "numerics + NEFF, in simulation" the rank-3 ``passed`` state
+        is defined as (kernel_registry.STATUS_RANK) — so a correct simulate maps
+        to rank-3 ``passed`` in the ``simulate`` tier, and an incorrect one to
+        rank-2 ``failed-numerical`` (it ran and produced output, but wrong). This
+        is the intermediate rung between offline-lint and a real device compile:
+        a math bug now costs a CPU interpret, not a Trainium compile.
+
+        Crucially it stays a ``simulate``-tier result: per the Mamba lesson
+        (a scan that simulated to 2e-7 ran ~67 off on silicon) a rank-3 simulate
+        pass MUST still be re-proven on device (``reuse_decision`` routes it to
+        ``REVALIDATE_ON_DEVICE``), never reused blind. A ``nonfinite`` kernel
+        (NaN/Inf where the reference is finite) trips the adversarial veto →
+        rank-0, since a correct op never manufactures a non-finite value.
+
+        Only call this when the simulate actually RAN; a deferral (simulator
+        absent) is not a ladder outcome — leave those unranked.
+        """
+        return cls.from_run(
+            numerics_ok=correct, neff_emitted=True, on_device=False,
+            numeric_error=numeric_error, adversarial_ok=not nonfinite,
+            adversarial_reasons=(["kernel produced NaN/Inf where reference is "
+                                  "finite"] if nonfinite else None),
+            notes=notes)
+
 
 def _rank_of(spec_or_rank: Any) -> int | None:
     """Extract a numeric rank from a KernelSpec, a KernelValidation, a bare int,

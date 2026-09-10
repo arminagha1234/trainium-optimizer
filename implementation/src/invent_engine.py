@@ -71,6 +71,7 @@ from kernel_anticheat import require_reproducible, run_candidate_before_referenc
 from kernel_author import KernelAuthor, RecipeAuthor
 from kernel_perf import KernelPerfLoop, PerfFeedback, PerfOutcome
 from kernel_repair import CompileResult, Feedback, KernelRepairLoop
+from kernel_simulate import SimulateResult, simulate_kernel_cpu
 from ledger import Layer, Ledger, Origin, Row, Stage, Status, current_commit
 from invent_kernels import (
     AuthoredKernel,
@@ -160,6 +161,18 @@ class OfflineGate:
     # Kept as the LAST field with a default so existing positional constructions
     # (incl. tests) are unaffected.
     parity_independent: bool = True
+    # R1 (nki.simulate offline gate). Did the CPU simulator actually RUN the REAL
+    # kernel source (True only on a box where nki.simulate_kernel is importable),
+    # and did it match the reference there? When it runs it is the AUTHORITATIVE
+    # offline math verdict — it simulates the actual kernel, so it is never the
+    # numpy_impl-vs-reference tautology, and it sets ``parity_ok`` /
+    # ``parity_independent`` accordingly. Off-simulator (this laptop / CI) both
+    # stay False, the simulate step is a transparent no-op, and the gate's
+    # behaviour is byte-for-byte the pre-R1 numpy-parity path. Trailing + defaulted
+    # so every existing positional/keyword OfflineGate construction is unchanged.
+    simulate_ran: bool = False
+    simulate_ok: bool = False
+    simulate_precise_fp: bool = False   # True == verdict came from NKI_PRECISE_FP=1
 
 
 @dataclass
@@ -222,6 +235,11 @@ RaceFn = Callable[[AuthoredKernel, OpSpec], RaceResult]
 # a CompileResult (ok + error_log). On device the engine's own ``_compile`` is
 # used; tests inject a deterministic stand-in compiler.
 CompileFnT = Callable[[AuthoredKernel], CompileResult]
+
+# A simulate function lets tests inject a deterministic CPU-simulate outcome (R1).
+# On a simulator box the engine's own ``_simulate`` runs the REAL kernel through
+# ``nki.simulate_kernel``; off-simulator it returns ran=False (honest deferral).
+SimulateFnT = Callable[[AuthoredKernel, OpSpec], SimulateResult]
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +453,7 @@ class InventEngine:
         kernel_library: "Any" = None,
         arch: str = "trn2",
         profiler: "Any" = None,
+        simulate_fn: "SimulateFnT | None" = None,
     ) -> None:
         # The pluggable authoring seam. Defaults to the recipe table
         # (``RecipeAuthor`` wraps ``invent_kernels.author_kernel``) so behaviour
@@ -520,6 +539,15 @@ class InventEngine:
         # Default None => analytic-only (behaviour unchanged): profiling is a
         # precision upgrade the caller opts into by wiring a real neuron-profile.
         self.profiler = profiler
+        # R1: OFFLINE (CPU) correctness gate via nki.simulate_kernel. Default None
+        # => the built-in ``_simulate`` runs the REAL kernel source through the
+        # simulator (and honestly defers, ran=False, off a simulator box — so on
+        # this laptop / CI it is a transparent no-op and the offline gate is
+        # unchanged). Injectable so a test can drive a deterministic simulate
+        # outcome (the CPU-testable plumbing), exactly like ``race_fn`` /
+        # ``compile_fn``. When it runs, it is the authoritative offline math check
+        # that breaks the numpy_impl-vs-reference tautology.
+        self.simulate_fn = simulate_fn
 
     def attach_tournament(self, complete_fn, strategies=None, *,
                           compose: bool = True) -> None:
@@ -689,6 +717,28 @@ class InventEngine:
 
     # -- offline gate --------------------------------------------------------
 
+    def _simulate(self, author: AuthoredKernel, spec: OpSpec) -> SimulateResult:
+        """R1: run the REAL authored kernel on CPU via ``nki.simulate_kernel`` and
+        compare to the reference — the genuine offline math check (never the
+        numpy_impl-vs-reference tautology). Uses the injected ``simulate_fn`` when
+        present (tests drive a deterministic outcome), else the built-in runner,
+        which honestly defers (``ran=False``) on any box without the simulator.
+        Never raises: a seam/reference error becomes an honest deferral."""
+        if self.simulate_fn is not None:
+            try:
+                return self.simulate_fn(author, spec)
+            except Exception as e:  # noqa: BLE001 — seam error is a deferral, not a crash
+                return SimulateResult(False, reason=f"injected simulate_fn raised: {e!r}")
+        try:
+            inp = spec.offline_inputs()
+            ref = np.asarray(spec.reference(inp), dtype=np.float32)
+        except Exception as e:  # noqa: BLE001 — reference/inputs failure => deferral
+            return SimulateResult(False, reason=f"reference/inputs raised: {e!r}")
+        return simulate_kernel_cpu(
+            nki_src=author.nki_src, entry=author.entry, op=spec.name,
+            inputs=inp, reference_out=ref,
+            arg_order=_arg_order(spec.name, inp))
+
     def offline_gate(self, author: AuthoredKernel, spec: OpSpec) -> OfflineGate:
         """numpy-ref parity at the 128x128 shape + static NKI lint.
 
@@ -732,24 +782,61 @@ class InventEngine:
             parity_ok = False
         # (2) static lint.
         violations = static_lint(author.nki_src)
+
+        # (3) R1 — CPU simulate of the REAL kernel source. This EXECUTES the
+        # actual authored kernel (via nki.simulate_kernel), so unlike the
+        # numpy_impl comparison above it is NEVER a tautology. When it runs it is
+        # the authoritative offline math verdict and OVERRIDES the numpy-parity
+        # result — catching a math bug for the price of a CPU interpret instead of
+        # a scarce on-device compile. Off a simulator box (this laptop / CI) it
+        # returns ran=False and this whole block is a transparent no-op, so the
+        # pre-R1 numpy-parity behaviour is byte-for-byte preserved there.
+        sim = self._simulate(author, spec)
+        sim_ran = sim.ran
+        sim_ok = sim.ran and sim.correct
+        if sim_ran:
+            # The simulator ran the real kernel: its verdict is the independent
+            # parity truth. Fold it in (a simulate pass is a genuine, non-vacuous
+            # parity pass; a simulate miss is a real math reject).
+            parity_ok = bool(sim.correct)
+            independent = True
+            if np.isfinite(sim.max_abs_err):
+                max_err = sim.max_abs_err
+
         # Device time is gated on: lint clean AND the impl ran with the right
-        # shape AND (only when an independent check exists) that check passed. A
-        # tautological-parity op still advances to the REAL on-device gate — we
-        # simply never pretend an offline parity pass occurred.
-        passed = (not violations) and shape_ok and (parity_ok if independent else True)
+        # shape AND the math check passed. The math check is the SIMULATE verdict
+        # when it ran, else the independent numpy-parity; a tautological-parity op
+        # with no simulator still advances to the REAL on-device gate (we never
+        # pretend an offline parity pass occurred).
+        if sim_ran:
+            math_ok = bool(sim.correct)
+        elif independent:
+            math_ok = parity_ok
+        else:
+            math_ok = True   # tautology, no simulator -> defer math to on-device
+        passed = (not violations) and shape_ok and math_ok
         reason = ""
         if not shape_ok:
             reason = "numpy_impl shape != reference shape"
-        elif independent and not parity_ok:
+        elif sim_ran and not sim.correct:
+            reason = (f"simulate reject: "
+                      f"{sim.reason or f'max_abs_err={max_err:.3e}'}")
+        elif independent and not sim_ran and not parity_ok:
             reason = f"numpy parity fail (max_abs_err={max_err:.3e})"
         elif violations:
             reason = f"lint: {'; '.join(violations)}"
+        elif sim_ran and sim.precision_artifact:
+            reason = f"simulate pass (precision artifact): {sim.reason}"
+        elif sim_ran:
+            reason = f"simulate pass (real kernel; max_abs_err={max_err:.3e})"
         elif not independent:
             # Passing, but be explicit in the record about what was NOT verified.
             reason = ("parity NOT independently verified: numpy_impl is "
                       "spec.reference (tautology) — math deferred to on-device gate")
         return OfflineGate(passed, parity_ok, max_err, violations, reason,
-                           parity_independent=independent)
+                           parity_independent=independent,
+                           simulate_ran=sim_ran, simulate_ok=sim_ok,
+                           simulate_precise_fp=sim.precise_fp)
 
     # -- on-device race ------------------------------------------------------
 
