@@ -1025,6 +1025,25 @@ class InventEngine:
             reason = f"correct={correct} speedup={speedup:.3f}x [{oracle_note}]"
             if profile_reason:
                 reason += f" | profile: {profile_reason}"
+            # R25 — silent-perf detectors over the signals available at the race
+            # site. Today only %SOL is measurable here (-> roofline_gap); the
+            # operand-reread / relayout-DMA / code-size detectors need profiler
+            # counters neuron_profile does not yet surface, so they stay dormant
+            # until that hook is extended (honest: they simply don't fire without
+            # their inputs). The findings' route tokens are folded into ``reason``
+            # exactly like profile_reason, so kernel_perf.classify_bottleneck can
+            # route the perf loop's lever off them. Never breaks the race.
+            try:
+                import silent_perf  # noqa: PLC0415 — optional, self-contained
+                _findings = silent_perf.detect_silent_perf({"sol": sol})
+                _sp_summary = silent_perf.summary(_findings)
+                _sp_route = silent_perf.route_tokens(_findings)
+                if _sp_summary:
+                    reason += f" | {_sp_summary}"
+                if _sp_route:
+                    reason += f" | {_sp_route}"
+            except Exception:  # noqa: BLE001 — detectors are advisory; never break the race
+                pass
             return RaceResult(True, correct, corr_pct, speedup,
                               kernel_ms, baseline_ms,
                               reason=reason,

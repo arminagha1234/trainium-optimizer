@@ -79,6 +79,36 @@ class NoBaselineError(RuntimeError):
     """
 
 
+def _seed_op_specs(spec: "ModelSpec", max_targets: int = 1) -> list:
+    """Build the compiler-weak OpSpecs worth inventing a kernel for, for a model.
+
+    ModelSpec carries no op list, so seed from the built-in op catalog PLUS the
+    genuinely compiler-weak, fleet-wide ops — the sequential gated-delta scan
+    (always a real WIN candidate) and, in the long-context regime, flash
+    attention — then prune to the worth-authoring targets via
+    ``opportunity.select_targets`` (analytic off-device: the compiler already wins
+    the memory-bound elementwise/norm catalog ops, so they are dropped). The
+    compiler-weak ops are OP-centric — a kernel banked from one model is harvested
+    by the next — so seeding them for any model populates the shared bank. Returns
+    the capped list of OpSpecs (possibly empty when nothing is worth authoring).
+    Imports are local so the backend-independent core keeps no hard dependency on
+    the invent stack."""
+    from invent_kernels import catalog, flash_attention_spec, gated_delta_rule_spec
+    from opportunity import select_targets
+    specs = list(catalog().values())
+    # The canonical compiler-weak scan — banked for the whole fleet (Qwen3-Next /
+    # Qwen3.6 GatedDeltaNet and any linear-attention model reuse it).
+    specs.append(gated_delta_rule_spec())
+    # Long-context / batched attention only where the shape is actually the
+    # compiler-weak regime (single-head short attention is compiler-strong).
+    seq = int(getattr(spec, "seq_len", 0) or 0)
+    if getattr(spec, "long_context", False) or seq >= 8192:
+        specs.append(flash_attention_spec(seqlen=max(seq, 2048)))
+    by_name = {s.name: s for s in specs}
+    targets = select_targets(specs, max_targets=max_targets)
+    return [by_name[t.op] for t in targets if t.op in by_name]
+
+
 @dataclass
 class ModelSpec:
     """What the optimizer needs to know about the target model."""
@@ -136,6 +166,13 @@ class Orchestrator:
     # winner is found in the first handful). Fires only AFTER the current round
     # finishes (never mid-round), so the round holding the big lever still runs.
     max_configs: int | None = None
+    # Stage-4 INVENT engine (invent_engine.InventEngine). Default None => Stage 4
+    # records the honest "not enabled" discard — byte-for-byte the pre-wiring
+    # behaviour, so every existing run/test is unchanged. Injected by overnight.py
+    # under --invent so run_deep_stages authors + offline-gates + on-device-races +
+    # banks NKI kernels for the model's compiler-weak ops. Typed Any to avoid a
+    # hard import of the invent stack into the backend-independent core.
+    invent_engine: "Any" = None
 
     # populated during a run
     incumbent: Candidate | None = None
@@ -383,20 +420,25 @@ class Orchestrator:
                 if evaluated is not None:
                     self._update_incumbent(evaluated)
 
-        # Stage 4 — invent: NOT integrated into this pipeline. The invent_engine
-        # module (author -> offline-gate -> on-device race -> bank) exists but is
-        # not wired here — auto-authoring novel NKI kernels needs the NKI-writer
-        # agent + a validated on-device execution path. Record the DISCARD once
-        # per run (not once per profile-loop round) so the ledger reflects
-        # "Stage 4 not run" honestly without spamming a row every re-entry.
-        if "stage4-invent-recorded" not in self._deep_tried:
-            self._deep_tried.add("stage4-invent-recorded")
-            self._record(
-                Candidate(config=base_cfg, provenance="stage4-invent", layer=Layer.KERNEL),
-                Stage.INVENT, Origin.NONE, Layer.KERNEL, source="",
-                metric=0.0, correctness=0.0, compile_s=0.0, status=Status.DISCARD,
-                desc="Stage 4 not integrated: invent_engine not wired to pipeline "
-                     "(needs NKI-writer agent + validated on-device execution)")
+        # Stage 4 — INVENT: author + offline-gate + on-device race + bank novel
+        # NKI kernels for the model's compiler-weak ops. Runs ONLY when an
+        # InventEngine is injected (overnight --invent); default None => the honest
+        # "not enabled" DISCARD below, byte-for-byte the pre-wiring behaviour (so
+        # every existing run/test is unchanged). Guarded to run ONCE per model-run
+        # (not once per profile-loop round — authoring is minutes-expensive).
+        # ``_run_stage4_invent`` never raises: any failure is recorded and the
+        # pipeline continues, so a Stage-4 problem can never cost the model its
+        # config/borrow/rewrite result.
+        if "stage4-invent-done" not in self._deep_tried:
+            self._deep_tried.add("stage4-invent-done")
+            if self.invent_engine is None:
+                self._record(
+                    Candidate(config=base_cfg, provenance="stage4-invent", layer=Layer.KERNEL),
+                    Stage.INVENT, Origin.NONE, Layer.KERNEL, source="",
+                    metric=0.0, correctness=0.0, compile_s=0.0, status=Status.DISCARD,
+                    desc="Stage 4 not enabled (no invent engine wired; pass --invent)")
+            else:
+                self._run_stage4_invent(spec, base_cfg)
         return self.incumbent
 
     # -- Stage 6 -------------------------------------------------------------
@@ -701,3 +743,83 @@ class Orchestrator:
             correctness=0.0, compile_s=0.0, status=Status.DISCARD,
             description=f"pruned: {reason}",
         ))
+
+    # -- Stage 4: invent (author -> gate -> race -> bank NKI kernels) ---------
+
+    def _run_stage4_invent(self, spec: ModelSpec, base_cfg: dict[str, Any]) -> None:
+        """Drive the injected InventEngine over the model's compiler-weak ops.
+
+        Records one Stage.INVENT ledger row per op attempt (win / harvested /
+        anti-pattern / deferred / offline-reject / no-author). An invented WIN is
+        an OP-level speedup (the NKI kernel vs torch-eager for that op) + a banked
+        NKI_KERNEL lesson the whole fleet reuses — it does NOT move THIS model's
+        tok/s incumbent (that needs the kernel injected into the model + a
+        re-measure, a separate integration), so it is recorded honestly as a
+        KERNEL-layer invent row, not a config-throughput win. Never raises: every
+        failure is recorded and the loop continues."""
+        eng = self.invent_engine
+        max_targets = int(getattr(eng, "_invent_max_targets", 1) or 1)
+        try:
+            targets = _seed_op_specs(spec, max_targets=max_targets)
+        except Exception as e:  # noqa: BLE001 — selection must never break the run
+            self._record(
+                Candidate(config=base_cfg, provenance="stage4-invent", layer=Layer.KERNEL),
+                Stage.INVENT, Origin.NONE, Layer.KERNEL, source="",
+                metric=0.0, correctness=0.0, compile_s=0.0, status=Status.DISCARD,
+                desc=f"Stage 4 target selection failed: {e!r}")
+            return
+        if not targets:
+            self._record(
+                Candidate(config=base_cfg, provenance="stage4-invent", layer=Layer.KERNEL),
+                Stage.INVENT, Origin.NONE, Layer.KERNEL, source="",
+                metric=0.0, correctness=0.0, compile_s=0.0, status=Status.DISCARD,
+                desc="Stage 4: no compiler-weak op targets for this model "
+                     "(compiler already wins the ops it has)")
+            return
+        # Cross-model dedupe within a run: overnight.py shares ONE engine instance
+        # across all models, so an op already attempted this run is skipped — a
+        # win was banked (and is harvested anyway) and a non-win must not re-burn
+        # authoring on every subsequent model.
+        attempted = getattr(eng, "_attempted_shape_classes", None)
+        if attempted is None:
+            attempted = set()
+            try:
+                eng._attempted_shape_classes = attempted
+            except Exception:  # noqa: BLE001 — read-only engine mock; dedupe just no-ops
+                pass
+        for op_spec in targets:
+            key = f"{op_spec.name}-{op_spec.shape_class}"
+            if key in attempted:
+                continue
+            attempted.add(key)
+            try:
+                result = eng.run_op(op_spec)
+            except Exception as e:  # noqa: BLE001 — an invent failure is data, never fatal
+                self._record(
+                    Candidate(config={**base_cfg, "invent_op": op_spec.name},
+                              provenance=f"stage4-invent:{op_spec.name}",
+                              layer=Layer.KERNEL),
+                    Stage.INVENT, Origin.NONE, Layer.KERNEL, source="invent-engine",
+                    metric=0.0, correctness=0.0, compile_s=0.0, status=Status.DISCARD,
+                    desc=f"Stage 4 invent raised for {op_spec.name}: {e!r}")
+                continue
+            self._record_invent_result(op_spec, result, base_cfg)
+
+    def _record_invent_result(self, op_spec, result, base_cfg: dict[str, Any]) -> None:
+        """Translate an InventResult into a Stage.INVENT ledger row (honest per-op
+        outcome; does not touch the model tok/s incumbent)."""
+        origin = {
+            "win": Origin.INVENTED,
+            "harvested": Origin.HARVESTED,
+        }.get(result.status, Origin.NONE)
+        status = Status.KEEP if result.status in ("win", "harvested") else Status.DISCARD
+        race = getattr(result, "race", None)
+        speedup = float(getattr(race, "speedup", 0.0) or 0.0)
+        corr = float(getattr(race, "correctness_pct", 0.0) or 0.0)
+        self._record(
+            Candidate(config={**base_cfg, "invent_op": op_spec.name},
+                      provenance=f"stage4-invent:{op_spec.name}:{result.status}",
+                      layer=Layer.KERNEL),
+            Stage.INVENT, origin, Layer.KERNEL, source="invent-engine",
+            metric=speedup, correctness=corr, compile_s=0.0, status=status,
+            desc=f"Stage 4 {result.status} [{op_spec.name}]: {result.detail}"[:300])

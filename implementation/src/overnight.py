@@ -327,6 +327,7 @@ def run_one(
     kernels_wired: bool = False,
     rewrites_wired: bool = False,
     serve_target: "ServeTarget | None" = None,
+    invent_engine: "Any | None" = None,
 ) -> ModelResult:
     """Optimize a single model. Crashes are caught and returned, never raised,
     so one bad model does not end the night."""
@@ -393,6 +394,7 @@ def run_one(
             equivalence=_equivalence_for(effective_backend), sdk_version=sdk_version,
             instance_type=instance_type,   # fills the whole box (DP/CP), not just the TP group
             max_configs=max_configs,       # hard Stage-1 config backstop (small-box efficiency)
+            invent_engine=invent_engine,   # Stage 4 (None unless --invent) — shared across models
         )
 
         log(f"[{slug}] establishing baseline on {effective_backend}")
@@ -873,6 +875,27 @@ def main() -> None:
                          "int64 fp32-sort) that makes it compile + be correct "
                          "without a DeltaNet kernel. Off by default.")
     ap.set_defaults(rewrites_wired=False)
+    # --- Stage 4: INVENT (author + offline-gate + on-device race + bank NKI) ---
+    ap.add_argument("--invent", dest="invent", action="store_true",
+                    help="enable Stage 4: author + offline-gate + on-device race + "
+                         "bank NKI kernels for each model's compiler-weak ops "
+                         "(scan / long-context attention). OFF by default — the "
+                         "invent engine stays dormant unless this is set.")
+    ap.set_defaults(invent=False)
+    ap.add_argument("--invent-provider", default="auto",
+                    help="Stage-4 author: 'auto' (Bedrock Opus-5 LLM author — the "
+                         "only path that authors the compiler-weak ops), "
+                         "'anthropic', 'echo' (offline stub), or 'recipe' "
+                         "(deterministic catalog recipes; cannot author scan/attn).")
+    ap.add_argument("--invent-max-targets", type=int, default=1,
+                    help="Stage-4: max ops authored per model (harvest dedupes "
+                         "wins across models; 1 keeps per-model authoring bounded).")
+    ap.add_argument("--invent-repair-rounds", type=int, default=2,
+                    help="Stage-4: max author->compile->re-author repair rounds "
+                         "(R6; >1 activates the compile-verify-fix loop).")
+    ap.add_argument("--invent-perf-rounds", type=int, default=1,
+                    help="Stage-4: max correct-but-slow re-author perf rounds "
+                         "(R6; 1 = off, race once on the 5%% invention margin).")
     # --- bank hygiene: re-validate stale verified priors when the SDK changed ---
     ap.add_argument("--no-publish", dest="publish", action="store_false",
                     help="do not refresh LEADERBOARD.md / optimized_models after "
@@ -940,6 +963,43 @@ def main() -> None:
         f"kernel_dir={registry.kernel_dir} models={models} ===")
     log(f"    (touch {stop_file} to stop cleanly after the current model)")
 
+    # Stage-4 INVENT engine — constructed ONCE per run (shared across models: a
+    # kernel banked from one model is harvested by the next, and an op attempted
+    # once this run is not re-authored per model). None unless --invent, so the
+    # default run is byte-for-byte unchanged. bank_root points at the SHARED bank
+    # so invented-kernel lessons compound; artifacts land under out_root/invent.
+    invent_engine = None
+    if a.invent:
+        from invent_engine import InventEngine
+        _author = None
+        if a.invent_provider and a.invent_provider != "recipe":
+            try:
+                from kernel_providers import author_from_provider
+                _author = author_from_provider(a.invent_provider)
+            except Exception as e:  # noqa: BLE001 — fall back to RecipeAuthor, don't die
+                log(f"invent: author provider {a.invent_provider!r} unavailable "
+                    f"({e!r}) — falling back to RecipeAuthor (catalog ops only)")
+                _author = None
+        try:
+            invent_engine = InventEngine(
+                out_dir=out_root / "invent",
+                bank_root=a.bank_root.resolve(),   # wins compound into the shared bank
+                sdk_version=a.sdk,
+                author=_author,
+                max_repair_rounds=max(1, a.invent_repair_rounds),
+                max_perf_rounds=max(1, a.invent_perf_rounds),
+                arch="trn2",
+            )
+            invent_engine._invent_max_targets = max(1, a.invent_max_targets)
+            invent_engine._attempted_shape_classes = set()
+            log(f"invent: Stage 4 ENABLED (provider={a.invent_provider}, "
+                f"max_targets={a.invent_max_targets}, "
+                f"repair_rounds={a.invent_repair_rounds}, "
+                f"perf_rounds={a.invent_perf_rounds}) -> {out_root / 'invent'}")
+        except Exception as e:  # noqa: BLE001 — never let invent setup kill the run
+            log(f"invent: Stage 4 setup FAILED ({e!r}) — running without invention")
+            invent_engine = None
+
     # BANK HYGIENE (startup, opt-in) — re-validate stale verified priors when
     # the toolchain has moved off the bank's dominant stamped SDK. Additive and
     # a no-op unless the SDK actually changed, so it never disrupts the run
@@ -982,6 +1042,7 @@ def main() -> None:
                     kernels_wired=a.kernels_wired,
                     rewrites_wired=a.rewrites_wired,
                     serve_target=serve_target,
+                    invent_engine=invent_engine,
                 ))
 
             # Compound learning: promote qualifying provisional lessons so the
