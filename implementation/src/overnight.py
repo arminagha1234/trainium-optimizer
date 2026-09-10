@@ -183,6 +183,14 @@ SEED_MODELS: dict[str, ModelSpec] = {
     "qwen3-5-4b": ModelSpec(model_id="Qwen/Qwen3.5-4B", family="dense_causal_lm", param_count=4e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1),
     "qwen3-6-27b": ModelSpec(model_id="Qwen/Qwen3.6-27B", family="dense_causal_lm", param_count=27e9, parent="qwen", probe_shape="chat 512/256", probe_batch=1),
 
+    # ---- Meta Muse-Glimmer-30B (released 2026-08-10, Apache-2.0, OPEN) ----
+    #      Dense 30B agentic LM (29.6B incl. a ~1.8B ViT-G/14 perception encoder,
+    #      i.e. multimodal). Loaded text-only via AutoModelForCausalLM; if the
+    #      multimodal class doesn't expose a causal-LM head the baseline will
+    #      FAIL_NO_BASELINE and it skips honestly. This is the real open release
+    #      of the model the seed comments once called "the non-open muse-glimmer-30b".
+    "muse-glimmer-30b": ModelSpec(model_id="meta-models/Muse-Glimmer-30B", family="dense_causal_lm", param_count=30e9, parent="meta", probe_shape="chat 512/256", probe_batch=1),
+
     # ---- GATED (need an HF token; otherwise skipped) ----
     "llama-3-2-1b": ModelSpec(model_id="meta-llama/Llama-3.2-1B-Instruct", family="dense_causal_lm", param_count=1e9, parent="meta", probe_shape="chat 512/256", probe_batch=1),
     "llama-3-2-3b": ModelSpec(model_id="meta-llama/Llama-3.2-3B-Instruct", family="dense_causal_lm", param_count=3e9, parent="meta", probe_shape="chat 512/256", probe_batch=1),
