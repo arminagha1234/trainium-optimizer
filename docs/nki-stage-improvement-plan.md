@@ -5,6 +5,8 @@
 > SAIL Gemma-v6e blog + GPU algorithmic patterns), new rec R25 (silent-perf detectors).
 > **v3 (2026-09-10):** began implementation. R1 landed (◐ — offline plumbing done+tested,
 > device activation pending one on-device run), R17 landed (☑). See §9 implementation log.
+> **v4 (2026-09-10):** R3 (◐), R25 (☑), M4 (☑), R18 (☑) landed. Full offline suite 961 passing
+> (same pre-existing torch/boto3-only failures, none introduced). See §9.
 > **Purpose:** a reviewable, add-to-later plan for improving the framework's Stage-4
 > (invent / NKI kernel authoring) and megakernel-writing path. This is a PLAN, not a
 > changelog — every recommendation has a status box so we can check things off and
@@ -372,7 +374,7 @@ recs, which is the honest outcome:
 |---|---|---|---|---|---|
 | R1 | nki.simulate offline gate | 0 | M | N | ◐ (offline done+tested; device-activation pending) |
 | R2 | reuse sim test harness | 0 | M | N | ☐ |
-| R3 | harvest nki-library + twins | 0 | M | N | ☐ |
+| R3 | harvest nki-library + twins | 0 | M | N | ◐ (registry multi-dir landed; corpus indexing = device follow-up) |
 | R4 | NAKB/NKIBench scoreboard | 0 | M | Y | ☐ |
 | R5 | align w/ NAKOS + OSS | 0 | L | Y | ☐ |
 | R6 | repair loop + LLMAuthor default | 1 | M | N | ☐ |
@@ -387,15 +389,16 @@ recs, which is the honest outcome:
 | R15 | framework custom-op e2e | 2 | M | Y | ☐ |
 | R16 | nrtpy race harness | 2 | S | Y | ☐ |
 | R17 | oracle coverage + CI audit | 2 | S | N | ☑ (FlashAttention oracle + audit CI gate + allowlist) |
-| R18 | coding-guidelines rubric | 2 | S | N | ☐ |
+| R18 | coding-guidelines rubric | 2 | S | N | ☑ (module-scope-helper in static_lint; fuller rubric in internal nki_lint) |
 | R19 | gpt_oss giga-kernel imitation | 3 | L | Y | ☐ |
 | R20 | schedule-search template | 3 | M | N | ☐ |
 | R21 | Torch/Numpy→NKI front-end | 3 | M | N | ☐ |
 | R22 | ArgNeuron layout solver | 3 | M | N | ☐ |
 | R23 | ACO before/after eval | 3 | M | N | ☐ |
 | R24 | LNC2 sim multi-core | 3 | M | N | ☐ |
-| R25 | silent-perf-regression detectors | 3 | M | N | ☐ |
-| M1–M6 | megakernel scaffold/gate/rules | — | — | mixed | ☐ |
+| R25 | silent-perf-regression detectors | 3 | M | N | ☑ (silent_perf.py: re-read / relayout-DMA / code-size) |
+| M4 | fused-in-name-only detector | — | S | N | ☑ (fusion.detect_fused_in_name_only + offline-gate wiring) |
+| M1–M3,M5,M6 | megakernel scaffold/gate/rules | — | — | mixed | ☐ |
 
 ---
 
@@ -448,3 +451,39 @@ until Stage 4 is wired (a later rec) and a fresh launch is authorized.
   harvests their `_torch` twins). `test_audit_oracles_is_a_ci_gate` runs the audit in
   a fresh subprocess and enforces: zero vacuous oracles, every uncovered kernel
   consciously allowlisted, allowlist only shrinks.
+- **2026-09-10 — R3 (harvest nki-library corpus) ◐.** `KernelRegistry` gained
+  multi-dir harvest: `extra_dirs` arg + `$TRN_OPT_EXTRA_KERNEL_DIRS` (os.pathsep),
+  so a cloned nki-library checkout is indexed ALONGSIDE the in-repo kernels (primary
+  wins a name clash; a malformed manifest falls through to the next dir). nki-library
+  is already in the borrow list (`kernel_sources.yaml`) and does not cover the 9
+  KNOWN_UNCOVERED exotic primitives, so it cannot ground those oracles — grounded
+  refs come from the model source repos (a separate harvest). Actual manifest-
+  indexing of a checkout + lifting its `_torch` twins into oracles is the
+  device/external follow-up. 5 tests.
+- **2026-09-10 — R25 (silent-perf-regression detectors) ☑.** New `silent_perf.py`
+  flags the compiler-hidden waste from the cross-HW T3 lesson: `operand_reread`
+  (HBM traffic ÷ minimum-needed; the KV-re-read class), `relayout_dma` (share of the
+  DMA path in compiler-inserted relayout/transpose; the "free transpose that
+  wasn't"), `code_size` (instruction-footprint blowup — fires only with a caller-
+  supplied limit, no baked Trn2 constant), and a `roofline_gap` companion to
+  roofline.py's %SOL. Findings carry a `route_token` so `kernel_perf.classify_
+  bottleneck` (now recognizing "relayout"/"re-read") routes the matching lever.
+  Complements roofline.py's MFU-implausibility (fake-speedup) guard. 18 tests.
+- **2026-09-10 — M4 (fused-in-name-only detector) ☑.** `fusion.detect_fused_in_
+  name_only` + `count_kernel_seams`: a true megakernel is ONE trace with inline
+  subkernels; ≥2 torch→NKI seams (@nki.jit/baremetal/nki_op/wrap_nki) means the
+  intermediates round-trip through HBM. Wired into `offline_gate` for fused specs
+  (rejected before device time, banked as an anti-pattern); non-fused ops
+  unaffected. 9 tests.
+- **2026-09-10 — R18 (coding-guideline hard constraints) ☑.** Added the module-
+  scope-helper rule to the TRACKED `static_lint` (the linter the offline gate calls):
+  a helper defined inside a kernel body (indented def) breaks the tracer's source
+  introspection → rejected. The fuller review rubric (incl. one-E4M3-per-trace, the
+  ~25-rule migration table) lives in the internal-only `nki_lint` (git-excluded,
+  never pushed — internal-sourced material), which was also extended locally. 4
+  tests + a catalog-stays-clean regression.
+
+> **Compliance note:** `.git/info/exclude` marks `nki_lint.py`, `bank_kernels.py`,
+> `blockers.py`, and parts of `knowledge-bank/` as INTERNAL-ONLY (internal-sourced /
+> customer-derived) — never pushed. All committed work above is in tracked, pushable
+> files and does not import an internal-only module from a tracked test.
