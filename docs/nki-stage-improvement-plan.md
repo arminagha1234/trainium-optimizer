@@ -1,6 +1,8 @@
 # NKI / Megakernel-Writing Stage — Improvement Plan (living doc)
 
-> **Status:** DRAFT v1 · started 2026-09-10 · owner: Armin
+> **Status:** DRAFT v2 · started 2026-09-10 · owner: Armin
+> **v2 (2026-09-10):** added §6 cross-hardware research (TPU playbook from the verified
+> SAIL Gemma-v6e blog + GPU algorithmic patterns), new rec R25 (silent-perf detectors).
 > **Purpose:** a reviewable, add-to-later plan for improving the framework's Stage-4
 > (invent / NKI kernel authoring) and megakernel-writing path. This is a PLAN, not a
 > changelog — every recommendation has a status box so we can check things off and
@@ -166,6 +168,11 @@ Legend: **Effort** S/M/L · **Device?** Y (needs Trainium) / N (offline-safe) ·
 - **R22.** Evaluate ArgNeuron (layout solver). **M · N · ☐**
 - **R23.** Use AgenticCodeOptimizer `examples/nki` (before/after + evaluators) as optimizer eval material. **M · N · ☐**
 - **R24.** Offline-test multi-core paths with `nki.simulate` LNC2. **M · N · ☐**
+- **R25. Silent-perf-regression detector set** (from cross-HW research, §6). Both TPU and GPU
+  showed the compiler *hiding* perf bugs. Add offline/profile detectors: (a) relayout/transpose-
+  DMA count above a threshold, (b) KV/operand re-read multiplier (bytes moved ÷ bytes needed),
+  (c) per-op roofline gap (measured ÷ floor) as the primary rank signal, (d) code-size/unroll
+  blowup. *Files:* `kernel_perf`, `kernel_anticheat`, `fusion` (M4). **Effort M · Device N · ☐**
 
 ---
 
@@ -200,12 +207,146 @@ scaffold.
 
 ## 6. Cross-hardware (TPU / GPU) transferable techniques
 
-> **PENDING** — two research agents are mining TPU (Pallas/Mosaic, XLA fusion, MXU tiling,
-> Gemma-on-v6e serving, incl. the SAIL research blog) and GPU (flash-attention, CUTLASS/
-> Triton, persistent/megakernels, FP8/MXFP4, autotuning) literature, with a strict
-> "transferable-to-NKI, flag ISA-specific" lens. Findings will be appended here as §6a (TPU)
-> and §6b (GPU). Priority: TPU is architecturally closer to Trainium (systolic matmul +
-> scratchpad + XLA), so weight it higher; GPU contributes algorithmic patterns.
+Two research passes mined TPU and GPU kernel-optimization literature with a strict
+"transferable-to-NKI, flag the ISA-specific parts" lens. TPU is weighted higher because it
+is architecturally closer to Trainium (systolic matmul array + software-managed scratchpad +
+a fusing compiler); GPU contributes algorithmic patterns. Everything below is mapped to a
+concrete change in *our* stage; hardware facts that do **not** port are flagged inline.
+
+### 6a. TPU — the transferable playbook
+
+Primary source: SAIL Research, *"Optimizing Gemma 4 on TPU v6e"* (sailresearch.com/blog/
+tpu-v6e-gemma), cross-checked against the JAX Scaling Book and Pallas/Mosaic TPU docs. The
+blog took Gemma 4 31B prefill (8192 tokens, 2×2 v6e) from **~32% → ~63% MFU** (throughput
+18,228 → 36,669 tok/s; TTFT 449.4 → 223.4 ms; speed-of-light ceiling was 58,431 tok/s /
+100% MFU). Verified against the source 2026-09-10. The techniques, most-transferable first:
+
+- **T1. Roofline-as-bug-detector — adopt as the core perf loop.** Their entire result came
+  from one loop: *(1) compute what an op should cost from first principles, (2) measure what
+  it actually costs, (3) treat the gap as a bug until proven a physical limit.* Without a
+  roofline, a 1.539 ms attention kernel and a 788 µs AllReduce both just look like "how long
+  that takes"; only against the roofline is one obviously a mis-tuned kernel and the other a
+  hardware limit. → This is exactly what **R9 (NeffSim perf oracle)** + **R10 (perf rulebook)**
+  + **R11 (neuron-profile)** should implement: attach a per-op roofline (PE-bound vs
+  DMA-bound floor) to every raced kernel and gate/prioritize on the *gap*, not the raw
+  latency. Cheap, offline, high-leverage. *Port cleanly; no ISA dependency.*
+- **T2. Reuse-aware tile sizing (the single biggest win).** Their attention kernel was slow
+  purely because it was **mis-tuned**: query-block size of 32 caused each KV entry to be
+  re-fetched from HBM ~32× (a key is wanted by the 1024 queries in Gemma's sliding window).
+  Retuning the block to 512 took the sliding layers from **1.539 ms → 261 µs (~6×)** with no
+  algorithm change. → Direct mandate for **R12 (nki-autotune tile sweep)**: sweep tile/block
+  sizes and *score by HBM bytes re-read*, not just latency. The SBUF analog of "keep queries
+  parked in VMEM, stream keys once" is a first-class megakernel rule (M3). *Port cleanly;
+  retune the specific numbers on Trn2 SBUF — do not copy 512.*
+- **T3. Silent-performance-failure detectors (a whole catalog).** The bulk of the 52%→63%
+  grind was hunting failures the compiler hid instead of erroring on. Each has a Trainium
+  analog worth a detector/lint in `kernel_anticheat` / `kernel_perf` / the M4 "fused-in-name-
+  only" check:
+  - *Bad mesh/device ordering* silently cost ~2× (a ring that needs non-existent diagonal
+    links). → Trn2 analog: collective/replica-group ordering vs the real NeuronLink topology.
+  - *"Free" transpose that wasn't* — the compiler relabels an array column-major at load
+    instead of moving bytes, then is forced to wire a real copying transpose into *every*
+    forward pass (~173 µs/layer). → Trn2 analog: silent **relayout DMAs**; detect via
+    transpose/relayout count in the profile.
+  - *Instruction-memory (IMEM) overflow* — large blocks made Mosaic unroll a matmul to
+    ~4.45 MB of code, over the ~4 MiB IMEM, causing invisible instruction-fetch stalls
+    ("SyncWait"). → Trn2 analog: code-size/loop-unroll blowups; prefer compact loops over
+    unrolled blocks. *Numbers are TPU-specific; the failure class ports.*
+  - **Lesson for us:** the design already distrusts silent wins (mock/real labeling); extend
+    that to silent *perf* losses. This is the strongest cross-HW confirmation of the M4
+    detector + honest-banking direction.
+- **T4. Epilogue / cross-boundary fusion into the resident kernel.** Two of the highest-value
+  late wins: (a) fold `gelu(gate)·up` into the MLP kernel's output stage while still in VMEM,
+  killing a redundant 176 MB HBM write + 88 MB read; (b) fold the q/k/v RMS-norms and RoPE
+  into the qkv kernel and emit q/k/v as separate arrays, removing ~500 µs/layer of
+  compiler-inserted copies/dtype-conversions/transposes at the kernel boundary. → This *is*
+  the megakernel thesis (§5, M1–M3): keep activations SBUF-resident across stage boundaries;
+  fold norms/activations/RoPE into the producing kernel; the expensive thing is the
+  torch↔kernel seam (M4). *Ports cleanly to SBUF.*
+- **T5. Collective-matmul overlap.** When TP collectives are on the critical path (their
+  AllReduce was ~27% of a layer at ~93% of the ICI limit — i.e. *not* fixable by a faster
+  collective), split AllReduce → ReduceScatter + AllGather, **defer** the AllGather to just
+  before the next matmul that needs full tokens, and ring-overlap each half with the matmul
+  it feeds (send a token/output slice to the neighbor while computing the next). Hides ICI
+  behind compute you were running anyway. → Maps to a future distributed-megakernel rec
+  (relates to R19/§5 and the internal `DistributedGemmNKI` lead). **⚠️ Flag:** this is the
+  most topology-dependent technique — **NeuronLink ≠ ICI** (Trn2's interconnect and
+  collective primitives differ from v6e's 2×2 torus ring), so the *pattern* (split/defer/
+  overlap) ports but the slice/hop sizing and whether the compiler already does it must be
+  re-derived on Trn2. Also note their XLA did this *badly* out of the box (only ~0.45 of
+  ~1.3 ms/layer hidden) and they dropped to Pallas — evidence that a hand-written NKI
+  collective-matmul can beat the compiler, which is our whole value thesis.
+- **T6. Trust the fusing compiler first, hand-write only where it demonstrably fails.** Their
+  narrative is a clean statement of our §0 thesis: XLA's out-of-the-box fusion is very strong
+  (don't rebuild it); the wins came from the specific spots where the compiler silently gave
+  up. → Keep targeting **compiler-weak primitives**, and use the roofline gap (T1) to *find*
+  those spots rather than guessing.
+
+**TPU non-ports / verify-on-Trn2 (do not copy blindly):**
+- v6e has two **256×256** systolic arrays; Trainium's TensorEngine is **128×128** → pad/tile
+  to **128**, not 256. (Pallas even enforces a 128-multiple last block dim; our NKI tiling
+  already assumes 128.)
+- **VMEM ≠ SBUF** capacity/bandwidth ratios — re-derive all tile sizes (T2) against Trn2 SBUF;
+  the 512 block size is a v6e artifact.
+- **ICI ≠ NeuronLink** (see T5) — topology, per-hop bandwidth, and collective set differ.
+- IMEM/SyncWait specifics (~4 MiB) are TPU-only; only the *code-size-matters* lesson ports.
+
+### 6b. GPU — transferable algorithmic patterns
+
+GPU hardware (warps/SIMT, tensor cores, shared-mem/register file) does **not** map to
+Trainium's engine model, so we take **algorithms and scheduling patterns**, not code. Sources:
+FlashAttention (Dao et al. 2022) / FlashAttention-2 (Dao 2023), vLLM PagedAttention (Kwon et
+al. 2023), CUTLASS/CuTe and Triton autotuning docs, and the FP8/MXFP4 microscaling literature.
+
+- **G1. Online-softmax / streaming attention (FlashAttention).** Never materialize the N×N
+  scores; tile over K/V, keep a running max + running denominator, rescale the accumulator as
+  you go. IO-aware: read Q,K,V,O through HBM once, keep scores in on-chip memory. → We already
+  have attention-sink / flash-style kernels; the transferable rule is the **streaming-reduction
+  pattern** for any softmax/scan/norm primitive the compiler handles poorly, and it composes
+  with SBUF residency (T4). *Algorithm ports; the tiling is ours.*
+- **G2. Minimize non-matmul FLOPs + partition for the matmul engine (FlashAttention-2).**
+  FA2's ~2× over FA1 (reported) came from *rearranging the algorithm so the systolic/tensor
+  unit stays busy* — fewer rescales, non-matmul work off the critical path, work partitioned
+  to keep the matmul engine saturated. → This is an MFU/PE-utilization rulebook item for
+  **R10**: count non-matmul ops on the critical path and push them into epilogues (ties to
+  T4). The "keep the matmul array fed" goal is *more* true on a systolic array than a GPU.
+- **G3. Block / microscaling quant with high-precision accumulate.** FP8/MXFP4-style block
+  scaling (per-block scale, MMA accumulate in higher precision) is the standard route to
+  matmul throughput. → Encode as a perf lever + a correctness rule: **accumulate in fp32/bf16
+  even when inputs are low-precision**, and validate with the `NKI_PRECISE_FP` algorithm-vs-
+  precision split (R1). *Pattern ports; exact dtypes are Trn2-specific.*
+- **G4. Megakernel-for-decode / persistent kernels.** The GPU "persistent megakernel" idea —
+  one long-lived kernel that keeps state resident and walks the whole decode step to kill
+  launch overhead and round-trips — is the same instinct as our SBUF-resident megakernel
+  (§5) and the internal gpt_oss giga-kernels (R19). → Reinforces prioritizing the fused
+  single-trace decode layer. *Instinct ports; mechanism is ours (SBUF, not CUDA graphs).*
+- **G5. Autotune-and-cache per shape.** Triton/CUTLASS autotune tile/pipeline configs per
+  problem shape and **cache the winner**. → Directly supports **R12** and a bank keyed by
+  `(op, shape, dtype)` so the forever-run doesn't re-search a shape it already solved. Ties
+  to G2/T2 (the thing you're tuning is reuse-aware tiling).
+- **G6. Paged / indirect-DMA KV access (PagedAttention).** vLLM's block-table indirection
+  (gather KV blocks via a lookup instead of contiguous reads) is the pattern behind efficient
+  long-context/batched decode. → Transfers as an **indirect-DMA / gather-DMA** pattern for
+  KV-cache kernels on Trainium; relevant when we get to decode megakernels (R19). *Pattern
+  ports; it's a DMA-descriptor technique, not CUDA-specific.*
+
+**GPU non-ports:** warp-level primitives, shared-memory bank-conflict tuning, CUDA-graph
+capture, and register-file occupancy math are SIMT-specific and do not translate — ignore
+them. Take the *algorithm* (G1/G2) and the *scheduling instinct* (G4/G5/G6), never the code.
+
+### 6c. Net new/changed recommendations from cross-HW research
+
+The cross-HW pass did not invent new subsystems — it **sharpened and re-prioritized** existing
+recs, which is the honest outcome:
+- **Promotes R9+R10+R11** (roofline perf loop) — T1 is the single most-endorsed idea across
+  both TPU and GPU; make the roofline *gap* the ranking signal, not raw latency.
+- **Promotes R12** (autotune) with a concrete objective from T2/G5: sweep tiling, score by
+  **HBM/SBUF bytes re-read**, and cache the winner per `(op, shape, dtype)`.
+- **Strengthens M3/M4** (megakernel SBUF discipline + fused-in-name-only detector) — T3's
+  silent-failure catalog and T4's epilogue fusions are independent confirmation; add explicit
+  **relayout-DMA-count** and **code-size** detectors.
+- **Adds a small new rec R25 (below):** a "silent-perf-regression" detector set, since both
+  architectures showed the compiler *hiding* perf bugs rather than erroring.
 
 ---
 
@@ -251,6 +392,7 @@ scaffold.
 | R22 | ArgNeuron layout solver | 3 | M | N | ☐ |
 | R23 | ACO before/after eval | 3 | M | N | ☐ |
 | R24 | LNC2 sim multi-core | 3 | M | N | ☐ |
+| R25 | silent-perf-regression detectors | 3 | M | N | ☐ |
 | M1–M6 | megakernel scaffold/gate/rules | — | — | mixed | ☐ |
 
 ---
