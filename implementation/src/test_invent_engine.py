@@ -374,6 +374,57 @@ def test_unfair_race_defers_and_cannot_bank_a_win(tmp_path):
         "a deferred (unfair) race must never bank an NKI_KERNEL win")
 
 
+# -- #1 native-DLC DEVICE-VALIDATED path (_finish) ---------------------------
+# On a native-PyTorch DLC (neuronxcc present, torch_xla absent) the engine can
+# prove a kernel CORRECT (R1 nki.simulate) and that it RUNS on the core
+# (nki.baremetal + nki.benchmark), but it CANNOT fairly time a torch-eager
+# baseline the same way — so _device_race_native returns device_viable=True with
+# speedup=0.0. _finish must bank that as a WIN labeled "device-validated", rather
+# than mislabeling a missing baseline as an anti-pattern ("correct-but-slow").
+def _device_validated_race(_author, _spec) -> RaceResult:
+    return RaceResult(True, correct=True, correctness_pct=100.0, speedup=0.0,
+                      kernel_ms=0.05, sol=0.55, device_viable=True,
+                      reason="native-DLC DEVICE-VALIDATED: simulate-correct + ran on core")
+
+
+def test_native_device_validated_banks_win(tmp_path):
+    eng = InventEngine(out_dir=tmp_path)
+    res = eng.run_op(catalog()["softcap"], race_fn=_device_validated_race)
+    assert res.status == "win"
+    assert "device-validated" in res.detail
+    assert "%SOL=55%" in res.detail          # roofline %SOL surfaced honestly
+    # It is recorded as a KEEP in the ledger (kept for fleet reuse), and because
+    # speedup==0 there is no beat-a-baseline margin, so no NKI_KERNEL win lesson
+    # is fabricated — the honest split between "validated" and "beat eager".
+    from ledger import Ledger, Stage, Status
+    rows = [r for r in Ledger(tmp_path).read() if r.stage is Stage.INVENT]
+    assert rows and rows[-1].status is Status.KEEP
+
+
+def test_device_validated_still_gated_by_correctness(tmp_path):
+    # ORDERING guard: the correctness gate runs BEFORE the device-validated
+    # branch, so a native race that RAN on the core but is numerically WRONG
+    # (device_viable=True, correct=False) must bank an anti-pattern — a kernel is
+    # never "device-validated" on the strength of merely compiling.
+    def _viable_but_wrong(_a, _s):
+        return RaceResult(True, correct=False, correctness_pct=0.0, speedup=0.0,
+                          device_viable=True, reason="ran on core but simulate WRONG")
+    eng = InventEngine(out_dir=tmp_path)
+    res = eng.run_op(catalog()["rmsnorm"], race_fn=_viable_but_wrong)
+    assert res.status == "anti_pattern"
+    assert "device-validated" not in res.detail
+
+
+def test_speed_race_win_is_not_labeled_device_validated(tmp_path):
+    # The device-validated branch triggers ONLY on the native path (device_viable
+    # AND speedup<=0). A normal torch_xla speed-race win (speedup>1, the default
+    # device_viable=False) keeps its existing "win" and is NOT mislabeled.
+    eng = InventEngine(out_dir=tmp_path)
+    res = eng.run_op(catalog()["softcap"], race_fn=_win_race)
+    assert res.status == "win"
+    assert "device-validated" not in res.detail
+
+
 def test_full_run_writes_ledger_and_summary(tmp_path):
     eng = InventEngine(out_dir=tmp_path)
     specs = resolve_ops(["write-new"])

@@ -207,6 +207,14 @@ class RaceResult:
     # Trailing + defaulted so every existing RaceResult construction is unchanged.
     sol: float = 0.0
     profit_verdict: str = ""
+    # Native-DLC (no torch_xla) path: the kernel compiled + RAN on the NeuronCore
+    # via nki.baremetal (device-viable — it cleared neuronx-cc), even though this
+    # image can't fairly time it against torch-eager (so ``speedup`` stays 0). True
+    # ONLY on the native device path; ``_finish`` banks such a result as a
+    # DEVICE-VALIDATED kernel (correct via R1 simulate + runs on hardware) rather
+    # than mislabeling a missing baseline as "correct-but-slow". Trailing +
+    # defaulted so every existing RaceResult construction is unchanged.
+    device_viable: bool = False
 
 
 @dataclass
@@ -892,6 +900,18 @@ class InventEngine:
         # as we do when the kernel cannot build. Honesty over a banked artifact.
         device = _neuron_device()
         if device is None:
+            # No torch_xla device handle. On a NATIVE-DLC box (neuronxcc.nki present
+            # but NO torch_xla) we can still VALIDATE on-device via the baremetal/
+            # benchmark path (correctness from R1 simulate) instead of deferring —
+            # this is the #1 recommendation for making this box actually race. Only
+            # truly off-device (no neuronxcc.nki either) do we defer.
+            try:
+                import kernel_baremetal as _kb  # noqa: PLC0415 — optional, self-contained
+                _is_native = _kb.native_dlc()
+            except Exception:  # noqa: BLE001
+                _is_native = False
+            if _is_native:
+                return self._device_race_native(author, spec, _perf)
             return RaceResult(False, reason=(
                 "kernel built but no Neuron device handle for a fair "
                 "same-device, same-method race — deferred (never a "
@@ -1066,6 +1086,60 @@ class InventEngine:
                     f"incorrect): {e!r}"), **_perf)
             return RaceResult(True, False, 0.0, 0.0,
                               reason=f"device race error: {e!r}", **_perf)
+
+    def _device_race_native(self, author: AuthoredKernel, spec: OpSpec,
+                            _perf: dict) -> RaceResult:
+        """Native-DLC (no torch_xla) on-device VALIDATION path (#1).
+
+        Correctness comes from R1 ``nki.simulate`` (authoritative on the box's
+        neuronxcc); device-viability + latency from ``nki.baremetal`` /
+        ``nki.benchmark`` (kernel_baremetal). This image cannot fairly time the
+        torch-eager baseline (the native torch path can't run the @nki.jit kernel
+        the same way), so NO speedup is claimed — the result is a DEVICE-VALIDATED
+        kernel judged on correctness + it-runs-on-the-core + %SOL, with
+        ``device_viable=True``. Never raises: any failure degrades to an honest
+        deferral (ran=False), exactly like the torch_xla path."""
+        sim = self._simulate(author, spec)
+        if not sim.ran:
+            return RaceResult(False, reason=(
+                f"native-DLC: correctness unavailable (simulate: {sim.reason}) "
+                f"— deferred"), **_perf)
+        if not sim.correct:
+            # R1 caught a math bug on the box — record incorrect (banks anti-pattern).
+            return RaceResult(True, correct=False, correctness_pct=0.0,
+                              reason=(f"native-DLC: simulate says WRONG "
+                                      f"(err={sim.max_abs_err:.2e}) — {sim.reason}"),
+                              **_perf)
+        try:
+            import kernel_baremetal as _kb  # noqa: PLC0415
+            inp = spec.real_inputs()
+            nat = _kb.run_baremetal(nki_src=author.nki_src, entry=author.entry,
+                                    op=spec.name, inputs=inp,
+                                    arg_order=_arg_order(spec.name, inp))
+        except Exception as e:  # noqa: BLE001 — a baremetal error is a deferral, not a crash
+            return RaceResult(False, reason=f"native-DLC baremetal raised: {e!r}",
+                              **_perf)
+        if not nat.ran or not nat.compiled:
+            return RaceResult(False, reason=(
+                f"native-DLC: simulate-correct but device build/run deferred "
+                f"({nat.reason})"), **_perf)
+        kernel_ms = nat.kernel_ms
+        sol, profit_verdict = 0.0, ""
+        if kernel_ms > 0:
+            try:
+                import roofline  # noqa: PLC0415
+                _bytes, _flops = _op_bytes_flops(spec)
+                _prof = roofline.profitability(
+                    _bytes, _flops, kernel_ms / 1000.0, _perf.get("bottleneck", ""))
+                sol, profit_verdict = _prof.sol, _prof.verdict
+            except Exception:  # noqa: BLE001 — %SOL is advisory
+                pass
+        return RaceResult(True, correct=True, correctness_pct=100.0,
+                          speedup=0.0, kernel_ms=kernel_ms, baseline_ms=0.0,
+                          reason=(f"native-DLC DEVICE-VALIDATED: simulate-correct "
+                                  f"+ ran on core; {nat.reason}"),
+                          sol=sol, profit_verdict=profit_verdict,
+                          device_viable=True, **_perf)
 
     # -- banking -------------------------------------------------------------
 
@@ -1351,6 +1425,27 @@ class InventEngine:
                                 "anti_pattern", offline, race, lesson_id=lid,
                                 detail=(f"implausible {race.speedup:.3f}x "
                                         f"(sol={race.sol * 100:.0f}% > roofline)"),
+                                lessons_consulted=n)
+
+        # NATIVE-DLC DEVICE-VALIDATED (#1): a correct kernel that compiled + RAN on
+        # the NeuronCore via nki.baremetal, but on an image with no torch-eager
+        # baseline to race latency against (so speedup==0, device_viable==True).
+        # The hard part — clearing neuronx-cc + running on real hardware — is done,
+        # and %SOL reports its efficiency, so bank it as a validated kernel (kept
+        # in the library for fleet reuse) rather than mislabeling a missing
+        # baseline as "correct-but-slow". Only triggers on the native path
+        # (device_viable), so the torch_xla speed-race path + all tests are
+        # unaffected. Reached only for a correct, non-implausible result.
+        if getattr(race, "device_viable", False) and race.speedup <= 0.0:
+            self._bank_kernel_to_library(spec, author, race)   # keep-winner source for reuse
+            self._record(spec, Status.KEEP, 0.0, race.correctness_pct,
+                         (f"DEVICE-VALIDATED (native DLC): correct + runs on core; "
+                          f"%SOL={race.sol * 100:.0f}% [{race.reason}]")[:300],
+                         n_lessons=n)
+            return InventResult(spec.name, spec.shape_class, spec.origin, "win",
+                                offline, race,
+                                detail=(f"device-validated (native DLC), "
+                                        f"%SOL={race.sol * 100:.0f}%"),
                                 lessons_consulted=n)
 
         # PERF LOOP (only when asked): a kernel can be CORRECT but slow (the 0.08x
