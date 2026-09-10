@@ -1297,3 +1297,49 @@ def test_m4_detector_only_applies_to_fused_specs(tmp_path):
     # softcap is a normal single-op spec; its authored source clears the gate.
     g = eng.offline_gate(author_kernel(cat["softcap"]), cat["softcap"])
     assert "fused-in-name-only" not in g.reason
+
+
+# -- R18: static_lint enforces module-scope helpers ---------------------------
+def test_static_lint_flags_nested_helper():
+    """A helper defined INSIDE the kernel body (indented def) is not module-scope
+    and breaks the tracer's source introspection — static_lint must flag it."""
+    src = (
+        "import nki\n"
+        "@nki.jit\n"
+        "def k_kernel(x):\n"
+        "    def helper(y):\n"          # nested def -> R18 violation
+        "        return y\n"
+        "    return helper(x)\n"
+    )
+    assert any("module scope" in s.lower() for s in static_lint(src))
+
+
+def test_static_lint_allows_module_scope_helper():
+    src = (
+        "import nki\n"
+        "def helper(y):\n"              # correct: top-level
+        "    return y\n"
+        "@nki.jit\n"
+        "def k_kernel(x):\n"
+        "    return helper(x)\n"
+    )
+    assert not any("module scope" in s.lower() for s in static_lint(src))
+
+
+def test_static_lint_ignores_def_in_comment():
+    src = (
+        "import nki\n"
+        "@nki.jit\n"
+        "def k_kernel(x):\n"
+        "    # def helper(y): return y   <- a comment, not a nested def\n"
+        "    return x\n"
+    )
+    assert not any("module scope" in s.lower() for s in static_lint(src))
+
+
+def test_catalog_kernels_have_no_nested_helpers(tmp_path):
+    """Regression: no built-in catalog kernel trips the new module-scope rule
+    (so every catalog op still clears the offline gate)."""
+    for name, spec in catalog().items():
+        v = static_lint(author_kernel(spec).nki_src)
+        assert not any("module scope" in s.lower() for s in v), f"{name}: {v}"

@@ -338,6 +338,18 @@ def static_lint(nki_src: str) -> list[str]:
                 f"partition (first) dim {first} > 128 — partition dim must be 128"
             )
 
+    # module-scope helper (R18): a helper defined INSIDE the kernel body (an
+    # INDENTED ``def``) is not at module scope. The NKI tracer reads the kernel's
+    # Python SOURCE (the file-backed loader in build()), and a nested def breaks
+    # that source introspection — helpers MUST be top-level (column-0) defs.
+    # Checked on the scrubbed code so a "def" inside a comment/string never
+    # false-positives; the kernel's own entry def is at column 0 and never matches.
+    if re.search(r"(?m)^[ \t]+(?:async\s+)?def\s+\w+\s*\(", code):
+        violations.append(
+            "helper defined inside the kernel body (indented def) — NKI helpers "
+            "must be at MODULE scope; a nested def breaks the tracer's source "
+            "introspection. Move it to a top-level def.")
+
     violations.extend(_lint_dma_rule(code))
     return violations
 
