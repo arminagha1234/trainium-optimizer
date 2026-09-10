@@ -138,11 +138,16 @@ def classify_bottleneck(race: Any) -> str:
     # that merely lists "GPSIMD 0%" does not misroute here.
     if "gpsimd-bound" in hay or "gpsimd_bound" in hay or "indirect" in hay:
         return GPSIMD_BOUND
-    if "dma" in hay or "bandwidth" in hay:
+    # "relayout" is a silent_perf (R25) token: a compiler-inserted relayout/
+    # transpose DMA is a load-path problem -> the DMA_BLOCKED lever (fix layout /
+    # double-buffer), so route it there alongside the generic dma/bandwidth tokens.
+    if "dma" in hay or "bandwidth" in hay or "relayout" in hay:
         return DMA_BLOCKED
     if "single" in hay or "serial" in hay or "engine" in hay:
         return SINGLE_ENGINE
-    if "spill" in hay:
+    # "spill" and the silent_perf (R25) "re-read" token are the same class: an
+    # operand re-fetched from HBM -> MEMORY_BOUND (fuse + keep SBUF-resident).
+    if "spill" in hay or "re-read" in hay or "reread" in hay:
         return MEMORY_BOUND
     # Fall back to the analytic roofline classification.
     bn = (getattr(race, "bottleneck", "") or "").lower()
