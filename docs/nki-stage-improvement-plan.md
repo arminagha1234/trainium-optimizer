@@ -7,6 +7,9 @@
 > device activation pending one on-device run), R17 landed (☑). See §9 implementation log.
 > **v4 (2026-09-10):** R3 (◐), R25 (☑), M4 (☑), R18 (☑) landed. Full offline suite 961 passing
 > (same pre-existing torch/boto3-only failures, none introduced). See §9.
+> **v5 (2026-09-10):** R8 (☑), R7 (◐) landed. Also recorded honest status for the recs that
+> are device-gated (R4/R5/R9/R11/R15/R16/R19), need a provider+benchmark (R6/R13), or are
+> internal-repo (M1/M3 authoring scaffold). See §9 + §10.
 > **Purpose:** a reviewable, add-to-later plan for improving the framework's Stage-4
 > (invent / NKI kernel authoring) and megakernel-writing path. This is a PLAN, not a
 > changelog — every recommendation has a status box so we can check things off and
@@ -378,8 +381,8 @@ recs, which is the honest outcome:
 | R4 | NAKB/NKIBench scoreboard | 0 | M | Y | ☐ |
 | R5 | align w/ NAKOS + OSS | 0 | L | Y | ☐ |
 | R6 | repair loop + LLMAuthor default | 1 | M | N | ☐ |
-| R7 | error→fix KB | 1 | M | N | ☐ |
-| R8 | run-log-arbitrated banking | 1 | M | N | ☐ |
+| R7 | error→fix KB | 1 | M | N | ◐ (catalog already rich; grew it with the live HBM-OOM failure; internal 28-code catalog not transcribed) |
+| R8 | run-log-arbitrated banking | 1 | M | N | ☑ (banking already measured; wired the physical-plausibility veto into the win gate) |
 | R9 | NeffSim perf oracle | 1 | M | N | ☐ |
 | R10 | perf rulebook + gates | 1 | M | N | ☐ |
 | R11 | neuron-profile in perf loop | 1 | M | Y | ☐ |
@@ -487,3 +490,58 @@ until Stage 4 is wired (a later rec) and a fresh launch is authorized.
 > `blockers.py`, and parts of `knowledge-bank/` as INTERNAL-ONLY (internal-sourced /
 > customer-derived) — never pushed. All committed work above is in tracked, pushable
 > files and does not import an internal-only module from a tracked test.
+- **2026-09-10 — R8 (run-log-arbitrated banking) ☑.** Finding: banking was already
+  measurement-driven — `invent_engine._bank_*` banks the measured `race`, and
+  `overnight._emit_lesson` banks the measured winner; neither trusts an agent
+  self-report. The concrete gap was that `roofline.is_implausible_mfu` (the ~788x
+  fake-speedup guard) existed but was not wired into the invent-engine banking
+  path. Added `roofline.is_implausible_sol` (per-op analog) and wired it into
+  `_finish`: a CORRECT kernel whose measured %SOL exceeds the physical roofline is
+  banked as an anti-pattern ("measuring dispatch, not compute"), never a win. The
+  physical ceiling arbitrates the measured number. Fail-open (unmeasured sol=0 is
+  not vetoed). 6 tests.
+- **2026-09-10 — R7 (error→fix KB) ◐.** The catalog (`kernel_rewrites`) is already
+  rich (~16 rewrites grounded in real captured failures). Grew it with
+  `hbm-oom-shrink-footprint`, grounded in a REAL failure observed in the running
+  soak (Neuron OOM / HBM pressure), routing the repair loop to the resource levers
+  (shard/bucket/stream/dtype). Deliberately distinct from the NCC_INLA001 compiler
+  bug (escalate, don't tune) — a test asserts no cross-match. The internal ~28-code
+  error catalog is NOT transcribed (internal-sourced material). New
+  `test_kernel_rewrites.py` (9 tests, incl. catalog integrity). Further growth is
+  best driven by real soak failures as they appear, not bulk transcription.
+
+---
+
+## 10. Status of the remaining recommendations (honest blockers)
+
+The recs not yet landed are blocked on resources this offline workstation does not
+have, not on effort. Grouped by what unblocks them:
+
+- **Device-gated (need Trainium; must not disturb the running soak):** R4 (NAKB/
+  NKIBench scoreboard), R5 (align with NAKOS + OSS device-race infra), R9 (NeffSim
+  HW-free perf oracle — internal asset), R11 (real neuron-profile in the perf loop —
+  the `profiler` seam already exists in `invent_engine.__init__`, unwired), R15
+  (framework custom-op e2e), R16 (nrtpy race harness), R19 (gpt_oss giga-kernel
+  imitation). **Also R1's device-activation** and R3's actual nki-library checkout
+  indexing. These should be scheduled on a Trainium box (or the soak box between
+  models) when device time is authorized.
+- **Need a model provider + a benchmark A/B (per §7):** R6 (make `LLMAuthor` the
+  default + turn the repair loop on by default). The repair loop is already
+  implemented and unit-tested (`max_repair_rounds>1` with an injected compile_fn),
+  and the author seam already accepts an `LLMAuthor`; flipping the DEFAULT is a
+  cost/behaviour change that the doc's own §7 says to validate on NAKB first (the
+  ACO ablation warns RAG didn't help; the NKI-Agent paper endorses the loop). Not
+  flipped blind. R13 (multi-specialist analyze) similarly needs the provider.
+- **Internal-repo (compliance):** M1/M3 megakernel authoring scaffold + SBUF-
+  discipline author rules. The scaffold/template and the specific SBUF APIs come
+  from the internal megakernel skill; encoding them verbatim in this PUBLIC repo
+  would leak internal-sourced material (see the `.git/info/exclude` INTERNAL-ONLY
+  list). Their OBSERVABLE enforcement is already public: **M4** rejects a
+  fused-in-name-only kernel (multiple traces) and **R25 `operand_reread`** flags an
+  intermediate that round-trips through HBM (a SBUF-residency violation) — so a
+  megakernel that violates the discipline is caught by its symptoms without
+  publishing the internal rulebook.
+- **Lower priority / forward-looking (offline, not yet done):** R10 (perf rulebook —
+  largely already present in `kernel_perf._GUIDANCE` + `roofline` good-bars +
+  `perf_hints`), R12 (NeuroTile/autotune), R14 (test-set minimizer — worth adding as
+  the gate grows), R20–R24.
