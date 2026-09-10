@@ -183,9 +183,31 @@ class KernelRegistry:
     """
 
     def __init__(self, kernel_dir: str | os.PathLike | None = None,
-                 library: Any = None) -> None:
+                 library: Any = None,
+                 extra_dirs: "list[str | os.PathLike] | None" = None) -> None:
         d = kernel_dir or os.environ.get("TRN_OPT_KERNEL_DIR") or ""
         self.kernel_dir: Path | None = Path(d) if d else None
+        # R3 (harvest the nki-library corpus): ADDITIONAL read-only harvest dirs,
+        # searched AFTER the primary dir, so a cloned external corpus (e.g. an
+        # nki-library checkout whose kernels have been indexed with kernel.json
+        # manifests) is harvested ALONGSIDE the in-repo validated kernels without
+        # displacing them — the primary dir keeps precedence (our validated
+        # kernels win a name clash). Sourced from the ``extra_dirs`` arg then
+        # $TRN_OPT_EXTRA_KERNEL_DIRS (os.pathsep-separated). Empty => byte-for-byte
+        # the previous single-dir behaviour, so existing runs/tests are unchanged.
+        raw_extra: list = list(extra_dirs or [])
+        env_extra = os.environ.get("TRN_OPT_EXTRA_KERNEL_DIRS", "")
+        if env_extra:
+            raw_extra += [p for p in env_extra.split(os.pathsep) if p]
+        seen: set[str] = set()
+        if self.kernel_dir is not None:
+            seen.add(str(self.kernel_dir))
+        self.extra_kernel_dirs: list[Path] = []
+        for p in raw_extra:
+            pp = Path(p)
+            if str(pp) not in seen:                 # dedup; never shadow the primary
+                seen.add(str(pp))
+                self.extra_kernel_dirs.append(pp)
         # Optional IN-REPO validated kernel library (kernel_library.KernelLibrary).
         # Consulted FIRST in for_primitive so a kernel WE wrote+validated is
         # reused before an external proprietary one and before authoring. Default
@@ -194,19 +216,33 @@ class KernelRegistry:
         self._cache: dict[str, KernelSpec | None] = {}
 
     def _manifest_path(self, kernel_name: str) -> Path | None:
+        """Primary-dir manifest path (back-compat single-dir accessor)."""
         if self.kernel_dir is None:
             return None
         return self.kernel_dir / kernel_name / "kernel.json"
 
+    def _manifest_paths(self, kernel_name: str) -> "list[Path]":
+        """All candidate manifest paths in precedence order: the primary dir
+        first, then each extra harvest dir (R3). The primary keeps precedence so
+        a validated in-repo kernel always wins a name clash with an external one."""
+        paths: list[Path] = []
+        if self.kernel_dir is not None:
+            paths.append(self.kernel_dir / kernel_name / "kernel.json")
+        for d in self.extra_kernel_dirs:
+            paths.append(d / kernel_name / "kernel.json")
+        return paths
+
     def lookup(self, kernel_name: str) -> KernelSpec | None:
         """The KernelSpec for a kernel by canonical name, or None if this install
-        has no (readable) manifest for it. Never raises: a malformed/absent
-        manifest is treated as 'not available'."""
+        has no (readable) manifest for it in ANY harvest dir. Never raises: a
+        malformed/absent manifest is skipped (try the next dir), and the FIRST
+        readable manifest wins (primary dir before extras)."""
         if kernel_name in self._cache:
             return self._cache[kernel_name]
         spec: KernelSpec | None = None
-        mp = self._manifest_path(kernel_name)
-        if mp is not None and mp.is_file():
+        for mp in self._manifest_paths(kernel_name):
+            if not mp.is_file():
+                continue
             try:
                 data = json.loads(mp.read_text())
                 spec = KernelSpec(
@@ -220,7 +256,8 @@ class KernelRegistry:
                     backend=str(data.get("backend", "")),
                     notes=str(data.get("notes", "")),
                 )
-            except Exception:  # noqa: BLE001 — a bad manifest is "not available"
+                break                               # first readable manifest wins
+            except Exception:  # noqa: BLE001 — a bad manifest is skipped, try next dir
                 spec = None
         self._cache[kernel_name] = spec
         return spec

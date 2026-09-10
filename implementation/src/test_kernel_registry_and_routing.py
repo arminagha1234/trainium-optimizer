@@ -177,3 +177,85 @@ def test_invent_does_not_harvest_failed_compile_kernel(tmp_path: Path):
     eng = InventEngine(out_dir=tmp_path / "run3", registry=reg)
     res = eng.run_op(_op(primitive="linear_attention"))
     assert res.status != "harvested"          # a failed attempt is not prior art
+
+
+# -- R3: multi-dir harvest (repo kernels + an external nki-library checkout) --
+import os as _os
+
+
+def _write_kernel(dir_root: Path, name: str, status: str, entry: str,
+                  notes: str = "") -> None:
+    kdir = dir_root / name
+    kdir.mkdir(parents=True, exist_ok=True)
+    (kdir / "kernel.json").write_text(json.dumps({
+        "name": name, "status": status, "entry": entry,
+        "path": f"{name.lower()}.py", "variants": [],
+        "tolerances": {"bf16": 8.3e-4}, "notes": notes,
+    }))
+
+
+def test_extra_dir_kernel_is_harvested(tmp_path: Path):
+    """A kernel present ONLY in an extra harvest dir (e.g. a cloned nki-library
+    checkout) is found alongside the primary repo kernels."""
+    primary = tmp_path / "repo_kernels"
+    external = tmp_path / "nki_library"
+    _write_kernel(primary, "DeltaNet", "passed-on-device", "gdn:gdn_kernel")
+    _write_kernel(external, "Mamba2", "passed-on-device", "ssd:ssd_kernel",
+                  notes="from external nki-library")
+    reg = KernelRegistry(primary, extra_dirs=[external])
+    assert reg.available("DeltaNet")                     # primary
+    m = reg.lookup("Mamba2")                             # extra dir
+    assert m is not None and "external nki-library" in m.notes
+
+
+def test_primary_dir_wins_name_clash(tmp_path: Path):
+    """When the same kernel name exists in the primary AND an extra dir, the
+    primary (our validated) manifest wins — extras never displace repo kernels."""
+    primary = tmp_path / "repo_kernels"
+    external = tmp_path / "nki_library"
+    _write_kernel(primary, "DeltaNet", "passed-on-device", "ours:k",
+                  notes="in-repo validated")
+    _write_kernel(external, "DeltaNet", "analysis-only", "theirs:k",
+                  notes="external")
+    reg = KernelRegistry(primary, extra_dirs=[external])
+    spec = reg.lookup("DeltaNet")
+    assert spec is not None and spec.notes == "in-repo validated"
+    assert spec.status == "passed-on-device"
+
+
+def test_extra_dirs_from_env(tmp_path: Path, monkeypatch):
+    """$TRN_OPT_EXTRA_KERNEL_DIRS (os.pathsep-separated) is parsed into extra
+    harvest dirs."""
+    primary = tmp_path / "repo_kernels"
+    ext1 = tmp_path / "lib1"
+    ext2 = tmp_path / "lib2"
+    _write_kernel(primary, "DeltaNet", "passed", "a:k")
+    _write_kernel(ext1, "Mamba2", "passed", "b:k")
+    _write_kernel(ext2, "MLA", "passed", "c:k")
+    monkeypatch.setenv("TRN_OPT_EXTRA_KERNEL_DIRS",
+                       _os.pathsep.join([str(ext1), str(ext2)]))
+    reg = KernelRegistry(primary)
+    assert reg.available("DeltaNet") and reg.available("Mamba2") and reg.available("MLA")
+
+
+def test_bad_manifest_in_primary_falls_through_to_extra(tmp_path: Path):
+    """A malformed manifest in the primary dir is skipped and the same kernel's
+    readable manifest in an extra dir is used (robust harvest)."""
+    primary = tmp_path / "repo_kernels"
+    external = tmp_path / "nki_library"
+    (primary / "DeltaNet").mkdir(parents=True)
+    (primary / "DeltaNet" / "kernel.json").write_text("{ not json")
+    _write_kernel(external, "DeltaNet", "passed-on-device", "ext:k",
+                  notes="fallback from extra")
+    reg = KernelRegistry(primary, extra_dirs=[external])
+    spec = reg.lookup("DeltaNet")
+    assert spec is not None and spec.notes == "fallback from extra"
+
+
+def test_no_extra_dirs_is_unchanged(tmp_path: Path):
+    """With no extra dirs (the default), behaviour is the single-dir path."""
+    primary = tmp_path / "repo_kernels"
+    _write_kernel(primary, "DeltaNet", "passed", "a:k")
+    reg = KernelRegistry(primary)
+    assert reg.extra_kernel_dirs == []
+    assert reg.available("DeltaNet") and reg.lookup("Mamba2") is None
