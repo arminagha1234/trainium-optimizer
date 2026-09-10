@@ -202,6 +202,43 @@ REWRITES: tuple[Rewrite, ...] = (
         evidence="General static-shape guardrail; unverified against a specific "
                  "captured reject (kept low-confidence until re-compile-verified).",
     ),
+    Rewrite(
+        name="hbm-oom-shrink-footprint",
+        summary="Neuron OOM / HBM pressure: shrink the resident footprint — shard "
+                "more (higher TP), lower the batch×seq bucket, or stream large "
+                "intermediates instead of materializing them.",
+        # The exact runtime/compiler OOM tokens (a resource abort, not a miscompile
+        # and not the NCC_INLA001 compiler-bug 'out of bound' which must be
+        # escalated, not tuned around). Specific enough not to cross-match.
+        error_signatures=(
+            "Neuron OOM",
+            "OOM / HBM pressure",
+            "RecordOOMFailure",
+            "HBM pressure",
+        ),
+        hostile_ops=(),
+        fix=(
+            "# A RESOURCE abort (device HBM exhausted), not a miscompile: the run\n"
+            "# needs less resident memory, not a different kernel. Levers, cheapest\n"
+            "# first (all reduce per-core HBM):\n"
+            "#   1. Shard more — raise TP so weights + KV cache split over more\n"
+            "#      cores (per-core HBM ~= total / TP).\n"
+            "#   2. Lower the batch x seq BUCKET (fewer/smaller static shapes) so\n"
+            "#      the activation + KV footprint drops.\n"
+            "#   3. Stream, don't materialize — fuse the op so a large intermediate\n"
+            "#      stays tiled/resident (see the megakernel SBUF discipline) rather\n"
+            "#      than being written whole to HBM.\n"
+            "#   4. Lower the KV-cache / activation dtype where correctness allows.\n"
+            "# Distinct from NCC_INLA001 'Allocated memory out of bound' — that is a\n"
+            "# compiler bug to ESCALATE, not tune around."
+        ),
+        applies_at="model-graph",
+        confidence="medium",
+        evidence="Observed live in the 72h soak (2026-09-10, trn2.48xl): a worker "
+                 "aborted 'OOM / HBM pressure ... Neuron OOM: Segment pool state ... "
+                 "total_hbm=25769803776 (RecordOOMFailure)'. Fix (shard/bucket/stream) "
+                 "is the standard HBM-pressure lever; not yet re-verified in our loop.",
+    ),
     # --- OFFLINE LINT symptoms (BUG #3) ------------------------------------
     # The entries above route COMPILER errors. These route the OFFLINE static
     # lint's own messages (``invent_kernels.static_lint``), so a lint failure —
