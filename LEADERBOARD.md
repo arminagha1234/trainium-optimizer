@@ -23,46 +23,52 @@ Every row is generated from a `recipe.json` in an existing bundle: no bundle, no
 | 13 | Qwen3-1.7B | qwen3 | 1.7B | **51,278** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-1-7b/) |
 | 14 | Qwen2.5-1.5B-Instruct | qwen2.5 | 1.5B | **50,804** | TP=4, torch.compile(neuron), bf16, batch=8, DP=16 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-1-5b-instruct/trn2.48xlarge/) |
 | 15 | SmolLM2-1.7B-Instruct | smollm2 | 1.7B | **50,650** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-1-7b-instruct/) |
-| 16 | bloom-560m | bloom | — | **48,320** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/bloom-560m/) |
-| 17 | SmolLM2-360M-Instruct | smollm2 | — | **48,203** | TP=1, torch.compile(neuron), bf16, batch=8, DP=64 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/smollm2-360m-instruct/trn2.48xlarge/) |
-| 18 | TinyLlama-1.1B-Chat-v1.0 | tinyllama | 1.1B | **48,108** | torch.compile(neuron) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/tinyllama-1-1b-chat-v1-0/) |
-| 19 | SmolLM2-360M-Instruct | smollm2 | — | **48,064** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-360m-instruct/) |
-| 20 | granite-3.1-2b-instruct | granite | 2B | **38,708** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/granite-3-1-2b-instruct/) |
-| 21 | Qwen2.5-Coder-1.5B | qwen2.5 | 1.5B | **38,369** | torch.compile(neuron) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-coder-1-5b/) |
-| 22 | Qwen3-4B | qwen3 | 4B | **36,938** | TP=32, torch.compile(neuron), bf16, batch=8, DP=2 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-4b/trn2.48xlarge/) |
-| 23 | Qwen2.5-3B-Instruct | qwen2.5 | 3B | **35,343** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-3b-instruct/) |
-| 24 | gemma-2-2b | gemma | 2B | **34,051** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/gemma-2-2b/) |
-| 25 | SmolLM2-360M | smollm2 | — | **31,764** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-360m/) |
-| 26 | gpt2-large | gpt2 | — | **30,620** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/gpt2-large/) |
-| 27 | Qwen3-4B | qwen3 | 4B | **26,548** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-4b/) |
-| 28 | Qwen3-8B | qwen3 | 8B | **26,166** | TP=32, torch.compile(neuron), bf16, batch=8, DP=2 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-8b/trn2.48xlarge/) |
-| 29 | bloom-1b7 | bloom | — | **24,852** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/bloom-1b7/) |
-| 30 | Mistral-7B-Instruct-v0.3 | mistral | 7B | **23,270** | TP=4, torch.compile(neuron), bf16, batch=32 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/mistral-7b-instruct-v0-3/) |
-| 31 | opt-1.3b | opt | 1.3B | **21,077** | torch.compile(neuron) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/opt-1-3b/) |
-| 32 | deepseek-llm-7b-base | deepseek | 7B | **20,702** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/deepseek-llm-7b-base/) |
-| 33 | Qwen3.5-4B | qwen3.5 | 4B | **20,470** | TP=16, torch.compile(neuron), bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-4b/trn2.48xlarge/) |
-| 34 | Qwen2.5-Coder-7B | qwen2.5 | 7B | **19,866** | torch.compile(neuron) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-coder-7b/) |
-| 35 | Qwen2.5-Math-7B | qwen2.5 | 7B | **19,826** | torch.compile(neuron) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-math-7b/) |
-| 36 | Qwen3-8B | qwen3 | 8B | **16,876** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-8b/) |
-| 37 | SmolLM2-1.7B | smollm2 | 1.7B | **14,460** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-1-7b/) |
-| 38 | stablelm-2-1_6b | stablelm | 6B | **14,183** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/stablelm-2-1-6b/) |
-| 39 | pythia-1.4b | pythia | 1.4B | **13,294** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/pythia-1-4b/) |
-| 40 | opt-2.7b | opt | 2.7B | **11,649** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/opt-2-7b/) |
-| 41 | Qwen3-14B | qwen3 | 14B | **10,343** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-14b/) |
-| 42 | Qwen2.5-14B-Instruct | qwen2.5 | 14B | **10,256** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-14b-instruct/) |
-| 43 | Qwen2.5-7B-Instruct | qwen2.5 | 7B | **9,870** | TP=4, bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-7b-instruct/) |
-| 44 | phi-2 | phi | — | **9,841** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/phi-2/) |
-| 45 | RedPajama-INCITE-Instruct-3B-v1 | redpajama | 3B | **9,824** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/redpajama-incite-instruct-3b-v1/) |
-| 46 | stablelm-3b-4e1t | stablelm | 3B | **7,721** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/stablelm-3b-4e1t/) |
-| 47 | pythia-2.8b | pythia | 2.8B | **6,450** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/pythia-2-8b/) |
-| 48 | Qwen3-32B | qwen3 | 32B | **3,698** | TP=4, torch.compile(neuron), bf16, batch=1, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-32b/) |
-| 49 | Qwen3.5-35B-A3B | qwen3.5 | 35B | **2,695** | TP=16, bf16, batch=8 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-35b-a3b/trn2.48xlarge/) |
-| 50 | Qwen3.5-0.8B | qwen3.5 | 0.8B | **1,143** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-0-8b/trn2.48xlarge/) |
-| 51 | Qwen3.5-2B | qwen3.5 | 2B | **1,129** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-2b/trn2.48xlarge/) |
-| 52 | Qwen3.8-27B | qwen3.8 | 27B | **343** | TP=8, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-8-27b/trn2.48xlarge/) |
-| 53 | DeepSeek-V4-Flash | deepseek | 284B | **0.29** | TP=1, EP=64, bf16-resident (all Linears dequant-once), batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/deepseek-v4-flash/trn2.48xlarge/) |
+| 16 | Qwen2.5-3B-Instruct | qwen2.5 | 3B | **49,880** | TP=16, torch.compile(neuron), bf16, batch=8, DP=4 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-3b-instruct/trn2.48xlarge/) |
+| 17 | bloom-560m | bloom | — | **48,320** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/bloom-560m/) |
+| 18 | SmolLM2-360M-Instruct | smollm2 | — | **48,203** | TP=1, torch.compile(neuron), bf16, batch=8, DP=64 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/smollm2-360m-instruct/trn2.48xlarge/) |
+| 19 | TinyLlama-1.1B-Chat-v1.0 | tinyllama | 1.1B | **48,108** | torch.compile(neuron) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/tinyllama-1-1b-chat-v1-0/) |
+| 20 | SmolLM2-360M-Instruct | smollm2 | — | **48,064** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-360m-instruct/) |
+| 21 | granite-3.1-2b-instruct | granite | 2B | **38,708** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/granite-3-1-2b-instruct/) |
+| 22 | Qwen2.5-Coder-1.5B | qwen2.5 | 1.5B | **38,369** | torch.compile(neuron) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-coder-1-5b/) |
+| 23 | Qwen3-4B | qwen3 | 4B | **36,938** | TP=32, torch.compile(neuron), bf16, batch=8, DP=2 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-4b/trn2.48xlarge/) |
+| 24 | Qwen2.5-3B-Instruct | qwen2.5 | 3B | **35,343** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-3b-instruct/) |
+| 25 | gemma-2-2b | gemma | 2B | **34,051** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/gemma-2-2b/) |
+| 26 | SmolLM2-360M | smollm2 | — | **31,764** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-360m/) |
+| 27 | gpt2-large | gpt2 | — | **30,620** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/gpt2-large/) |
+| 28 | Qwen3-4B | qwen3 | 4B | **26,548** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-4b/) |
+| 29 | Qwen3-8B | qwen3 | 8B | **26,166** | TP=32, torch.compile(neuron), bf16, batch=8, DP=2 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-8b/trn2.48xlarge/) |
+| 30 | bloom-1b7 | bloom | — | **24,852** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/bloom-1b7/) |
+| 31 | Mistral-7B-Instruct-v0.3 | mistral | 7B | **23,270** | TP=4, torch.compile(neuron), bf16, batch=32 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/mistral-7b-instruct-v0-3/) |
+| 32 | opt-1.3b | opt | 1.3B | **21,077** | torch.compile(neuron) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/opt-1-3b/) |
+| 33 | deepseek-llm-7b-base | deepseek | 7B | **20,702** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/deepseek-llm-7b-base/) |
+| 34 | Qwen3.5-4B | qwen3.5 | 4B | **20,470** | TP=16, torch.compile(neuron), bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-4b/trn2.48xlarge/) |
+| 35 | Qwen2.5-Coder-7B | qwen2.5 | 7B | **19,866** | torch.compile(neuron) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-coder-7b/) |
+| 36 | Qwen2.5-Math-7B | qwen2.5 | 7B | **19,826** | torch.compile(neuron) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-math-7b/) |
+| 37 | Qwen2.5-Coder-7B-Instruct | qwen2.5 | 7B | **19,532** | TP=4, torch.compile(neuron), bf16, batch=8, DP=16 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-coder-7b-instruct/trn2.48xlarge/) |
+| 38 | Qwen3-8B | qwen3 | 8B | **16,876** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-8b/) |
+| 39 | SmolLM2-1.7B | smollm2 | 1.7B | **14,460** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/smollm2-1-7b/) |
+| 40 | stablelm-2-1_6b | stablelm | 6B | **14,183** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/stablelm-2-1-6b/) |
+| 41 | pythia-1.4b | pythia | 1.4B | **13,294** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/pythia-1-4b/) |
+| 42 | Qwen2.5-14B-Instruct | qwen2.5 | 14B | **13,269** | TP=8, torch.compile(neuron), bf16, batch=8, DP=8 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-14b-instruct/trn2.48xlarge/) |
+| 43 | opt-2.7b | opt | 2.7B | **11,649** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/opt-2-7b/) |
+| 44 | Qwen3-14B | qwen3 | 14B | **10,343** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-14b/) |
+| 45 | Qwen2.5-14B-Instruct | qwen2.5 | 14B | **10,256** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-14b-instruct/) |
+| 46 | Qwen2.5-7B-Instruct | qwen2.5 | 7B | **9,976** | TP=4, bf16, batch=8, DP=16 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-7b-instruct/trn2.48xlarge/) |
+| 47 | Qwen2.5-7B-Instruct | qwen2.5 | 7B | **9,870** | TP=4, bf16, batch=8 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-7b-instruct/) |
+| 48 | phi-2 | phi | — | **9,841** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/phi-2/) |
+| 49 | RedPajama-INCITE-Instruct-3B-v1 | redpajama | 3B | **9,824** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/redpajama-incite-instruct-3b-v1/) |
+| 50 | QwQ-32B | qwq | 32B | **8,078** | TP=8, torch.compile(neuron), bf16, batch=8, DP=8 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwq-32b/trn2.48xlarge/) |
+| 51 | Qwen2.5-32B-Instruct | qwen2.5 | 32B | **8,049** | TP=8, torch.compile(neuron), bf16, batch=8, DP=8 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen2-5-32b-instruct/trn2.48xlarge/) |
+| 52 | stablelm-3b-4e1t | stablelm | 3B | **7,721** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/stablelm-3b-4e1t/) |
+| 53 | pythia-2.8b | pythia | 2.8B | **6,450** | (config-only) | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/pythia-2-8b/) |
+| 54 | Qwen3-32B | qwen3 | 32B | **3,698** | TP=4, torch.compile(neuron), bf16, batch=1, CP=2 | trn2.3xlarge | ✅ verified | [recipe](./optimized_models/qwen3-32b/) |
+| 55 | Qwen3.5-35B-A3B | qwen3.5 | 35B | **2,695** | TP=16, bf16, batch=8 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-35b-a3b/trn2.48xlarge/) |
+| 56 | Qwen3.5-0.8B | qwen3.5 | 0.8B | **1,143** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-0-8b/trn2.48xlarge/) |
+| 57 | Qwen3.5-2B | qwen3.5 | 2B | **1,129** | TP=4, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-5-2b/trn2.48xlarge/) |
+| 58 | Qwen3.8-27B | qwen3.8 | 27B | **343** | TP=8, bf16, batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/qwen3-8-27b/trn2.48xlarge/) |
+| 59 | DeepSeek-V4-Flash | deepseek | 284B | **0.29** | TP=1, EP=64, bf16-resident (all Linears dequant-once), batch=1 | trn2.48xlarge | ✅ verified | [recipe](./optimized_models/deepseek-v4-flash/trn2.48xlarge/) |
 
-53 verified result(s) across 46 model(s) and 2 hardware target(s). Throughput is the prefill tok/s measured on real hardware at the recipe's probe shape. Absolute throughput is comparable across rows on the same hardware target.
+59 verified result(s) across 49 model(s) and 2 hardware target(s). Throughput is the prefill tok/s measured on real hardware at the recipe's probe shape. Absolute throughput is comparable across rows on the same hardware target.
 
 ## Improvement over eager baseline
 
@@ -80,6 +86,7 @@ The same verified results, ranked by speedup over the **eager** baseline on the 
 | Qwen3-4B | 4B | 2,089 | **36,938** | **17.683×** | TP=32, torch.compile(neuron), bf16, batch=8, DP=2 | trn2.48xlarge |
 | Qwen3-1.7B | 1.7B | 2,975 | **51,278** | **17.239×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge |
 | gemma-2-2b | 2B | 1,996 | **34,051** | **17.061×** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge |
+| Qwen2.5-3B-Instruct | 3B | 2,974 | **49,880** | **16.771×** | TP=16, torch.compile(neuron), bf16, batch=8, DP=4 | trn2.48xlarge |
 | Qwen2.5-1.5B-Instruct | 1.5B | 3,797 | **59,241** | **15.601×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge |
 | Qwen2.5-0.5B-Instruct | 0.5B | 4,833 | **74,269** | **15.368×** | TP=2, torch.compile(neuron), bf16, batch=8, DP=2 | trn2.3xlarge |
 | Qwen2.5-0.5B-Instruct | 0.5B | 5,220 | **74,449** | **14.263×** | TP=2, torch.compile(neuron), bf16, batch=8, DP=32 | trn2.48xlarge |
@@ -102,13 +109,18 @@ The same verified results, ranked by speedup over the **eager** baseline on the 
 | Qwen3-8B | 8B | 1,903 | **16,876** | **8.87×** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge |
 | deepseek-llm-7b-base | 7B | 2,781 | **20,702** | **7.443×** | (config-only) | trn2.3xlarge |
 | gpt2-large | — | 4,170 | **30,620** | **7.343×** | (config-only) | trn2.3xlarge |
+| Qwen2.5-14B-Instruct | 14B | 1,889 | **13,269** | **7.024×** | TP=8, torch.compile(neuron), bf16, batch=8, DP=8 | trn2.48xlarge |
 | Qwen2.5-Math-7B | 7B | 2,930 | **19,826** | **6.765×** | torch.compile(neuron) | trn2.3xlarge |
 | Qwen2.5-Coder-7B | 7B | 2,949 | **19,866** | **6.736×** | torch.compile(neuron) | trn2.3xlarge |
+| Qwen2.5-Coder-7B-Instruct | 7B | 3,085 | **19,532** | **6.332×** | TP=4, torch.compile(neuron), bf16, batch=8, DP=16 | trn2.48xlarge |
 | Qwen3-14B | 14B | 1,699 | **10,343** | **6.087×** | TP=4, torch.compile(neuron), bf16, batch=8 | trn2.3xlarge |
 | Qwen3.5-35B-A3B | 35B | 453 | **2,695** | **5.946×** | TP=16, bf16, batch=8 | trn2.48xlarge |
 | Qwen2.5-14B-Instruct | 14B | 1,819 | **10,256** | **5.637×** | TP=4, torch.compile(neuron), bf16, batch=8, CP=2 | trn2.3xlarge |
+| QwQ-32B | 32B | 1,494 | **8,078** | **5.407×** | TP=8, torch.compile(neuron), bf16, batch=8, DP=8 | trn2.48xlarge |
+| Qwen2.5-32B-Instruct | 32B | 1,490 | **8,049** | **5.4×** | TP=8, torch.compile(neuron), bf16, batch=8, DP=8 | trn2.48xlarge |
 | Qwen3-32B | 32B | 975 | **3,698** | **3.794×** | TP=4, torch.compile(neuron), bf16, batch=1, CP=2 | trn2.3xlarge |
 | Qwen2.5-7B-Instruct | 7B | 2,916 | **9,870** | **3.384×** | TP=4, bf16, batch=8 | trn2.3xlarge |
+| Qwen2.5-7B-Instruct | 7B | 3,079 | **9,976** | **3.241×** | TP=4, bf16, batch=8, DP=16 | trn2.48xlarge |
 | opt-1.3b | 1.3B | 6,859 | **21,077** | **3.073×** | torch.compile(neuron) | trn2.3xlarge |
 | stablelm-2-1_6b | 6B | 4,828 | **14,183** | **2.938×** | (config-only) | trn2.3xlarge |
 | RedPajama-INCITE-Instruct-3B-v1 | 3B | 3,345 | **9,824** | **2.937×** | (config-only) | trn2.3xlarge |
