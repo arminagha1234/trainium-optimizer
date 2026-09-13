@@ -1,10 +1,10 @@
 # Optimized Recipe: Qwen/Qwen2-0.5B-Instruct
 
-**74,497 tok/s** — 13.818x over baseline
-(5,391 tok/s).
+**74,507 tok/s** — 13.795x over baseline
+(5,401 tok/s).
 
 Backend: `native-pytorch-beta3`  ·  Correctness: **verified** (trusted-grader re-measure)
-Generated: 2026-09-10T04:21:52Z
+Generated: 2026-09-11T16:23:27Z
 
 ## Winning config
 

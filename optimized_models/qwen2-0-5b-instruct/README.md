@@ -6,7 +6,7 @@ Verified optimization routes for [`Qwen/Qwen2-0.5B-Instruct`](https://huggingfac
 
 | Hardware | Baseline | Best | Speedup | Best config | Recipe |
 |:---------|---------:|-----:|--------:|:------------|:-------|
-| `trn2.48xlarge` | 5,391 | **74,497** | **13.818x** | TP=2, torch.compile(neuron), bf16, batch=8, DP=32 | [recipe](./trn2.48xlarge/) |
+| `trn2.48xlarge` | 5,401 | **74,507** | **13.795x** | TP=2, torch.compile(neuron), bf16, batch=8, DP=32 | [recipe](./trn2.48xlarge/) |
 
 Metric is tok/s, measured on real hardware via the `native-pytorch-beta3` backend.
 

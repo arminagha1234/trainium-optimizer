@@ -1,9 +1,9 @@
 {
   "model_id": "Qwen/Qwen2-0.5B-Instruct",
   "backend": "native-pytorch-beta3",
-  "baseline_metric": 5391.318963904876,
-  "best_metric": 74497.34155209758,
-  "speedup": 13.818,
+  "baseline_metric": 5401.142983616618,
+  "best_metric": 74506.87256972604,
+  "speedup": 13.795,
   "metric_label": "tok/s",
   "config": {
     "tp_degree": 2,
@@ -31,5 +31,5 @@
   "measurements": {},
   "verified": "verified",
   "instance_type": "trn2.48xlarge",
-  "generated_at": "2026-09-10T04:21:52Z"
+  "generated_at": "2026-09-11T16:23:27Z"
 }
